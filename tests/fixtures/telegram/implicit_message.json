@@ -1,0 +1,12 @@
+{
+  "update_id": 104,
+  "business_message": {
+    "message_id": 504,
+    "business_connection_id": "business-1",
+    "from": { "id": 42, "is_bot": false, "first_name": "Owner" },
+    "chat": { "id": 1001, "type": "private" },
+    "date": 1783987240,
+    "text": "We will get back to you soon",
+    "is_from_offline": true
+  }
+}

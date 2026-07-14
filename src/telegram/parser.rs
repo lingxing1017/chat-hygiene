@@ -1,0 +1,297 @@
+use chrono::{DateTime, TimeZone, Utc};
+use serde::Deserialize;
+use serde_json::Value;
+use thiserror::Error;
+
+use crate::detection::{MediaKind, MessageContent, MessageEntity, MessageEntityKind};
+
+use super::models::{
+    BusinessConnectionSnapshot, BusinessRights, ParsedUpdate, RawBusinessEvent, RawEventKind,
+};
+
+#[derive(Debug, Error)]
+pub enum ParseError {
+    #[error("invalid Telegram update JSON: {0}")]
+    InvalidJson(#[from] serde_json::Error),
+    #[error("Telegram update contains an invalid timestamp: {0}")]
+    InvalidTimestamp(i64),
+}
+
+#[derive(Deserialize)]
+struct Envelope {
+    update_id: i64,
+    business_connection: Option<BusinessConnection>,
+    business_message: Option<BusinessMessage>,
+    edited_business_message: Option<BusinessMessage>,
+    deleted_business_messages: Option<DeletedBusinessMessages>,
+}
+
+#[derive(Deserialize)]
+struct User {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct Chat {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct BusinessConnection {
+    id: String,
+    user: User,
+    date: i64,
+    can_reply: bool,
+    is_enabled: bool,
+    #[serde(default)]
+    rights: Rights,
+}
+
+#[derive(Default, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+struct Rights {
+    #[serde(default)]
+    can_reply: bool,
+    #[serde(default)]
+    can_read_messages: bool,
+    #[serde(default)]
+    can_delete_sent_messages: bool,
+    #[serde(default)]
+    can_delete_all_messages: bool,
+}
+
+#[derive(Deserialize)]
+struct BusinessMessage {
+    message_id: i64,
+    business_connection_id: String,
+    from: User,
+    chat: Chat,
+    date: i64,
+    edit_date: Option<i64>,
+    text: Option<String>,
+    caption: Option<String>,
+    #[serde(default)]
+    entities: Vec<Entity>,
+    #[serde(default)]
+    caption_entities: Vec<Entity>,
+    media_group_id: Option<String>,
+    sender_business_bot: Option<Value>,
+    #[serde(default)]
+    is_from_offline: bool,
+    forward_origin: Option<Value>,
+    photo: Option<Value>,
+    video: Option<Value>,
+    document: Option<Document>,
+    voice: Option<Value>,
+    sticker: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct Document {
+    file_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Entity {
+    #[serde(rename = "type")]
+    kind: String,
+    offset: usize,
+    length: usize,
+    url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeletedBusinessMessages {
+    business_connection_id: String,
+    chat: Chat,
+    message_ids: Vec<i64>,
+}
+
+/// Parses a Telegram update into a transient Business event.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when JSON, required fields, or Telegram timestamps
+/// are invalid. Unusable entity ranges are ignored with the entity itself.
+pub fn parse_update(body: &[u8], owner_user_id: i64) -> Result<ParsedUpdate, ParseError> {
+    let update: Envelope = serde_json::from_slice(body)?;
+    let event = if let Some(connection) = update.business_connection {
+        connection_event(connection)?
+    } else if let Some(message) = update.business_message {
+        message_event(message, owner_user_id, false)?
+    } else if let Some(message) = update.edited_business_message {
+        message_event(message, owner_user_id, true)?
+    } else if let Some(deleted) = update.deleted_business_messages {
+        deletion_event(deleted)
+    } else {
+        RawBusinessEvent {
+            kind: RawEventKind::Ignored,
+            connection_id: None,
+            chat_id: None,
+            message_id: None,
+            media_group_id: None,
+            content: None,
+            deleted_message_ids: Vec::new(),
+            connection: None,
+            occurred_at: Utc::now(),
+        }
+    };
+    Ok(ParsedUpdate {
+        update_id: update.update_id,
+        event,
+    })
+}
+
+fn connection_event(connection: BusinessConnection) -> Result<RawBusinessEvent, ParseError> {
+    let occurred_at = timestamp(connection.date)?;
+    let connection_id = connection.id.clone();
+    let snapshot = BusinessConnectionSnapshot {
+        connection_id: connection.id,
+        owner_user_id: connection.user.id,
+        enabled: connection.is_enabled,
+        rights: BusinessRights {
+            can_reply: connection.can_reply || connection.rights.can_reply,
+            can_read_messages: connection.rights.can_read_messages,
+            can_delete_sent_messages: connection.rights.can_delete_sent_messages,
+            can_delete_all_messages: connection.rights.can_delete_all_messages,
+        },
+    };
+    Ok(RawBusinessEvent {
+        kind: RawEventKind::BusinessConnectionChanged,
+        connection_id: Some(connection_id),
+        chat_id: None,
+        message_id: None,
+        media_group_id: None,
+        content: None,
+        deleted_message_ids: Vec::new(),
+        connection: Some(snapshot),
+        occurred_at,
+    })
+}
+
+fn message_event(
+    message: BusinessMessage,
+    owner_user_id: i64,
+    edited: bool,
+) -> Result<RawBusinessEvent, ParseError> {
+    let kind = classify_message(&message, owner_user_id, edited);
+    let occurred_at = timestamp(message.edit_date.unwrap_or(message.date))?;
+    let content = message_content(&message);
+    Ok(RawBusinessEvent {
+        kind,
+        connection_id: Some(message.business_connection_id),
+        chat_id: Some(message.chat.id),
+        message_id: Some(message.message_id),
+        media_group_id: message.media_group_id,
+        content: Some(content),
+        deleted_message_ids: Vec::new(),
+        connection: None,
+        occurred_at,
+    })
+}
+
+fn classify_message(message: &BusinessMessage, owner_user_id: i64, edited: bool) -> RawEventKind {
+    if message.sender_business_bot.is_some() {
+        return RawEventKind::BotBusinessMessage;
+    }
+    if message.is_from_offline {
+        return RawEventKind::ImplicitOwnerMessage;
+    }
+    if message.from.id == owner_user_id {
+        if message
+            .text
+            .as_deref()
+            .is_some_and(|text| text.trim_start().starts_with('/'))
+        {
+            return RawEventKind::OwnerCommand;
+        }
+        return RawEventKind::ManualOwnerMessage;
+    }
+    if edited {
+        RawEventKind::EditedInboundMessage
+    } else {
+        RawEventKind::InboundMessage
+    }
+}
+
+fn message_content(message: &BusinessMessage) -> MessageContent {
+    let mut entities = extract_entities(message.text.as_deref(), &message.entities);
+    entities.extend(extract_entities(
+        message.caption.as_deref(),
+        &message.caption_entities,
+    ));
+    MessageContent {
+        text: message.text.clone(),
+        caption: message.caption.clone(),
+        entities,
+        media_kind: media_kind(message),
+        document_filename: message
+            .document
+            .as_ref()
+            .and_then(|document| document.file_name.clone()),
+        forwarded: message.forward_origin.is_some(),
+    }
+}
+
+fn extract_entities(source: Option<&str>, entities: &[Entity]) -> Vec<MessageEntity> {
+    entities
+        .iter()
+        .filter_map(|entity| {
+            let value = entity.url.clone().or_else(|| {
+                source.and_then(|text| utf16_slice(text, entity.offset, entity.length))
+            })?;
+            Some(MessageEntity {
+                kind: match entity.kind.as_str() {
+                    "url" => MessageEntityKind::Url,
+                    "text_link" => MessageEntityKind::TextLink,
+                    "mention" => MessageEntityKind::Mention,
+                    "phone_number" => MessageEntityKind::PhoneNumber,
+                    _ => MessageEntityKind::Other,
+                },
+                value,
+            })
+        })
+        .collect()
+}
+
+fn utf16_slice(text: &str, offset: usize, length: usize) -> Option<String> {
+    let units = text.encode_utf16().collect::<Vec<_>>();
+    let end = offset.checked_add(length)?;
+    String::from_utf16(units.get(offset..end)?).ok()
+}
+
+fn media_kind(message: &BusinessMessage) -> Option<MediaKind> {
+    if message.photo.is_some() {
+        Some(MediaKind::Photo)
+    } else if message.video.is_some() {
+        Some(MediaKind::Video)
+    } else if message.document.is_some() {
+        Some(MediaKind::Document)
+    } else if message.voice.is_some() {
+        Some(MediaKind::Voice)
+    } else if message.sticker.is_some() {
+        Some(MediaKind::Sticker)
+    } else {
+        None
+    }
+}
+
+fn deletion_event(deleted: DeletedBusinessMessages) -> RawBusinessEvent {
+    RawBusinessEvent {
+        kind: RawEventKind::MessagesDeleted,
+        connection_id: Some(deleted.business_connection_id),
+        chat_id: Some(deleted.chat.id),
+        message_id: None,
+        media_group_id: None,
+        content: None,
+        deleted_message_ids: deleted.message_ids,
+        connection: None,
+        occurred_at: Utc::now(),
+    }
+}
+
+fn timestamp(seconds: i64) -> Result<DateTime<Utc>, ParseError> {
+    Utc.timestamp_opt(seconds, 0)
+        .single()
+        .ok_or(ParseError::InvalidTimestamp(seconds))
+}

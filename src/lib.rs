@@ -5,4 +5,5 @@ pub mod detection;
 pub mod domain;
 pub mod events;
 pub mod storage;
+pub mod telegram;
 pub mod verification;

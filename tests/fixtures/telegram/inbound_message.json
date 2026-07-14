@@ -1,0 +1,16 @@
+{
+  "update_id": 101,
+  "business_message": {
+    "message_id": 501,
+    "business_connection_id": "business-1",
+    "from": { "id": 1001, "is_bot": false, "first_name": "Sender" },
+    "chat": { "id": 1001, "type": "private" },
+    "date": 1783987210,
+    "text": "See https://example.com and @owner",
+    "entities": [
+      { "type": "url", "offset": 4, "length": 19 },
+      { "type": "mention", "offset": 28, "length": 6 }
+    ],
+    "future_message_field": { "ignored": true }
+  }
+}

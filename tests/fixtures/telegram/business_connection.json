@@ -1,0 +1,18 @@
+{
+  "update_id": 100,
+  "business_connection": {
+    "id": "business-1",
+    "user": { "id": 42, "is_bot": false, "first_name": "Owner" },
+    "user_chat_id": 42,
+    "date": 1783987200,
+    "can_reply": true,
+    "is_enabled": true,
+    "rights": {
+      "can_reply": true,
+      "can_read_messages": true,
+      "can_delete_sent_messages": true,
+      "can_delete_all_messages": true
+    }
+  },
+  "future_field": "ignored"
+}

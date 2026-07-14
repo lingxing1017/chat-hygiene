@@ -1,0 +1,12 @@
+{
+  "update_id": 103,
+  "business_message": {
+    "message_id": 503,
+    "business_connection_id": "business-1",
+    "from": { "id": 42, "is_bot": false, "first_name": "Owner" },
+    "sender_business_bot": { "id": 9001, "is_bot": true, "first_name": "ChatHygiene" },
+    "chat": { "id": 1001, "type": "private" },
+    "date": 1783987230,
+    "text": "Please answer: 7 + 5 - 3"
+  }
+}

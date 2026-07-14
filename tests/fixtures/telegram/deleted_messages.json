@@ -1,0 +1,8 @@
+{
+  "update_id": 108,
+  "deleted_business_messages": {
+    "business_connection_id": "business-1",
+    "chat": { "id": 1001, "type": "private" },
+    "message_ids": [501, 502, 503]
+  }
+}

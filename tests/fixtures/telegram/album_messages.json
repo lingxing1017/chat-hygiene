@@ -1,0 +1,27 @@
+[
+  {
+    "update_id": 106,
+    "business_message": {
+      "message_id": 510,
+      "business_connection_id": "business-1",
+      "from": { "id": 1001, "is_bot": false, "first_name": "Sender" },
+      "chat": { "id": 1001, "type": "private" },
+      "date": 1783987260,
+      "media_group_id": "album-1",
+      "photo": [{ "file_id": "one", "file_unique_id": "one", "width": 1, "height": 1 }]
+    }
+  },
+  {
+    "update_id": 107,
+    "business_message": {
+      "message_id": 511,
+      "business_connection_id": "business-1",
+      "from": { "id": 1001, "is_bot": false, "first_name": "Sender" },
+      "chat": { "id": 1001, "type": "private" },
+      "date": 1783987261,
+      "media_group_id": "album-1",
+      "caption": "second item",
+      "photo": [{ "file_id": "two", "file_unique_id": "two", "width": 1, "height": 1 }]
+    }
+  }
+]
