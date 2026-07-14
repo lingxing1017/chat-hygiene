@@ -1,0 +1,11 @@
+{
+  "update_id": 2,
+  "business_message": {
+    "message_id": 10,
+    "business_connection_id": "business-1",
+    "from": { "id": 2001, "is_bot": false, "first_name": "Sender" },
+    "chat": { "id": 2001, "type": "private" },
+    "date": 1783987202,
+    "text": "你好，我想咨询项目细节。"
+  }
+}

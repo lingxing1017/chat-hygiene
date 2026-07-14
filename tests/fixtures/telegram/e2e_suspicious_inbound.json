@@ -1,0 +1,11 @@
+{
+  "update_id": 701,
+  "business_message": {
+    "message_id": 10,
+    "business_connection_id": "business-1",
+    "from": { "id": 6001, "is_bot": false, "first_name": "Sender" },
+    "chat": { "id": 6001, "type": "private" },
+    "date": 1783987901,
+    "text": "promotion investment"
+  }
+}

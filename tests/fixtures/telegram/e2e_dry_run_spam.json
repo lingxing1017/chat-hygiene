@@ -1,0 +1,11 @@
+{
+  "update_id": 711,
+  "business_message": {
+    "message_id": 30,
+    "business_connection_id": "business-1",
+    "from": { "id": 6010, "is_bot": false, "first_name": "Sender" },
+    "chat": { "id": 6010, "type": "private" },
+    "date": 1783987911,
+    "text": "privacy-marker Contact me for promotion and guaranteed investment returns. Pay 0x1234567890abcdef1234567890abcdef12345678"
+  }
+}
