@@ -27,6 +27,7 @@ pub(crate) enum PreparedAction {
     },
     ActiveInbound,
     BlockedInbound,
+    BlockedFailOpen,
     ManualOwner,
     BotMessage {
         sender: PreparedSender,

@@ -11,6 +11,7 @@ use crate::storage::{
     increment_challenge_attempts, insert_audit_event, mark_message_deleted, record_message,
     save_conversation, upsert_business_connection,
 };
+use crate::telegram::delete_message_batches;
 
 use super::models::{
     DetectionFacts, InboundOutcome, LifecycleFacts, PreparedAction, PreparedSender,
@@ -79,8 +80,19 @@ impl EventApplier for LifecycleHandler {
                             .await?;
                     record_inbound(uow, &facts, &key).await?;
                     enqueue_read(event.update_id, &key, message_id, facts.occurred_at, uow).await?;
-                    enqueue_delete(event.update_id, &key, &[message_id], facts.occurred_at, uow)
+                    let deletion_ids = eligible_deletion_ids(uow, &key).await?;
+                    enqueue_delete(event.update_id, &key, &deletion_ids, facts.occurred_at, uow)
                         .await?;
+                    conversation.updated_at = facts.occurred_at;
+                    let version = conversation.state_version;
+                    save_conversation(uow, &mut conversation, version).await?;
+                }
+                PreparedAction::BlockedFailOpen => {
+                    let key = facts.key()?;
+                    let mut conversation =
+                        get_or_create_conversation(uow, &key, facts.user_id()?, facts.occurred_at)
+                            .await?;
+                    record_inbound(uow, &facts, &key).await?;
                     conversation.updated_at = facts.occurred_at;
                     let version = conversation.state_version;
                     save_conversation(uow, &mut conversation, version).await?;
@@ -571,7 +583,7 @@ async fn enqueue_delete(
     now: chrono::DateTime<Utc>,
     uow: &mut UnitOfWork<'_>,
 ) -> Result<(), EventError> {
-    for (batch_index, batch) in message_ids.chunks(100).enumerate() {
+    for (batch_index, batch) in delete_message_batches(message_ids).into_iter().enumerate() {
         enqueue_action(
             uow,
             update_id,

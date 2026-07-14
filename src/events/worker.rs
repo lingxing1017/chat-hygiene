@@ -1,10 +1,12 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use chrono::Utc;
 use sqlx::SqlitePool;
 
 use crate::storage::{StorageError, UnitOfWork};
+use crate::telegram::{BusinessApi, DispatchOutcome, OutboxDispatcher};
 
 use super::models::{ApplyReceipt, PreparedEvent};
 use super::recorder::EventError;
@@ -107,4 +109,33 @@ pub async fn recover_recorded_events<A: EventApplier>(
         }
     }
     Ok(recovered_count)
+}
+
+/// Starts the single polling worker that drains due Telegram outbox actions.
+#[must_use]
+pub fn spawn_outbox_worker<C: BusinessApi + 'static>(
+    dispatcher: OutboxDispatcher<C>,
+    pool: SqlitePool,
+    poll_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(poll_interval);
+        loop {
+            ticker.tick().await;
+            loop {
+                match dispatcher.dispatch_next(Utc::now(), &pool).await {
+                    Ok(DispatchOutcome::Idle) => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(
+                            error_code = "outbox_dispatch_failed",
+                            error = %error,
+                            "outbox dispatch paused until the next poll"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    })
 }

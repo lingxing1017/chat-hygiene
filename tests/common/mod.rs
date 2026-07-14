@@ -39,7 +39,11 @@ pub async fn processing_database() -> (TempDir, SqlitePool) {
     sqlx::query(
         "INSERT INTO business_connection
          (connection_id, owner_user_id, rights_json, enabled, updated_at)
-         VALUES ('business-1', 42, '{}', 1, '2026-07-14T00:00:00Z')",
+         VALUES (
+           'business-1', 42,
+           '{\"can_reply\":true,\"can_read_messages\":true,\"can_delete_sent_messages\":true,\"can_delete_all_messages\":true}',
+           1, '2026-07-14T00:00:00Z'
+         )",
     )
     .execute(&pool)
     .await

@@ -7,7 +7,7 @@ use crate::domain::ConversationState;
 
 use super::models::{
     BusinessConnectionRecord, ChallengeRecord, Conversation, ConversationKey, LedgerMessage,
-    NewAuditEvent, NewOutboxAction,
+    NewAuditEvent, NewOutboxAction, OutboxActionKind, OutboxActionRecord,
 };
 use super::{StorageError, UnitOfWork};
 
@@ -38,6 +38,31 @@ struct ChallengeRow {
     max_attempts: i64,
     prompt_message_id: Option<i64>,
     delivery_status: String,
+}
+
+#[derive(FromRow)]
+struct BusinessConnectionRow {
+    connection_id: String,
+    owner_user_id: i64,
+    rights_json: String,
+    enabled: bool,
+    updated_at: String,
+}
+
+#[derive(FromRow)]
+struct OutboxActionRow {
+    id: i64,
+    source_update_id: i64,
+    connection_id: Option<String>,
+    chat_id: Option<i64>,
+    action_type: String,
+    payload_json: String,
+    status: String,
+    attempts: i64,
+    claimed_at: Option<String>,
+    next_attempt_at: Option<String>,
+    created_at: String,
+    updated_at: String,
 }
 
 /// Loads a conversation or inserts its initial `NEW` state.
@@ -442,6 +467,267 @@ pub async fn insert_audit_event(
     Ok(result.last_insert_rowid())
 }
 
+/// Claims the oldest due action for the single outbox worker.
+///
+/// The attempt counter is committed before the network call so a restarted
+/// worker can conservatively detect an interrupted non-idempotent send.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the row is malformed or cannot be claimed.
+pub async fn claim_due_outbox_action(
+    uow: &mut UnitOfWork<'_>,
+    now: DateTime<Utc>,
+) -> Result<Option<OutboxActionRecord>, StorageError> {
+    let row = sqlx::query_as::<_, OutboxActionRow>(
+        "SELECT id, source_update_id, connection_id, chat_id, action_type,
+                payload_json, status, attempts, claimed_at, next_attempt_at,
+                created_at, updated_at
+         FROM outbox_action
+         WHERE status IN ('PENDING', 'RETRY')
+           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+         ORDER BY id LIMIT 1",
+    )
+    .bind(now.to_rfc3339())
+    .fetch_optional(uow.connection())
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let interrupted = row.claimed_at.is_some();
+    let attempt_increment = i64::from(!interrupted);
+    let result = sqlx::query(
+        "UPDATE outbox_action
+         SET attempts = attempts + ?, claimed_at = ?, updated_at = ?
+         WHERE id = ? AND status = ? AND attempts = ?",
+    )
+    .bind(attempt_increment)
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .bind(row.id)
+    .bind(&row.status)
+    .bind(row.attempts)
+    .execute(uow.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    let mut action: OutboxActionRecord = row.try_into()?;
+    action.attempts += attempt_increment;
+    action.interrupted = interrupted;
+    action.updated_at = now;
+    Ok(Some(action))
+}
+
+/// Marks an outbox action successfully applied.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the action cannot be updated.
+pub async fn mark_outbox_succeeded(
+    uow: &mut UnitOfWork<'_>,
+    action_id: i64,
+    now: DateTime<Utc>,
+) -> Result<(), StorageError> {
+    set_outbox_terminal(uow, action_id, "SUCCEEDED", None, now).await
+}
+
+/// Schedules a retry for a recoverable outbox failure.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the action cannot be updated.
+pub async fn mark_outbox_retry(
+    uow: &mut UnitOfWork<'_>,
+    action_id: i64,
+    next_attempt_at: DateTime<Utc>,
+    error_code: &str,
+    now: DateTime<Utc>,
+) -> Result<(), StorageError> {
+    update_one(
+        &sqlx::query(
+            "UPDATE outbox_action
+             SET status = 'RETRY', next_attempt_at = ?, claimed_at = NULL,
+                 last_error = ?, updated_at = ?
+             WHERE id = ? AND status IN ('PENDING', 'RETRY')",
+        )
+        .bind(next_attempt_at.to_rfc3339())
+        .bind(error_code)
+        .bind(now.to_rfc3339())
+        .bind(action_id)
+        .execute(uow.connection())
+        .await?,
+    )
+}
+
+/// Marks an ambiguous non-idempotent action for manual recovery.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the action cannot be updated.
+pub async fn mark_outbox_uncertain(
+    uow: &mut UnitOfWork<'_>,
+    action_id: i64,
+    error_code: &str,
+    now: DateTime<Utc>,
+) -> Result<(), StorageError> {
+    set_outbox_terminal(uow, action_id, "UNCERTAIN", Some(error_code), now).await
+}
+
+/// Marks an outbox action permanently failed.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the action cannot be updated.
+pub async fn mark_outbox_permanent_failure(
+    uow: &mut UnitOfWork<'_>,
+    action_id: i64,
+    error_code: &str,
+    now: DateTime<Utc>,
+) -> Result<(), StorageError> {
+    set_outbox_terminal(uow, action_id, "PERMANENT_FAILURE", Some(error_code), now).await
+}
+
+/// Loads one challenge by its stable outbox payload identity.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] for malformed persisted values.
+pub async fn find_challenge_by_id(
+    uow: &mut UnitOfWork<'_>,
+    challenge_id: i64,
+) -> Result<Option<ChallengeRecord>, StorageError> {
+    let row = sqlx::query_as::<_, ChallengeRow>(
+        "SELECT id, connection_id, chat_id, expression, answer_hmac, created_at,
+                expires_at, attempts_used, max_attempts, prompt_message_id,
+                delivery_status
+         FROM challenge WHERE id = ?",
+    )
+    .bind(challenge_id)
+    .fetch_optional(uow.connection())
+    .await?;
+    row.map(TryInto::try_into).transpose()
+}
+
+/// Records a delivered challenge prompt without reopening a closed challenge.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the challenge is missing or cannot be updated.
+pub async fn mark_challenge_sent(
+    uow: &mut UnitOfWork<'_>,
+    challenge_id: i64,
+    prompt_message_id: i64,
+) -> Result<(), StorageError> {
+    update_one(
+        &sqlx::query(
+            "UPDATE challenge
+             SET prompt_message_id = ?,
+                 delivery_status = CASE WHEN closed_at IS NULL THEN 'SENT'
+                                        ELSE delivery_status END
+             WHERE id = ?",
+        )
+        .bind(prompt_message_id)
+        .bind(challenge_id)
+        .execute(uow.connection())
+        .await?,
+    )
+}
+
+/// Records that Telegram may have delivered a challenge prompt.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the challenge is missing or cannot be updated.
+pub async fn mark_challenge_uncertain(
+    uow: &mut UnitOfWork<'_>,
+    challenge_id: i64,
+) -> Result<(), StorageError> {
+    update_one(
+        &sqlx::query(
+            "UPDATE challenge
+             SET delivery_status = CASE WHEN closed_at IS NULL THEN 'UNCERTAIN'
+                                        ELSE delivery_status END
+             WHERE id = ?",
+        )
+        .bind(challenge_id)
+        .execute(uow.connection())
+        .await?,
+    )
+}
+
+/// Loads a configured Business connection.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] for malformed persisted timestamps.
+pub async fn find_business_connection(
+    uow: &mut UnitOfWork<'_>,
+    connection_id: &str,
+) -> Result<Option<BusinessConnectionRecord>, StorageError> {
+    let row = sqlx::query_as::<_, BusinessConnectionRow>(
+        "SELECT connection_id, owner_user_id, rights_json, enabled, updated_at
+         FROM business_connection WHERE connection_id = ?",
+    )
+    .bind(connection_id)
+    .fetch_optional(uow.connection())
+    .await?;
+    row.map(TryInto::try_into).transpose()
+}
+
+/// Disables Business-side effects until a fresh connection update restores it.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the connection cannot be updated.
+pub async fn disable_business_connection(
+    uow: &mut UnitOfWork<'_>,
+    connection_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), StorageError> {
+    update_one(
+        &sqlx::query(
+            "UPDATE business_connection SET enabled = 0, updated_at = ?
+             WHERE connection_id = ?",
+        )
+        .bind(now.to_rfc3339())
+        .bind(connection_id)
+        .execute(uow.connection())
+        .await?,
+    )
+}
+
+async fn set_outbox_terminal(
+    uow: &mut UnitOfWork<'_>,
+    action_id: i64,
+    status: &str,
+    error_code: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<(), StorageError> {
+    update_one(
+        &sqlx::query(
+            "UPDATE outbox_action
+             SET status = ?, next_attempt_at = NULL, claimed_at = NULL,
+                 last_error = ?, updated_at = ?
+             WHERE id = ? AND status IN ('PENDING', 'RETRY')",
+        )
+        .bind(status)
+        .bind(error_code)
+        .bind(now.to_rfc3339())
+        .bind(action_id)
+        .execute(uow.connection())
+        .await?,
+    )
+}
+
+fn update_one(result: &sqlx::sqlite::SqliteQueryResult) -> Result<(), StorageError> {
+    if result.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(StorageError::ConcurrentModification)
+    }
+}
+
 async fn load_conversation(
     uow: &mut UnitOfWork<'_>,
     key: &ConversationKey,
@@ -495,6 +781,58 @@ impl TryFrom<ChallengeRow> for ChallengeRecord {
             max_attempts: row.max_attempts,
             prompt_message_id: row.prompt_message_id,
             delivery_status: row.delivery_status,
+        })
+    }
+}
+
+impl TryFrom<BusinessConnectionRow> for BusinessConnectionRecord {
+    type Error = StorageError;
+
+    fn try_from(row: BusinessConnectionRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            connection_id: row.connection_id,
+            owner_user_id: row.owner_user_id,
+            rights_json: row.rights_json,
+            enabled: row.enabled,
+            updated_at: parse_timestamp(&row.updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<OutboxActionRow> for OutboxActionRecord {
+    type Error = StorageError;
+
+    fn try_from(row: OutboxActionRow) -> Result<Self, Self::Error> {
+        let key = match (row.connection_id, row.chat_id) {
+            (Some(connection_id), Some(chat_id)) => {
+                Some(ConversationKey::new(connection_id, chat_id))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(StorageError::InvalidData(
+                    "outbox connection and chat identity must both be present or absent".to_owned(),
+                ));
+            }
+        };
+        Ok(Self {
+            id: row.id,
+            source_update_id: row.source_update_id,
+            key,
+            kind: row
+                .action_type
+                .parse::<OutboxActionKind>()
+                .map_err(StorageError::InvalidData)?,
+            payload_json: row.payload_json,
+            status: row.status,
+            attempts: row.attempts,
+            interrupted: false,
+            next_attempt_at: row
+                .next_attempt_at
+                .as_deref()
+                .map(parse_timestamp)
+                .transpose()?,
+            created_at: parse_timestamp(&row.created_at)?,
+            updated_at: parse_timestamp(&row.updated_at)?,
         })
     }
 }

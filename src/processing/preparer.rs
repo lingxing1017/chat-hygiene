@@ -6,7 +6,9 @@ use crate::clock::Clock;
 use crate::detection::{Decision, DetectionContext, DetectionResult, MessageContent, SpamDetector};
 use crate::domain::ConversationState;
 use crate::events::PreparedEvent;
-use crate::storage::{ConversationKey, UnitOfWork, active_challenge, find_conversation};
+use crate::storage::{
+    ConversationKey, UnitOfWork, active_challenge, find_business_connection, find_conversation,
+};
 use crate::telegram::{RawBusinessEvent, RawEventKind};
 use crate::verification::{AnswerKind, ChallengeVerifier};
 
@@ -113,11 +115,16 @@ where
         if state == ConversationState::Active {
             return Ok(PreparedAction::ActiveInbound);
         }
+        let availability = business_availability(uow, &key).await?;
         if matches!(
             state,
             ConversationState::TempSoftBlocked | ConversationState::SpamSoftBlocked
         ) {
-            return Ok(PreparedAction::BlockedInbound);
+            return Ok(if self.destructive_mode && availability.destructive {
+                PreparedAction::BlockedInbound
+            } else {
+                PreparedAction::BlockedFailOpen
+            });
         }
 
         let content = raw.content.clone().unwrap_or_default();
@@ -136,11 +143,18 @@ where
             Err(error) => (DetectionFacts::failed(error.to_string()), true),
         };
         let is_spam = detection.decision == "SPAM";
-        let dry_run_spam = is_spam && !self.destructive_mode;
-        let outcome = if is_spam && self.destructive_mode {
+        let destructive_mode = self.destructive_mode && availability.destructive;
+        let dry_run_spam = is_spam && !destructive_mode;
+        let outcome = if is_spam && destructive_mode {
             InboundOutcome::Spam
+        } else if matches!(
+            state,
+            ConversationState::New | ConversationState::VerifyPending
+        ) && !availability.reply
+        {
+            InboundOutcome::Retain
         } else {
-            self.safe_outcome(raw.kind, state, &key, &content, uow)
+            self.safe_outcome(raw.kind, state, &key, &content, destructive_mode, uow)
                 .await?
         };
         let mut detection = detection;
@@ -160,6 +174,7 @@ where
         state: ConversationState,
         key: &ConversationKey,
         content: &MessageContent,
+        destructive_mode: bool,
         uow: &mut UnitOfWork<'_>,
     ) -> Result<InboundOutcome, ProcessingError> {
         match state {
@@ -192,7 +207,7 @@ where
                                 exhausted,
                                 block_expires_at: exhausted
                                     .then(|| self.clock.now() + Duration::hours(24))
-                                    .filter(|_| self.destructive_mode),
+                                    .filter(|_| destructive_mode),
                             }
                         }
                         AnswerKind::NonNumeric => InboundOutcome::NonNumeric,
@@ -218,6 +233,36 @@ where
             max_attempts: challenge.max_attempts,
         }
     }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct StoredRights {
+    can_reply: bool,
+    can_read_messages: bool,
+    can_delete_all_messages: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BusinessAvailability {
+    reply: bool,
+    destructive: bool,
+}
+
+async fn business_availability(
+    uow: &mut UnitOfWork<'_>,
+    key: &ConversationKey,
+) -> Result<BusinessAvailability, ProcessingError> {
+    let Some(connection) = find_business_connection(uow, &key.connection_id).await? else {
+        return Ok(BusinessAvailability::default());
+    };
+    if !connection.enabled {
+        return Ok(BusinessAvailability::default());
+    }
+    let rights = serde_json::from_str::<StoredRights>(&connection.rights_json).unwrap_or_default();
+    Ok(BusinessAvailability {
+        reply: rights.can_reply,
+        destructive: rights.can_read_messages && rights.can_delete_all_messages,
+    })
 }
 
 impl From<DetectionResult> for DetectionFacts {

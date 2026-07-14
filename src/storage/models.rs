@@ -146,6 +146,37 @@ impl OutboxActionKind {
     }
 }
 
+impl std::str::FromStr for OutboxActionKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "SEND_CHALLENGE" => Ok(Self::SendChallenge),
+            "EDIT_CHALLENGE" => Ok(Self::EditChallenge),
+            "READ_BUSINESS_MESSAGE" => Ok(Self::ReadBusinessMessage),
+            "DELETE_BUSINESS_MESSAGES" => Ok(Self::DeleteBusinessMessages),
+            "SEND_OWNER_MESSAGE" => Ok(Self::SendOwnerMessage),
+            "PROPOSED_DESTRUCTIVE_ACTION" => Ok(Self::ProposedDestructiveAction),
+            _ => Err(format!("unknown outbox action kind {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxActionRecord {
+    pub id: i64,
+    pub source_update_id: i64,
+    pub key: Option<ConversationKey>,
+    pub kind: OutboxActionKind,
+    pub payload_json: String,
+    pub status: String,
+    pub attempts: i64,
+    pub interrupted: bool,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewOutboxAction {
     pub source_update_id: i64,

@@ -44,7 +44,15 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         .fetch_one(&pool)
         .await
         .expect("count migrations");
-    assert_eq!(applied, 1);
+    assert_eq!(applied, 2);
+    let outbox_columns = sqlx::query("PRAGMA table_info(outbox_action)")
+        .fetch_all(&pool)
+        .await
+        .expect("list outbox columns")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<BTreeSet<_>>();
+    assert!(outbox_columns.contains("claimed_at"));
 }
 
 #[tokio::test]
