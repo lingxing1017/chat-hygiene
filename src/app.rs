@@ -9,8 +9,8 @@ use thiserror::Error;
 use crate::clock::SystemClock;
 use crate::config::Settings;
 use crate::detection::{DetectorError, RuleDetector};
-use crate::events::spawn_outbox_worker;
-use crate::processing::{ProcessingEngine, spawn_processing_worker};
+use crate::events::{EventError, recover_recorded_events, spawn_outbox_worker};
+use crate::processing::{LifecycleHandler, ProcessingEngine, spawn_processing_worker};
 use crate::storage::{StorageError, connect, migrate};
 use crate::telegram::{OutboxDispatcher, TelegramClient, WebhookInbox, webhook_router};
 use crate::verification::ArithmeticVerifier;
@@ -26,6 +26,8 @@ pub enum AppError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Detector(#[from] DetectorError),
+    #[error(transparent)]
+    Event(#[from] EventError),
 }
 
 pub fn build_router(_settings: Arc<Settings>) -> Router {
@@ -53,6 +55,7 @@ pub fn build_router_with_inbox<I: WebhookInbox + 'static>(
 pub async fn build_runtime_router(settings: Arc<Settings>) -> Result<Router, AppError> {
     let pool = connect(&settings.database_url).await?;
     migrate(&pool).await?;
+    recover_recorded_events(&pool, &LifecycleHandler).await?;
     let detector = RuleDetector::from_defaults()?;
     let verifier = ArithmeticVerifier::from_os_rng(settings.challenge_hmac_key.clone());
     let engine = ProcessingEngine::new(
@@ -69,9 +72,13 @@ pub async fn build_runtime_router(settings: Arc<Settings>) -> Result<Router, App
         pool,
         std::time::Duration::from_millis(250),
     ));
-    Ok(build_router_with_inbox(&settings, inbox))
+    Ok(build_router_with_inbox(&settings, inbox).route("/health/ready", get(readiness)))
 }
 
 async fn liveness() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "ok" })
+}
+
+async fn readiness() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
