@@ -44,7 +44,7 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         .fetch_one(&pool)
         .await
         .expect("count migrations");
-    assert_eq!(applied, 2);
+    assert_eq!(applied, 3);
     let outbox_columns = sqlx::query("PRAGMA table_info(outbox_action)")
         .fetch_all(&pool)
         .await
@@ -53,6 +53,12 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         .map(|row| row.get::<String, _>("name"))
         .collect::<BTreeSet<_>>();
     assert!(outbox_columns.contains("claimed_at"));
+    let runtime_override: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM runtime_setting WHERE key = 'destructive_mode'")
+            .fetch_one(&pool)
+            .await
+            .expect("inspect runtime override");
+    assert_eq!(runtime_override, 0);
 }
 
 #[tokio::test]

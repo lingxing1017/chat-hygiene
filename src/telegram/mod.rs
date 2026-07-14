@@ -9,7 +9,8 @@ pub use client::{
     TelegramError, delete_message_batches,
 };
 pub use models::{
-    BusinessConnectionSnapshot, BusinessRights, ParsedUpdate, RawBusinessEvent, RawEventKind,
+    BusinessConnectionSnapshot, BusinessRights, OwnerCommandSnapshot, OwnerReplySnapshot,
+    ParsedUpdate, RawBusinessEvent, RawEventKind,
 };
 pub use outbox::{DispatchError, DispatchOutcome, OutboxDispatcher};
 pub use parser::{ParseError, parse_update};

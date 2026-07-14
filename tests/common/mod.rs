@@ -183,6 +183,7 @@ pub fn inbound(
         }),
         deleted_message_ids: Vec::new(),
         connection: None,
+        owner_command: None,
         occurred_at: now,
     }
 }
@@ -203,6 +204,7 @@ pub fn deleted(chat_id: i64, message_ids: Vec<i64>, now: DateTime<Utc>) -> RawBu
         content: None,
         deleted_message_ids: message_ids,
         connection: None,
+        owner_command: None,
         occurred_at: now,
     }
 }

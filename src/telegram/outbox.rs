@@ -301,7 +301,8 @@ struct DeletePayload {
 
 #[derive(Debug, Deserialize)]
 struct OwnerAlertPayload {
-    alert: String,
+    alert: Option<String>,
+    message: Option<String>,
     challenge_id: Option<i64>,
 }
 
@@ -608,7 +609,10 @@ fn challenge_status_text(payload: &EditPayload) -> String {
 }
 
 fn owner_alert_text(payload: &OwnerAlertPayload) -> String {
-    match payload.alert.as_str() {
+    if let Some(message) = &payload.message {
+        return message.clone();
+    }
+    match payload.alert.as_deref().unwrap_or_default() {
         "challenge_send_uncertain" => format!(
             "ChatHygiene 无法确认验证提示是否已发送（challenge {}）。",
             payload

@@ -6,7 +6,8 @@ use thiserror::Error;
 use crate::detection::{MediaKind, MessageContent, MessageEntity, MessageEntityKind};
 
 use super::models::{
-    BusinessConnectionSnapshot, BusinessRights, ParsedUpdate, RawBusinessEvent, RawEventKind,
+    BusinessConnectionSnapshot, BusinessRights, OwnerCommandSnapshot, OwnerReplySnapshot,
+    ParsedUpdate, RawBusinessEvent, RawEventKind,
 };
 
 #[derive(Debug, Error)]
@@ -24,6 +25,8 @@ struct Envelope {
     business_message: Option<BusinessMessage>,
     edited_business_message: Option<BusinessMessage>,
     deleted_business_messages: Option<DeletedBusinessMessages>,
+    message: Option<BotMessage>,
+    channel_post: Option<BotMessage>,
 }
 
 #[derive(Deserialize)]
@@ -34,6 +37,25 @@ struct User {
 #[derive(Deserialize)]
 struct Chat {
     id: i64,
+}
+
+#[derive(Deserialize)]
+struct BotChat {
+    id: i64,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Deserialize)]
+struct BotMessage {
+    message_id: i64,
+    from: Option<User>,
+    chat: BotChat,
+    date: i64,
+    text: Option<String>,
+    caption: Option<String>,
+    reply_to_message: Option<Box<BotMessage>>,
+    forward_origin: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -123,6 +145,8 @@ pub fn parse_update(body: &[u8], owner_user_id: i64) -> Result<ParsedUpdate, Par
         message_event(message, owner_user_id, true)?
     } else if let Some(deleted) = update.deleted_business_messages {
         deletion_event(deleted)
+    } else if let Some(message) = update.message.or(update.channel_post) {
+        bot_message_event(message)?
     } else {
         RawBusinessEvent {
             kind: RawEventKind::Ignored,
@@ -133,6 +157,7 @@ pub fn parse_update(body: &[u8], owner_user_id: i64) -> Result<ParsedUpdate, Par
             content: None,
             deleted_message_ids: Vec::new(),
             connection: None,
+            owner_command: None,
             occurred_at: Utc::now(),
         }
     };
@@ -165,6 +190,7 @@ fn connection_event(connection: BusinessConnection) -> Result<RawBusinessEvent, 
         content: None,
         deleted_message_ids: Vec::new(),
         connection: Some(snapshot),
+        owner_command: None,
         occurred_at,
     })
 }
@@ -186,6 +212,7 @@ fn message_event(
         content: Some(content),
         deleted_message_ids: Vec::new(),
         connection: None,
+        owner_command: None,
         occurred_at,
     })
 }
@@ -198,13 +225,6 @@ fn classify_message(message: &BusinessMessage, owner_user_id: i64, edited: bool)
         return RawEventKind::ImplicitOwnerMessage;
     }
     if message.from.id == owner_user_id {
-        if message
-            .text
-            .as_deref()
-            .is_some_and(|text| text.trim_start().starts_with('/'))
-        {
-            return RawEventKind::OwnerCommand;
-        }
         return RawEventKind::ManualOwnerMessage;
     }
     if edited {
@@ -212,6 +232,62 @@ fn classify_message(message: &BusinessMessage, owner_user_id: i64, edited: bool)
     } else {
         RawEventKind::InboundMessage
     }
+}
+
+fn bot_message_event(message: BotMessage) -> Result<RawBusinessEvent, ParseError> {
+    let occurred_at = timestamp(message.date)?;
+    let command_text = message.text.clone().unwrap_or_default();
+    let is_command = command_text.trim_start().starts_with('/');
+    let replied_sample = message
+        .reply_to_message
+        .as_deref()
+        .and_then(owner_reply_snapshot);
+    Ok(RawBusinessEvent {
+        kind: if is_command {
+            RawEventKind::OwnerCommand
+        } else {
+            RawEventKind::Ignored
+        },
+        connection_id: None,
+        chat_id: Some(message.chat.id),
+        message_id: Some(message.message_id),
+        media_group_id: None,
+        content: None,
+        deleted_message_ids: Vec::new(),
+        connection: None,
+        owner_command: is_command.then(|| OwnerCommandSnapshot {
+            from_user_id: message.from.map(|user| user.id),
+            private_chat: message.chat.kind == "private",
+            text: command_text,
+            replied_sample,
+        }),
+        occurred_at,
+    })
+}
+
+fn owner_reply_snapshot(message: &BotMessage) -> Option<OwnerReplySnapshot> {
+    let (body, content_type) = if let Some(text) = message.text.as_ref() {
+        (text.clone(), "text".to_owned())
+    } else {
+        (message.caption.clone()?, "caption".to_owned())
+    };
+    let source_chat_id = message
+        .forward_origin
+        .as_ref()
+        .and_then(|origin| origin.get("chat"))
+        .and_then(|chat| chat.get("id"))
+        .and_then(Value::as_i64);
+    let source_message_id = message
+        .forward_origin
+        .as_ref()
+        .and_then(|origin| origin.get("message_id"))
+        .and_then(Value::as_i64);
+    Some(OwnerReplySnapshot {
+        body,
+        content_type,
+        source_chat_id,
+        source_message_id,
+    })
 }
 
 fn message_content(message: &BusinessMessage) -> MessageContent {
@@ -286,6 +362,7 @@ fn deletion_event(deleted: DeletedBusinessMessages) -> RawBusinessEvent {
         content: None,
         deleted_message_ids: deleted.message_ids,
         connection: None,
+        owner_command: None,
         occurred_at: Utc::now(),
     }
 }

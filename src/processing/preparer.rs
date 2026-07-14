@@ -115,12 +115,13 @@ where
         if state == ConversationState::Active {
             return Ok(PreparedAction::ActiveInbound);
         }
+        let destructive_mode = runtime_destructive_mode(uow, self.destructive_mode).await?;
         let availability = business_availability(uow, &key).await?;
         if matches!(
             state,
             ConversationState::TempSoftBlocked | ConversationState::SpamSoftBlocked
         ) {
-            return Ok(if self.destructive_mode && availability.destructive {
+            return Ok(if destructive_mode && availability.destructive {
                 PreparedAction::BlockedInbound
             } else {
                 PreparedAction::BlockedFailOpen
@@ -143,7 +144,7 @@ where
             Err(error) => (DetectionFacts::failed(error.to_string()), true),
         };
         let is_spam = detection.decision == "SPAM";
-        let destructive_mode = self.destructive_mode && availability.destructive;
+        let destructive_mode = destructive_mode && availability.destructive;
         let dry_run_spam = is_spam && !destructive_mode;
         let outcome = if is_spam && destructive_mode {
             InboundOutcome::Spam
@@ -262,6 +263,22 @@ async fn business_availability(
     Ok(BusinessAvailability {
         reply: rights.can_reply,
         destructive: rights.can_read_messages && rights.can_delete_all_messages,
+    })
+}
+
+async fn runtime_destructive_mode(
+    uow: &mut UnitOfWork<'_>,
+    default: bool,
+) -> Result<bool, ProcessingError> {
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT value FROM runtime_setting WHERE key = 'destructive_mode'")
+            .fetch_optional(uow.connection())
+            .await
+            .map_err(crate::storage::StorageError::from)?;
+    Ok(match value.as_deref() {
+        None => default,
+        Some("true") => true,
+        Some(_) => false,
     })
 }
 

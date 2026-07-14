@@ -675,6 +675,29 @@ pub async fn find_business_connection(
     row.map(TryInto::try_into).transpose()
 }
 
+/// Loads the only configured Business connection for the single-account MVP.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when multiple connections exist or persisted data
+/// is malformed.
+pub async fn find_single_business_connection(
+    uow: &mut UnitOfWork<'_>,
+) -> Result<Option<BusinessConnectionRecord>, StorageError> {
+    let rows = sqlx::query_as::<_, BusinessConnectionRow>(
+        "SELECT connection_id, owner_user_id, rights_json, enabled, updated_at
+         FROM business_connection ORDER BY connection_id LIMIT 2",
+    )
+    .fetch_all(uow.connection())
+    .await?;
+    if rows.len() > 1 {
+        return Err(StorageError::InvalidData(
+            "single-account mode found multiple Business connections".to_owned(),
+        ));
+    }
+    rows.into_iter().next().map(TryInto::try_into).transpose()
+}
+
 /// Disables Business-side effects until a fresh connection update restores it.
 ///
 /// # Errors

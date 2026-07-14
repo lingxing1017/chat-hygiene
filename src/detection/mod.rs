@@ -9,6 +9,16 @@ use thiserror::Error;
 
 pub use rules::RuleDetector;
 
+/// Produces the same normalized content hash used by the rule detector.
+#[must_use]
+pub fn normalized_text_hash(body: &str) -> String {
+    normalize::normalize(&MessageContent {
+        text: Some(body.to_owned()),
+        ..MessageContent::default()
+    })
+    .normalized_hash
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Allow,

@@ -33,6 +33,22 @@ pub struct BusinessConnectionSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerReplySnapshot {
+    pub body: String,
+    pub content_type: String,
+    pub source_chat_id: Option<i64>,
+    pub source_message_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerCommandSnapshot {
+    pub from_user_id: Option<i64>,
+    pub private_chat: bool,
+    pub text: String,
+    pub replied_sample: Option<OwnerReplySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawBusinessEvent {
     pub kind: RawEventKind,
     pub connection_id: Option<String>,
@@ -42,6 +58,7 @@ pub struct RawBusinessEvent {
     pub content: Option<MessageContent>,
     pub deleted_message_ids: Vec<i64>,
     pub connection: Option<BusinessConnectionSnapshot>,
+    pub owner_command: Option<OwnerCommandSnapshot>,
     pub occurred_at: DateTime<Utc>,
 }
 

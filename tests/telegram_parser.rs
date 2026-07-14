@@ -90,13 +90,12 @@ fn preserves_album_identity_and_deletion_batches() {
 fn recognizes_owner_commands_and_rejects_invalid_required_fields() {
     let command = br#"{
       "update_id": 109,
-      "business_message": {
+      "message": {
         "message_id": 520,
-        "business_connection_id": "business-1",
         "from": {"id": 42},
-        "chat": {"id": 1001, "type": "private"},
+        "chat": {"id": 42, "type": "private"},
         "date": 1783987270,
-        "text": "/status"
+        "text": "/health"
       }
     }"#;
     assert_eq!(
