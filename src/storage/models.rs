@@ -114,6 +114,65 @@ pub struct ChallengeRecord {
     pub delivery_status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusinessConnectionRecord {
+    pub connection_id: String,
+    pub owner_user_id: i64,
+    pub rights_json: String,
+    pub enabled: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxActionKind {
+    SendChallenge,
+    EditChallenge,
+    ReadBusinessMessage,
+    DeleteBusinessMessages,
+    SendOwnerMessage,
+    ProposedDestructiveAction,
+}
+
+impl OutboxActionKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::SendChallenge => "SEND_CHALLENGE",
+            Self::EditChallenge => "EDIT_CHALLENGE",
+            Self::ReadBusinessMessage => "READ_BUSINESS_MESSAGE",
+            Self::DeleteBusinessMessages => "DELETE_BUSINESS_MESSAGES",
+            Self::SendOwnerMessage => "SEND_OWNER_MESSAGE",
+            Self::ProposedDestructiveAction => "PROPOSED_DESTRUCTIVE_ACTION",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewOutboxAction {
+    pub source_update_id: i64,
+    pub key: Option<ConversationKey>,
+    pub kind: OutboxActionKind,
+    pub payload_json: String,
+    pub idempotency_key: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAuditEvent {
+    pub source_update_id: i64,
+    pub key: Option<ConversationKey>,
+    pub event_kind: String,
+    pub state_before: Option<String>,
+    pub state_after: Option<String>,
+    pub score: Option<u8>,
+    pub reasons_json: Option<String>,
+    pub rule_ids_json: Option<String>,
+    pub normalized_hash: Option<String>,
+    pub rule_version: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+}
+
 impl ChallengeRecord {
     #[must_use]
     pub fn pending(

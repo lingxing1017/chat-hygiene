@@ -70,110 +70,114 @@ impl RuleDetector {
 }
 
 impl SpamDetector for RuleDetector {
-    async fn detect(
-        &self,
-        message: &MessageContent,
-        context: &DetectionContext,
-    ) -> Result<DetectionResult, DetectorError> {
-        let normalized = normalize(message);
-        let mut accumulator = Accumulator::default();
-        let solicitation = contains_phrase(&normalized.text, &self.config.solicitation_phrases);
-        let task_scam = contains_phrase(
-            &normalized.text,
-            &self.config.task_investment_airdrop_phrases,
-        );
-        let malicious_link = normalized.links.iter().any(|link| {
-            context
-                .malicious_domains
+    fn detect<'a>(
+        &'a self,
+        message: &'a MessageContent,
+        context: &'a DetectionContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<DetectionResult, DetectorError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let normalized = normalize(message);
+            let mut accumulator = Accumulator::default();
+            let solicitation = contains_phrase(&normalized.text, &self.config.solicitation_phrases);
+            let task_scam = contains_phrase(
+                &normalized.text,
+                &self.config.task_investment_airdrop_phrases,
+            );
+            let malicious_link = normalized.links.iter().any(|link| {
+                context
+                    .malicious_domains
+                    .iter()
+                    .filter_map(|domain| idna::domain_to_ascii(domain).ok())
+                    .any(|domain| domain.eq_ignore_ascii_case(&link.domain))
+            });
+            let telegram_invite = normalized.links.iter().any(|link| link.telegram_invite);
+
+            if malicious_link {
+                accumulator.add(
+                    "malicious_domain_exact",
+                    self.config.weights.malicious_domain_exact,
+                    "message contains a configured malicious domain",
+                );
+            }
+            if context.prior_distinct_senders_for_hash >= 2 && (solicitation || task_scam) {
+                accumulator.add(
+                    "repeated_promo_template",
+                    self.config.weights.repeated_promo_template,
+                    "promotional template repeated across distinct senders",
+                );
+            }
+            if telegram_invite {
+                accumulator.add(
+                    "telegram_invite_link",
+                    self.config.weights.telegram_invite_link,
+                    "message contains a Telegram invite link",
+                );
+            }
+            if solicitation {
+                accumulator.add(
+                    "solicitation_phrase",
+                    self.config.weights.solicitation_phrase,
+                    "message contains solicitation language",
+                );
+            }
+            if WALLET_RE.is_match(&normalized.text) {
+                accumulator.add(
+                    "wallet_or_payment_destination",
+                    self.config.weights.wallet_or_payment_destination,
+                    "message contains a wallet or payment destination",
+                );
+            }
+            if task_scam {
+                accumulator.add(
+                    "task_investment_airdrop_phrase",
+                    self.config.weights.task_investment_airdrop_phrase,
+                    "message contains task, investment, or airdrop language",
+                );
+            }
+            if normalized.links.len() > 2 {
+                accumulator.add(
+                    "more_than_two_links",
+                    self.config.weights.more_than_two_links,
+                    "message contains more than two distinct links",
+                );
+            }
+            if normalized.contact && solicitation {
+                accumulator.add(
+                    "contact_plus_solicitation",
+                    self.config.weights.contact_plus_solicitation,
+                    "contact information accompanies solicitation language",
+                );
+            }
+            if normalized.evasion {
+                accumulator.add(
+                    "spacing_or_mixed_script_evasion",
+                    self.config.weights.spacing_or_mixed_script_evasion,
+                    "message uses spacing, zero-width, or mixed-script evasion",
+                );
+            }
+            if normalized.mention_count > 3 || normalized.emoji_count >= 8 {
+                accumulator.add(
+                    "excessive_mentions_or_emoji",
+                    self.config.weights.excessive_mentions_or_emoji,
+                    "message contains excessive mentions or emoji",
+                );
+            }
+            if normalized
+                .links
                 .iter()
-                .filter_map(|domain| idna::domain_to_ascii(domain).ok())
-                .any(|domain| domain.eq_ignore_ascii_case(&link.domain))
-        });
-        let telegram_invite = normalized.links.iter().any(|link| link.telegram_invite);
+                .any(|link| !link.telegram_invite && !domain_is_malicious(&link.domain, context))
+            {
+                accumulator.add(
+                    "ordinary_url",
+                    self.config.weights.ordinary_url,
+                    "message contains an ordinary URL",
+                );
+            }
 
-        if malicious_link {
-            accumulator.add(
-                "malicious_domain_exact",
-                self.config.weights.malicious_domain_exact,
-                "message contains a configured malicious domain",
-            );
-        }
-        if context.prior_distinct_senders_for_hash >= 2 && (solicitation || task_scam) {
-            accumulator.add(
-                "repeated_promo_template",
-                self.config.weights.repeated_promo_template,
-                "promotional template repeated across distinct senders",
-            );
-        }
-        if telegram_invite {
-            accumulator.add(
-                "telegram_invite_link",
-                self.config.weights.telegram_invite_link,
-                "message contains a Telegram invite link",
-            );
-        }
-        if solicitation {
-            accumulator.add(
-                "solicitation_phrase",
-                self.config.weights.solicitation_phrase,
-                "message contains solicitation language",
-            );
-        }
-        if WALLET_RE.is_match(&normalized.text) {
-            accumulator.add(
-                "wallet_or_payment_destination",
-                self.config.weights.wallet_or_payment_destination,
-                "message contains a wallet or payment destination",
-            );
-        }
-        if task_scam {
-            accumulator.add(
-                "task_investment_airdrop_phrase",
-                self.config.weights.task_investment_airdrop_phrase,
-                "message contains task, investment, or airdrop language",
-            );
-        }
-        if normalized.links.len() > 2 {
-            accumulator.add(
-                "more_than_two_links",
-                self.config.weights.more_than_two_links,
-                "message contains more than two distinct links",
-            );
-        }
-        if normalized.contact && solicitation {
-            accumulator.add(
-                "contact_plus_solicitation",
-                self.config.weights.contact_plus_solicitation,
-                "contact information accompanies solicitation language",
-            );
-        }
-        if normalized.evasion {
-            accumulator.add(
-                "spacing_or_mixed_script_evasion",
-                self.config.weights.spacing_or_mixed_script_evasion,
-                "message uses spacing, zero-width, or mixed-script evasion",
-            );
-        }
-        if normalized.mention_count > 3 || normalized.emoji_count >= 8 {
-            accumulator.add(
-                "excessive_mentions_or_emoji",
-                self.config.weights.excessive_mentions_or_emoji,
-                "message contains excessive mentions or emoji",
-            );
-        }
-        if normalized
-            .links
-            .iter()
-            .any(|link| !link.telegram_invite && !domain_is_malicious(&link.domain, context))
-        {
-            accumulator.add(
-                "ordinary_url",
-                self.config.weights.ordinary_url,
-                "message contains an ordinary URL",
-            );
-        }
-
-        Ok(accumulator.finish(&self.config.version, &self.checksum, &normalized))
+            Ok(accumulator.finish(&self.config.version, &self.checksum, &normalized))
+        })
     }
 }
 

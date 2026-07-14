@@ -2,6 +2,7 @@ mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{future::Future, pin::Pin};
 
 use chathygiene::events::{
     EventApplier, EventError, PreparedEvent, apply_recorded_event, record_prepared_event,
@@ -47,32 +48,36 @@ struct CountingApplier {
 }
 
 impl EventApplier for CountingApplier {
-    async fn apply(
-        &self,
-        _event: &PreparedEvent,
-        _uow: &mut UnitOfWork<'_>,
-    ) -> Result<(), EventError> {
-        self.applications.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    fn apply<'a>(
+        &'a self,
+        _event: &'a PreparedEvent,
+        _uow: &'a mut UnitOfWork<'_>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EventError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.applications.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
     }
 }
 
 struct FailingApplier;
 
 impl EventApplier for FailingApplier {
-    async fn apply(
-        &self,
-        _event: &PreparedEvent,
-        uow: &mut UnitOfWork<'_>,
-    ) -> Result<(), EventError> {
-        get_or_create_conversation(
-            uow,
-            &ConversationKey::new("business-1", 100),
-            100,
-            at("2026-07-14T00:00:00Z"),
-        )
-        .await?;
-        Err(EventError::Application("simulated crash".to_owned()))
+    fn apply<'a>(
+        &'a self,
+        _event: &'a PreparedEvent,
+        uow: &'a mut UnitOfWork<'_>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EventError>> + Send + 'a>> {
+        Box::pin(async move {
+            get_or_create_conversation(
+                uow,
+                &ConversationKey::new("business-1", 100),
+                100,
+                at("2026-07-14T00:00:00Z"),
+            )
+            .await?;
+            Err(EventError::Application("simulated crash".to_owned()))
+        })
     }
 }
 

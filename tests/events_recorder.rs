@@ -2,6 +2,7 @@ mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{future::Future, pin::Pin};
 
 use chathygiene::events::{
     ApplyReceipt, EventApplier, EventError, PreparedEvent, RecordReceipt, apply_recorded_event,
@@ -34,13 +35,15 @@ struct CountingApplier {
 }
 
 impl EventApplier for CountingApplier {
-    async fn apply(
-        &self,
-        _event: &PreparedEvent,
-        _uow: &mut UnitOfWork<'_>,
-    ) -> Result<(), EventError> {
-        self.applications.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    fn apply<'a>(
+        &'a self,
+        _event: &'a PreparedEvent,
+        _uow: &'a mut UnitOfWork<'_>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EventError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.applications.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
     }
 }
 

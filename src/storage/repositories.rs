@@ -5,7 +5,10 @@ use sqlx::FromRow;
 
 use crate::domain::ConversationState;
 
-use super::models::{ChallengeRecord, Conversation, ConversationKey, LedgerMessage};
+use super::models::{
+    BusinessConnectionRecord, ChallengeRecord, Conversation, ConversationKey, LedgerMessage,
+    NewAuditEvent, NewOutboxAction,
+};
 use super::{StorageError, UnitOfWork};
 
 #[derive(FromRow)]
@@ -76,6 +79,50 @@ pub async fn get_or_create_conversation(
         block_count: 0,
         state_version: 0,
     })
+}
+
+/// Loads a conversation without creating missing state.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] for database failures or invalid persisted values.
+pub async fn find_conversation(
+    uow: &mut UnitOfWork<'_>,
+    key: &ConversationKey,
+) -> Result<Option<Conversation>, StorageError> {
+    load_conversation(uow, key)
+        .await?
+        .map(TryInto::try_into)
+        .transpose()
+}
+
+/// Inserts or refreshes the one configured Business connection.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when `SQLite` rejects the connection state.
+pub async fn upsert_business_connection(
+    uow: &mut UnitOfWork<'_>,
+    connection: &BusinessConnectionRecord,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO business_connection
+         (connection_id, owner_user_id, rights_json, enabled, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(connection_id) DO UPDATE SET
+           owner_user_id = excluded.owner_user_id,
+           rights_json = excluded.rights_json,
+           enabled = excluded.enabled,
+           updated_at = excluded.updated_at",
+    )
+    .bind(&connection.connection_id)
+    .bind(connection.owner_user_id)
+    .bind(&connection.rights_json)
+    .bind(connection.enabled)
+    .bind(connection.updated_at.to_rfc3339())
+    .execute(uow.connection())
+    .await?;
+    Ok(())
 }
 
 /// Saves a conversation only when its stored version matches `expected_version`.
@@ -283,6 +330,116 @@ pub async fn close_challenge(
     .execute(uow.connection())
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Increments a challenge's numeric-attempt counter and returns the new value.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the challenge is closed, exhausted, missing,
+/// or cannot be updated.
+pub async fn increment_challenge_attempts(
+    uow: &mut UnitOfWork<'_>,
+    challenge_id: i64,
+) -> Result<i64, StorageError> {
+    let attempts: Option<i64> = sqlx::query_scalar(
+        "UPDATE challenge SET attempts_used = attempts_used + 1
+         WHERE id = ? AND closed_at IS NULL AND attempts_used < max_attempts
+         RETURNING attempts_used",
+    )
+    .bind(challenge_id)
+    .fetch_optional(uow.connection())
+    .await?;
+    attempts.ok_or_else(|| {
+        StorageError::InvalidData(format!(
+            "challenge {challenge_id} cannot consume another attempt"
+        ))
+    })
+}
+
+/// Closes the active challenge for a conversation, if present.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when `SQLite` cannot update the challenge.
+pub async fn close_active_challenge(
+    uow: &mut UnitOfWork<'_>,
+    key: &ConversationKey,
+    closed_at: DateTime<Utc>,
+) -> Result<bool, StorageError> {
+    let result = sqlx::query(
+        "UPDATE challenge SET closed_at = ?, delivery_status = 'CLOSED'
+         WHERE connection_id = ? AND chat_id = ? AND closed_at IS NULL",
+    )
+    .bind(closed_at.to_rfc3339())
+    .bind(&key.connection_id)
+    .bind(key.chat_id)
+    .execute(uow.connection())
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Enqueues one idempotent Telegram-side action.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when `SQLite` rejects the action.
+pub async fn enqueue_outbox_action(
+    uow: &mut UnitOfWork<'_>,
+    action: &NewOutboxAction,
+) -> Result<bool, StorageError> {
+    let result = sqlx::query(
+        "INSERT OR IGNORE INTO outbox_action
+         (source_update_id, connection_id, chat_id, action_type, payload_json,
+          idempotency_key, status, attempts, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)",
+    )
+    .bind(action.source_update_id)
+    .bind(action.key.as_ref().map(|key| key.connection_id.as_str()))
+    .bind(action.key.as_ref().map(|key| key.chat_id))
+    .bind(action.kind.as_str())
+    .bind(&action.payload_json)
+    .bind(&action.idempotency_key)
+    .bind(action.created_at.to_rfc3339())
+    .bind(action.created_at.to_rfc3339())
+    .execute(uow.connection())
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Records one body-free lifecycle or decision audit row.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when `SQLite` rejects the audit record.
+pub async fn insert_audit_event(
+    uow: &mut UnitOfWork<'_>,
+    audit: &NewAuditEvent,
+) -> Result<i64, StorageError> {
+    let result = sqlx::query(
+        "INSERT INTO audit_event
+         (source_update_id, connection_id, chat_id, event_kind, state_before,
+          state_after, score, reasons_json, rule_ids_json, normalized_hash,
+          rule_version, error_code, error_message, occurred_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(audit.source_update_id)
+    .bind(audit.key.as_ref().map(|key| key.connection_id.as_str()))
+    .bind(audit.key.as_ref().map(|key| key.chat_id))
+    .bind(&audit.event_kind)
+    .bind(&audit.state_before)
+    .bind(&audit.state_after)
+    .bind(audit.score.map(i64::from))
+    .bind(&audit.reasons_json)
+    .bind(&audit.rule_ids_json)
+    .bind(&audit.normalized_hash)
+    .bind(&audit.rule_version)
+    .bind(&audit.error_code)
+    .bind(&audit.error_message)
+    .bind(audit.occurred_at.to_rfc3339())
+    .execute(uow.connection())
+    .await?;
+    Ok(result.last_insert_rowid())
 }
 
 async fn load_conversation(

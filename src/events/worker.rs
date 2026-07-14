@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use chrono::Utc;
 use sqlx::SqlitePool;
 
@@ -6,7 +9,6 @@ use crate::storage::{StorageError, UnitOfWork};
 use super::models::{ApplyReceipt, PreparedEvent};
 use super::recorder::EventError;
 
-#[allow(async_fn_in_trait)]
 pub trait EventApplier: Send + Sync {
     /// Applies only derived database state through the supplied transaction.
     ///
@@ -14,11 +16,11 @@ pub trait EventApplier: Send + Sync {
     ///
     /// Returns [`EventError`] when the event cannot be applied. The caller will
     /// roll back the transaction and leave the event recoverable.
-    async fn apply(
-        &self,
-        event: &PreparedEvent,
-        uow: &mut UnitOfWork<'_>,
-    ) -> Result<(), EventError>;
+    fn apply<'a>(
+        &'a self,
+        event: &'a PreparedEvent,
+        uow: &'a mut UnitOfWork<'_>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EventError>> + Send + 'a>>;
 }
 
 /// Applies one recorded event and marks it applied in the same transaction.

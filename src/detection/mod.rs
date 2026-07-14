@@ -2,6 +2,8 @@ mod normalize;
 mod rules;
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 
 use thiserror::Error;
 
@@ -92,16 +94,15 @@ pub enum DetectorError {
     InvalidConfig(String),
 }
 
-#[allow(async_fn_in_trait)]
 pub trait SpamDetector: Send + Sync {
     /// Classifies transient message content without performing network I/O.
     ///
     /// # Errors
     ///
     /// Returns [`DetectorError`] when the configured rule set is invalid.
-    async fn detect(
-        &self,
-        message: &MessageContent,
-        context: &DetectionContext,
-    ) -> Result<DetectionResult, DetectorError>;
+    fn detect<'a>(
+        &'a self,
+        message: &'a MessageContent,
+        context: &'a DetectionContext,
+    ) -> Pin<Box<dyn Future<Output = Result<DetectionResult, DetectorError>> + Send + 'a>>;
 }
