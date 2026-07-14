@@ -63,12 +63,22 @@ impl From<sqlx::Error> for OwnerCommandError {
 #[derive(Debug, Clone, Copy)]
 pub struct OwnerCommandService {
     now: DateTime<Utc>,
+    default_destructive_mode: bool,
 }
 
 impl OwnerCommandService {
     #[must_use]
     pub const fn at(now: DateTime<Utc>) -> Self {
-        Self { now }
+        Self {
+            now,
+            default_destructive_mode: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_default_destructive_mode(mut self, enabled: bool) -> Self {
+        self.default_destructive_mode = enabled;
+        self
     }
 
     /// Authorizes and executes one command in the current transaction.
@@ -113,7 +123,7 @@ impl OwnerCommandService {
         uow: &mut UnitOfWork<'_>,
     ) -> Result<String, OwnerCommandError> {
         match command {
-            OwnerCommand::Health => health(connection, uow).await,
+            OwnerCommand::Health => health(connection, self.default_destructive_mode, uow).await,
             OwnerCommand::Inspect { chat_id } => inspect(connection, chat_id, uow).await,
             OwnerCommand::Reset { chat_id } => {
                 reset(connection, chat_id, false, self.now, uow).await
@@ -137,13 +147,16 @@ impl OwnerCommandService {
 
 async fn health(
     connection: &BusinessConnectionRecord,
+    default_destructive_mode: bool,
     uow: &mut UnitOfWork<'_>,
 ) -> Result<String, OwnerCommandError> {
     let destructive: Option<String> =
         sqlx::query_scalar("SELECT value FROM runtime_setting WHERE key = 'destructive_mode'")
             .fetch_optional(uow.connection())
             .await?;
-    let dry_run = destructive.as_deref() != Some("true");
+    let destructive_mode = destructive
+        .as_deref()
+        .map_or(default_destructive_mode, |value| value == "true");
     Ok(format!(
         "status=ok connection={} dry_run={}",
         if connection.enabled {
@@ -151,7 +164,7 @@ async fn health(
         } else {
             "disabled"
         },
-        if dry_run { "on" } else { "off" }
+        if destructive_mode { "off" } else { "on" }
     ))
 }
 

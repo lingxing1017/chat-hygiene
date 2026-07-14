@@ -6,6 +6,7 @@ use chathygiene::owner::{
 };
 use chathygiene::processing::ProcessingEngine;
 use chathygiene::storage::UnitOfWork;
+use chathygiene::telegram::parse_update;
 
 fn owner(sample: Option<LabeledMessageBody>) -> OwnerCommandSource {
     OwnerCommandSource {
@@ -306,4 +307,45 @@ async fn reset_preserves_active_until_owner_replies_are_deleted() {
         .unwrap_err();
     assert_eq!(error, OwnerCommandError::ActiveConversation);
     uow.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn health_reports_the_engine_destructive_default() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    let mut engine = ProcessingEngine::new(
+        pool.clone(),
+        common::MutableDetector::new(common::DetectorMode::Allow),
+        common::FixedVerifier,
+        common::TestClock::new(now),
+        true,
+    );
+    let parsed = parse_update(
+        br#"{
+          "update_id": 900,
+          "message": {
+            "message_id": 1,
+            "from": {"id": 42},
+            "chat": {"id": 42, "type": "private"},
+            "date": 1783987200,
+            "text": "/health"
+          }
+        }"#,
+        42,
+    )
+    .unwrap();
+
+    engine
+        .process(parsed.update_id, parsed.event)
+        .await
+        .unwrap();
+
+    let reply: String = sqlx::query_scalar(
+        "SELECT payload_json FROM outbox_action
+         WHERE source_update_id = 900 AND action_type = 'SEND_OWNER_MESSAGE'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(reply.contains("dry_run=off"));
 }

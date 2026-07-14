@@ -42,6 +42,7 @@ pub struct ProcessingEngine<D, V, C> {
     preparer: EventPreparer<D, V, C>,
     retention: RetentionService<C>,
     handler: LifecycleHandler,
+    default_destructive_mode: bool,
 }
 
 struct WorkItem {
@@ -71,6 +72,7 @@ where
             preparer: EventPreparer::new(detector, verifier, clock.clone(), destructive_mode),
             retention: RetentionService::new(clock),
             handler: LifecycleHandler,
+            default_destructive_mode: destructive_mode,
         }
     }
 
@@ -150,7 +152,8 @@ where
                 source_message_id: sample.source_message_id,
             }),
         };
-        let service = OwnerCommandService::at(raw.occurred_at);
+        let service = OwnerCommandService::at(raw.occurred_at)
+            .with_default_destructive_mode(self.default_destructive_mode);
         let connection = match service.authorize(&source, &mut uow).await {
             Ok(connection) => connection,
             Err(OwnerCommandError::Unauthorized) => {
