@@ -138,7 +138,7 @@ struct DeletedBusinessMessages {
 pub fn parse_update(body: &[u8], owner_user_id: i64) -> Result<ParsedUpdate, ParseError> {
     let update: Envelope = serde_json::from_slice(body)?;
     let event = if let Some(connection) = update.business_connection {
-        connection_event(connection)?
+        connection_event(connection, owner_user_id)?
     } else if let Some(message) = update.business_message {
         message_event(message, owner_user_id, false)?
     } else if let Some(message) = update.edited_business_message {
@@ -148,18 +148,7 @@ pub fn parse_update(body: &[u8], owner_user_id: i64) -> Result<ParsedUpdate, Par
     } else if let Some(message) = update.message.or(update.channel_post) {
         bot_message_event(message)?
     } else {
-        RawBusinessEvent {
-            kind: RawEventKind::Ignored,
-            connection_id: None,
-            chat_id: None,
-            message_id: None,
-            media_group_id: None,
-            content: None,
-            deleted_message_ids: Vec::new(),
-            connection: None,
-            owner_command: None,
-            occurred_at: Utc::now(),
-        }
+        ignored_event(Utc::now())
     };
     Ok(ParsedUpdate {
         update_id: update.update_id,
@@ -167,8 +156,14 @@ pub fn parse_update(body: &[u8], owner_user_id: i64) -> Result<ParsedUpdate, Par
     })
 }
 
-fn connection_event(connection: BusinessConnection) -> Result<RawBusinessEvent, ParseError> {
+fn connection_event(
+    connection: BusinessConnection,
+    owner_user_id: i64,
+) -> Result<RawBusinessEvent, ParseError> {
     let occurred_at = timestamp(connection.date)?;
+    if connection.user.id != owner_user_id {
+        return Ok(ignored_event(occurred_at));
+    }
     let connection_id = connection.id.clone();
     let snapshot = BusinessConnectionSnapshot {
         connection_id: connection.id,
@@ -193,6 +188,21 @@ fn connection_event(connection: BusinessConnection) -> Result<RawBusinessEvent, 
         owner_command: None,
         occurred_at,
     })
+}
+
+fn ignored_event(occurred_at: DateTime<Utc>) -> RawBusinessEvent {
+    RawBusinessEvent {
+        kind: RawEventKind::Ignored,
+        connection_id: None,
+        chat_id: None,
+        message_id: None,
+        media_group_id: None,
+        content: None,
+        deleted_message_ids: Vec::new(),
+        connection: None,
+        owner_command: None,
+        occurred_at,
+    }
 }
 
 fn message_event(

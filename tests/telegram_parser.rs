@@ -21,6 +21,19 @@ fn parses_connection_rights_and_ignores_unknown_fields() {
 }
 
 #[test]
+fn ignores_business_connections_owned_by_another_account() {
+    let mut update: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/telegram/business_connection.json")).unwrap();
+    update["business_connection"]["user"]["id"] = serde_json::Value::from(99);
+
+    let parsed = parse_update(&serde_json::to_vec(&update).unwrap(), 42).unwrap();
+
+    assert_eq!(parsed.event.kind, RawEventKind::Ignored);
+    assert!(parsed.event.connection.is_none());
+    assert!(parsed.event.connection_id.is_none());
+}
+
+#[test]
 fn distinguishes_inbound_owner_bot_implicit_and_edited_messages() {
     let inbound = parse(include_str!("fixtures/telegram/inbound_message.json"));
     assert_eq!(inbound.event.kind, RawEventKind::InboundMessage);

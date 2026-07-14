@@ -52,37 +52,43 @@ where
         raw: RawBusinessEvent,
         uow: &mut UnitOfWork<'_>,
     ) -> Result<PreparedEvent, ProcessingError> {
-        let action = match raw.kind {
-            RawEventKind::BusinessConnectionChanged => {
-                let connection = raw.connection.as_ref().ok_or_else(|| {
-                    ProcessingError::InvalidEvent("connection snapshot is missing".to_owned())
-                })?;
-                let rights_json = serde_json::to_string(&serde_json::json!({
-                    "can_reply": connection.rights.can_reply,
-                    "can_read_messages": connection.rights.can_read_messages,
-                    "can_delete_sent_messages": connection.rights.can_delete_sent_messages,
-                    "can_delete_all_messages": connection.rights.can_delete_all_messages,
-                }))?;
-                PreparedAction::ConnectionChanged {
-                    owner_user_id: connection.owner_user_id,
-                    enabled: connection.enabled,
-                    rights_json,
+        let action = if requires_known_connection(raw.kind)
+            && !known_business_connection(&raw, uow).await?
+        {
+            PreparedAction::Ignore
+        } else {
+            match raw.kind {
+                RawEventKind::BusinessConnectionChanged => {
+                    let connection = raw.connection.as_ref().ok_or_else(|| {
+                        ProcessingError::InvalidEvent("connection snapshot is missing".to_owned())
+                    })?;
+                    let rights_json = serde_json::to_string(&serde_json::json!({
+                        "can_reply": connection.rights.can_reply,
+                        "can_read_messages": connection.rights.can_read_messages,
+                        "can_delete_sent_messages": connection.rights.can_delete_sent_messages,
+                        "can_delete_all_messages": connection.rights.can_delete_all_messages,
+                    }))?;
+                    PreparedAction::ConnectionChanged {
+                        owner_user_id: connection.owner_user_id,
+                        enabled: connection.enabled,
+                        rights_json,
+                    }
                 }
+                RawEventKind::InboundMessage | RawEventKind::EditedInboundMessage => {
+                    self.prepare_inbound(&raw, uow).await?
+                }
+                RawEventKind::ManualOwnerMessage => PreparedAction::ManualOwner,
+                RawEventKind::BotBusinessMessage => PreparedAction::BotMessage {
+                    sender: PreparedSender::BusinessBot,
+                },
+                RawEventKind::ImplicitOwnerMessage => PreparedAction::BotMessage {
+                    sender: PreparedSender::Implicit,
+                },
+                RawEventKind::MessagesDeleted => PreparedAction::MessagesDeleted {
+                    message_ids: raw.deleted_message_ids.clone(),
+                },
+                RawEventKind::OwnerCommand | RawEventKind::Ignored => PreparedAction::Ignore,
             }
-            RawEventKind::InboundMessage | RawEventKind::EditedInboundMessage => {
-                self.prepare_inbound(&raw, uow).await?
-            }
-            RawEventKind::ManualOwnerMessage => PreparedAction::ManualOwner,
-            RawEventKind::BotBusinessMessage => PreparedAction::BotMessage {
-                sender: PreparedSender::BusinessBot,
-            },
-            RawEventKind::ImplicitOwnerMessage => PreparedAction::BotMessage {
-                sender: PreparedSender::Implicit,
-            },
-            RawEventKind::MessagesDeleted => PreparedAction::MessagesDeleted {
-                message_ids: raw.deleted_message_ids.clone(),
-            },
-            RawEventKind::OwnerCommand | RawEventKind::Ignored => PreparedAction::Ignore,
         };
         let chat_id = raw.chat_id;
         let facts = LifecycleFacts {
@@ -234,6 +240,30 @@ where
             max_attempts: challenge.max_attempts,
         }
     }
+}
+
+const fn requires_known_connection(kind: RawEventKind) -> bool {
+    matches!(
+        kind,
+        RawEventKind::InboundMessage
+            | RawEventKind::EditedInboundMessage
+            | RawEventKind::ManualOwnerMessage
+            | RawEventKind::BotBusinessMessage
+            | RawEventKind::ImplicitOwnerMessage
+            | RawEventKind::MessagesDeleted
+    )
+}
+
+async fn known_business_connection(
+    raw: &RawBusinessEvent,
+    uow: &mut UnitOfWork<'_>,
+) -> Result<bool, ProcessingError> {
+    let Some(connection_id) = raw.connection_id.as_deref() else {
+        return Ok(false);
+    };
+    Ok(find_business_connection(uow, connection_id)
+        .await?
+        .is_some())
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

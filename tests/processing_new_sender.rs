@@ -82,3 +82,32 @@ async fn bounded_worker_serializes_fast_messages() {
             .unwrap();
     assert_eq!(challenge_count, 1);
 }
+
+#[tokio::test]
+async fn unknown_business_connections_are_acknowledged_without_state() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    let mut event = common::inbound(3001, 200, Some("private foreign message"), now);
+    event.connection_id = Some("foreign-business".to_owned());
+    let mut engine = ProcessingEngine::new(
+        pool.clone(),
+        common::MutableDetector::new(common::DetectorMode::Spam),
+        common::FixedVerifier,
+        common::TestClock::new(now),
+        true,
+    );
+
+    engine.process(20, event).await.unwrap();
+
+    let state_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state_rows, 0);
+    let event_json: String =
+        sqlx::query_scalar("SELECT event_json FROM processed_update WHERE update_id = 20")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!event_json.contains("private foreign message"));
+}
