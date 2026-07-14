@@ -1,0 +1,19 @@
+services:
+  chathygiene:
+    build:
+      context: .
+    image: chathygiene:local
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      CHATHYGIENE_DATABASE_URL: sqlite:///data/chathygiene.db
+      CHATHYGIENE_DESTRUCTIVE_MODE: ${CHATHYGIENE_DESTRUCTIVE_MODE:-false}
+    ports:
+      - "${CHATHYGIENE_PORT:-8080}:8080"
+    volumes:
+      - chathygiene-data:/data
+
+volumes:
+  chathygiene-data:
