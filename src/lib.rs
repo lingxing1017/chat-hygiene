@@ -1,6 +1,7 @@
 pub mod app;
 pub mod clock;
 pub mod config;
+pub mod detection;
 pub mod domain;
 pub mod events;
 pub mod storage;

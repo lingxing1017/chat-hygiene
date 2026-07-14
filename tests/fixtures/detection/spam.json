@@ -1,0 +1,20 @@
+[
+  {
+    "name": "mixed language promotion",
+    "text": "合作推广，空投高回报，加入 https://t.me/+abcdef",
+    "prior_distinct_senders": 0,
+    "expected": "SPAM"
+  },
+  {
+    "name": "english payment solicitation",
+    "text": "Contact me for promotion and guaranteed investment returns. Pay 0x1234567890abcdef1234567890abcdef12345678",
+    "prior_distinct_senders": 0,
+    "expected": "SPAM"
+  },
+  {
+    "name": "repeated promotional template",
+    "text": "DM me for advertising opportunities",
+    "prior_distinct_senders": 2,
+    "expected": "SPAM"
+  }
+]

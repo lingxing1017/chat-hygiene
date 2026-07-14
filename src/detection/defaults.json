@@ -1,0 +1,47 @@
+{
+  "version": "2026-07-14.1",
+  "weights": {
+    "malicious_domain_exact": 100,
+    "repeated_promo_template": 100,
+    "telegram_invite_link": 45,
+    "solicitation_phrase": 40,
+    "wallet_or_payment_destination": 45,
+    "task_investment_airdrop_phrase": 40,
+    "more_than_two_links": 30,
+    "contact_plus_solicitation": 30,
+    "spacing_or_mixed_script_evasion": 20,
+    "excessive_mentions_or_emoji": 10,
+    "ordinary_url": 10
+  },
+  "solicitation_phrases": [
+    "contact me",
+    "dm me",
+    "promotion",
+    "promote",
+    "advertising",
+    "marketing service",
+    "business opportunity",
+    "合作推广",
+    "推广",
+    "广告投放",
+    "联系我",
+    "私聊我",
+    "渠道合作",
+    "代理"
+  ],
+  "task_investment_airdrop_phrases": [
+    "investment",
+    "guaranteed return",
+    "airdrop",
+    "rebate",
+    "commission",
+    "task job",
+    "投资",
+    "空投",
+    "返佣",
+    "刷单",
+    "任务赚钱",
+    "高回报",
+    "稳赚"
+  ]
+}

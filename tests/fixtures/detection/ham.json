@@ -1,0 +1,30 @@
+[
+  {
+    "name": "legitimate project inquiry",
+    "text": "你好，我想咨询你在 https://example.com 展示的项目，可以聊聊吗？",
+    "forwarded": false,
+    "media_kind": null,
+    "expected": "ALLOW"
+  },
+  {
+    "name": "invoice with contact number",
+    "text": "Invoice 2026-0714 is ready. Call +852 2123 4567 if anything is wrong.",
+    "forwarded": false,
+    "media_kind": "document",
+    "expected": "ALLOW"
+  },
+  {
+    "name": "forward marker alone",
+    "text": "Meeting moved to Thursday afternoon.",
+    "forwarded": true,
+    "media_kind": null,
+    "expected": "ALLOW"
+  },
+  {
+    "name": "uncaptioned photo",
+    "text": null,
+    "forwarded": false,
+    "media_kind": "photo",
+    "expected": "ALLOW"
+  }
+]
