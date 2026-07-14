@@ -4,3 +4,4 @@ pub mod config;
 pub mod domain;
 pub mod events;
 pub mod storage;
+pub mod verification;
