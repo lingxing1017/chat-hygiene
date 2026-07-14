@@ -11,6 +11,10 @@ pub enum StorageError {
     Database(#[from] sqlx::Error),
     #[error("migration error: {0}")]
     Migration(#[from] MigrateError),
+    #[error("conversation was modified by another transaction")]
+    ConcurrentModification,
+    #[error("invalid persisted data: {0}")]
+    InvalidData(String),
 }
 
 /// Opens the single-connection `SQLite` pool used by the MVP worker.
