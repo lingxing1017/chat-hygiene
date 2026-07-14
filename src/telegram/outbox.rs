@@ -388,12 +388,26 @@ async fn finish_permanent(
         if let Some(key) = &action.key {
             disable_business_connection(&mut uow, &key.connection_id, now).await?;
         }
+        force_dry_run(&mut uow, now).await?;
         enqueue_owner_alert(&mut uow, action, "business_rights_unavailable", None, now).await?;
     }
     uow.commit().await?;
     Ok(DispatchOutcome::PermanentFailure {
         action_id: action.id,
     })
+}
+
+async fn force_dry_run(uow: &mut UnitOfWork<'_>, now: DateTime<Utc>) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO runtime_setting(key, value, updated_at)
+         VALUES ('destructive_mode', 'false', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+           updated_at = excluded.updated_at",
+    )
+    .bind(now.to_rfc3339())
+    .execute(uow.connection())
+    .await?;
+    Ok(())
 }
 
 async fn finish_action_uncertain(

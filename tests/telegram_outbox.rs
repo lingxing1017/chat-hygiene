@@ -218,6 +218,14 @@ async fn already_applied_delete_succeeds_but_missing_right_disables_connection()
     let now = common::at("2026-07-14T00:00:00Z");
     start_challenge(&pool, now).await;
     sqlx::query(
+        "INSERT INTO runtime_setting(key, value, updated_at)
+         VALUES ('destructive_mode', 'true', ?)",
+    )
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
         "UPDATE outbox_action SET action_type = 'DELETE_BUSINESS_MESSAGES',
          payload_json = '{\"message_ids\":[10]}' WHERE id = 1",
     )
@@ -266,6 +274,12 @@ async fn already_applied_delete_succeeds_but_missing_right_disables_connection()
     .await
     .unwrap();
     assert!(!enabled);
+    let destructive_mode: String =
+        sqlx::query_scalar("SELECT value FROM runtime_setting WHERE key = 'destructive_mode'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(destructive_mode, "false");
     let alerts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM outbox_action WHERE action_type = 'SEND_OWNER_MESSAGE'",
     )
