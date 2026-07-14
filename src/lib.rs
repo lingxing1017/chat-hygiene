@@ -6,6 +6,7 @@ pub mod domain;
 pub mod events;
 pub mod owner;
 pub mod processing;
+pub mod retention;
 pub mod storage;
 pub mod telegram;
 pub mod verification;

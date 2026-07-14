@@ -1,9 +1,11 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use sqlx::SqlitePool;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{MissedTickBehavior, interval};
 
 use crate::clock::Clock;
 use crate::detection::SpamDetector;
@@ -12,6 +14,7 @@ use crate::owner::{
     LabeledMessageBody, OwnerCommandError, OwnerCommandService, OwnerCommandSource,
     parse_owner_command,
 };
+use crate::retention::RetentionService;
 use crate::storage::{
     ConversationKey, NewOutboxAction, OutboxActionKind, StorageError, UnitOfWork,
     enqueue_outbox_action,
@@ -37,6 +40,7 @@ pub enum ProcessingError {
 pub struct ProcessingEngine<D, V, C> {
     pool: SqlitePool,
     preparer: EventPreparer<D, V, C>,
+    retention: RetentionService<C>,
     handler: LifecycleHandler,
 }
 
@@ -58,16 +62,14 @@ where
     C: Clock,
 {
     #[must_use]
-    pub fn new(
-        pool: SqlitePool,
-        detector: D,
-        verifier: V,
-        clock: C,
-        destructive_mode: bool,
-    ) -> Self {
+    pub fn new(pool: SqlitePool, detector: D, verifier: V, clock: C, destructive_mode: bool) -> Self
+    where
+        C: Clone,
+    {
         Self {
             pool,
-            preparer: EventPreparer::new(detector, verifier, clock, destructive_mode),
+            preparer: EventPreparer::new(detector, verifier, clock.clone(), destructive_mode),
+            retention: RetentionService::new(clock),
             handler: LifecycleHandler,
         }
     }
@@ -206,9 +208,31 @@ where
 {
     let (sender, mut receiver) = mpsc::channel::<WorkItem>(capacity.max(1));
     tokio::spawn(async move {
-        while let Some(item) = receiver.recv().await {
-            let result = engine.process(item.update_id, item.raw).await;
-            let _ = item.receipt.send(result);
+        let mut expiry_tick = interval(Duration::from_secs(15));
+        expiry_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut purge_tick = interval(Duration::from_hours(1));
+        purge_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                item = receiver.recv() => {
+                    let Some(item) = item else {
+                        break;
+                    };
+                    let result = engine.process(item.update_id, item.raw).await;
+                    let _ = item.receipt.send(result);
+                }
+                _ = expiry_tick.tick() => {
+                    if let Err(error) = engine.retention.expire_due_state(&engine.pool).await {
+                        tracing::error!(%error, "state expiry pass failed");
+                    }
+                }
+                _ = purge_tick.tick() => {
+                    if let Err(error) = engine.retention.purge_history(&engine.pool).await {
+                        tracing::error!(%error, "history retention pass failed");
+                    }
+                }
+            }
         }
     });
     ProcessingHandle { sender }
