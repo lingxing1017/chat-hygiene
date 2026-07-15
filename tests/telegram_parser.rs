@@ -97,6 +97,14 @@ fn preserves_album_identity_and_deletion_batches() {
     let deleted = parse(include_str!("fixtures/telegram/deleted_messages.json"));
     assert_eq!(deleted.event.kind, RawEventKind::MessagesDeleted);
     assert_eq!(deleted.event.deleted_message_ids, vec![501, 502, 503]);
+    assert_eq!(
+        deleted.event.contact_display_name.as_deref(),
+        Some("Deleted Contact")
+    );
+    assert_eq!(
+        deleted.event.contact_username.as_deref(),
+        Some("deleted_contact")
+    );
 }
 
 #[test]
@@ -120,7 +128,7 @@ fn recognizes_owner_commands_and_rejects_invalid_required_fields() {
 }
 
 #[test]
-fn parses_username_only_into_transient_event_context() {
+fn parses_chat_identity_before_inbound_sender_identity() {
     let parsed = parse(
         r#"{
           "update_id": 120,
@@ -130,10 +138,17 @@ fn parses_username_only_into_transient_event_context() {
             "from": {
               "id": 1001,
               "is_bot": false,
-              "first_name": "Sample",
-              "username": "sample_user"
+              "first_name": "Sender",
+              "last_name": "Person",
+              "username": "sender_user"
             },
-            "chat": {"id": 1001, "type": "private"},
+            "chat": {
+              "id": 1001,
+              "type": "private",
+              "first_name": "  Contact\n",
+              "last_name": " Name  ",
+              "username": "contact_user"
+            },
             "date": 1783987280,
             "text": "hello"
           }
@@ -141,7 +156,11 @@ fn parses_username_only_into_transient_event_context() {
     );
 
     assert_eq!(
+        parsed.event.contact_display_name.as_deref(),
+        Some("Contact Name")
+    );
+    assert_eq!(
         parsed.event.contact_username.as_deref(),
-        Some("sample_user")
+        Some("contact_user")
     );
 }

@@ -2,7 +2,13 @@
   "update_id": 108,
   "deleted_business_messages": {
     "business_connection_id": "business-1",
-    "chat": { "id": 1001, "type": "private" },
+    "chat": {
+      "id": 1001,
+      "type": "private",
+      "first_name": "Deleted",
+      "last_name": "Contact",
+      "username": "deleted_contact"
+    },
     "message_ids": [501, 502, 503]
   }
 }

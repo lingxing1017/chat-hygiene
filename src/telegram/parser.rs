@@ -32,12 +32,17 @@ struct Envelope {
 #[derive(Deserialize)]
 struct User {
     id: i64,
+    first_name: Option<String>,
+    last_name: Option<String>,
     username: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Chat {
     id: i64,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    username: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -187,6 +192,7 @@ fn connection_event(
         deleted_message_ids: Vec::new(),
         connection: Some(snapshot),
         owner_command: None,
+        contact_display_name: None,
         contact_username: None,
         occurred_at,
     })
@@ -203,6 +209,7 @@ fn ignored_event(occurred_at: DateTime<Utc>) -> RawBusinessEvent {
         deleted_message_ids: Vec::new(),
         connection: None,
         owner_command: None,
+        contact_display_name: None,
         contact_username: None,
         occurred_at,
     }
@@ -216,6 +223,7 @@ fn message_event(
     let kind = classify_message(&message, owner_user_id, edited);
     let occurred_at = timestamp(message.edit_date.unwrap_or(message.date))?;
     let content = message_content(&message);
+    let (contact_display_name, contact_username) = message_contact_identity(&message, kind);
     Ok(RawBusinessEvent {
         kind,
         connection_id: Some(message.business_connection_id),
@@ -226,7 +234,8 @@ fn message_event(
         deleted_message_ids: Vec::new(),
         connection: None,
         owner_command: None,
-        contact_username: message.from.username.clone(),
+        contact_display_name,
+        contact_username,
         occurred_at,
     })
 }
@@ -275,6 +284,7 @@ fn bot_message_event(message: BotMessage) -> Result<RawBusinessEvent, ParseError
             text: command_text,
             replied_sample,
         }),
+        contact_display_name: None,
         contact_username: None,
         occurred_at,
     })
@@ -367,7 +377,52 @@ fn media_kind(message: &BusinessMessage) -> Option<MediaKind> {
     }
 }
 
+fn message_contact_identity(
+    message: &BusinessMessage,
+    kind: RawEventKind,
+) -> (Option<String>, Option<String>) {
+    let (chat_display_name, chat_username) = chat_identity(&message.chat);
+    if !matches!(
+        kind,
+        RawEventKind::InboundMessage | RawEventKind::EditedInboundMessage
+    ) {
+        return (chat_display_name, chat_username);
+    }
+    (
+        chat_display_name.or_else(|| {
+            display_name(
+                message.from.first_name.as_deref(),
+                message.from.last_name.as_deref(),
+            )
+        }),
+        chat_username.or_else(|| normalized_username(message.from.username.as_deref())),
+    )
+}
+
+fn chat_identity(chat: &Chat) -> (Option<String>, Option<String>) {
+    (
+        display_name(chat.first_name.as_deref(), chat.last_name.as_deref()),
+        normalized_username(chat.username.as_deref()),
+    )
+}
+
+fn display_name(first_name: Option<&str>, last_name: Option<&str>) -> Option<String> {
+    let name = first_name
+        .into_iter()
+        .chain(last_name)
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!name.is_empty()).then_some(name)
+}
+
+fn normalized_username(username: Option<&str>) -> Option<String> {
+    let username = username?.trim().trim_start_matches('@');
+    (!username.is_empty()).then(|| username.to_owned())
+}
+
 fn deletion_event(deleted: DeletedBusinessMessages) -> RawBusinessEvent {
+    let (contact_display_name, contact_username) = chat_identity(&deleted.chat);
     RawBusinessEvent {
         kind: RawEventKind::MessagesDeleted,
         connection_id: Some(deleted.business_connection_id),
@@ -378,7 +433,8 @@ fn deletion_event(deleted: DeletedBusinessMessages) -> RawBusinessEvent {
         deleted_message_ids: deleted.message_ids,
         connection: None,
         owner_command: None,
-        contact_username: None,
+        contact_display_name,
+        contact_username,
         occurred_at: Utc::now(),
     }
 }
