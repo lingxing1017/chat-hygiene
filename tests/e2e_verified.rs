@@ -36,9 +36,9 @@ async fn verification_retains_messages_and_enforces_attempt_limits() {
     harness
         .post(business_message(3, 2001, 11, 2001, Some("不是数字")))
         .await;
-    assert_eq!(harness.challenge_attempts(2001).await, 0);
+    assert_eq!(harness.challenge_attempts(2001).await, 1);
 
-    for (update_id, message_id) in [(4, 12), (5, 13), (6, 14)] {
+    for (update_id, message_id) in [(4, 12), (5, 13)] {
         harness
             .post(business_message(
                 update_id,
@@ -51,7 +51,7 @@ async fn verification_retains_messages_and_enforces_attempt_limits() {
     }
     assert_eq!(harness.challenge_attempts(2001).await, 3);
     assert_eq!(harness.state(2001).await, "TEMP_SOFT_BLOCKED");
-    assert_eq!(harness.ledger_ids(2001).await, vec![10, 11, 12, 13, 14]);
+    assert_eq!(harness.ledger_ids(2001).await, vec![10, 11, 12, 13]);
     let block_expires_at: String =
         sqlx::query_scalar("SELECT block_expires_at FROM conversation WHERE chat_id = 2001")
             .fetch_one(&harness.pool)

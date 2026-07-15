@@ -154,10 +154,11 @@ where
         let dry_run_spam = is_spam && !destructive_mode;
         let outcome = if is_spam && destructive_mode {
             InboundOutcome::Spam
-        } else if matches!(
-            state,
-            ConversationState::New | ConversationState::VerifyPending
-        ) && !availability.reply
+        } else if (is_spam && state == ConversationState::VerifyPending)
+            || (matches!(
+                state,
+                ConversationState::New | ConversationState::VerifyPending
+            ) && !availability.reply)
         {
             InboundOutcome::Retain
         } else {
@@ -207,7 +208,7 @@ where
                         AnswerKind::Correct => InboundOutcome::Correct {
                             challenge_id: challenge.id,
                         },
-                        AnswerKind::Incorrect => {
+                        AnswerKind::Incorrect | AnswerKind::NonNumeric => {
                             let exhausted = challenge.attempts_used + 1 >= challenge.max_attempts;
                             InboundOutcome::Incorrect {
                                 challenge_id: challenge.id,
@@ -217,7 +218,6 @@ where
                                     .filter(|_| destructive_mode),
                             }
                         }
-                        AnswerKind::NonNumeric => InboundOutcome::NonNumeric,
                     },
                 )
             }

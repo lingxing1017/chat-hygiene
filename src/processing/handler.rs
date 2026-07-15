@@ -190,7 +190,7 @@ impl LifecycleHandler {
                 self.apply_challenge_start(context, conversation, outcome, uow)
                     .await?;
             }
-            InboundOutcome::Retain | InboundOutcome::NonNumeric => {}
+            InboundOutcome::Retain => {}
             InboundOutcome::Correct { challenge_id } => {
                 close_challenge(uow, *challenge_id, context.facts.occurred_at).await?;
                 set_transition(

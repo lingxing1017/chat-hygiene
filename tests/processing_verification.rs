@@ -1,6 +1,7 @@
 mod common;
 
 use chathygiene::processing::ProcessingEngine;
+use chathygiene::telegram::RawEventKind;
 use chrono::Duration;
 
 #[tokio::test]
@@ -80,4 +81,49 @@ async fn verification_handles_success_exhaustion_and_expiry() {
         .await
         .unwrap();
     assert_eq!(expired, "NEW");
+}
+
+#[tokio::test]
+async fn new_non_spam_replies_consume_attempts_but_edits_do_not() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    let mut engine = ProcessingEngine::new(
+        pool.clone(),
+        common::MutableDetector::new(common::DetectorMode::Allow),
+        common::FixedVerifier,
+        common::TestClock::new(now),
+        true,
+    );
+
+    engine
+        .process(20, common::inbound(2001, 20, Some("hello"), now))
+        .await
+        .unwrap();
+    engine
+        .process(21, common::inbound(2001, 21, Some("不是数字"), now))
+        .await
+        .unwrap();
+    assert_eq!(challenge_attempts(&pool, 2001).await, 1);
+
+    engine
+        .process(22, common::inbound_photo(2001, 22, now))
+        .await
+        .unwrap();
+    assert_eq!(challenge_attempts(&pool, 2001).await, 2);
+
+    let mut edited = common::inbound(2001, 21, Some("8"), now);
+    edited.kind = RawEventKind::EditedInboundMessage;
+    engine.process(23, edited).await.unwrap();
+    assert_eq!(challenge_attempts(&pool, 2001).await, 2);
+}
+
+async fn challenge_attempts(pool: &sqlx::SqlitePool, chat_id: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT attempts_used FROM challenge
+         WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(chat_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }

@@ -97,3 +97,39 @@ async fn spam_blocks_and_cleans_known_messages_while_failures_open() {
     .unwrap();
     assert_eq!(alerts, 1);
 }
+
+#[tokio::test]
+async fn live_spam_closes_pending_challenge_without_consuming_attempt() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    let detector = common::MutableDetector::new(common::DetectorMode::Allow);
+    let mut engine = ProcessingEngine::new(
+        pool.clone(),
+        detector.clone(),
+        common::FixedVerifier,
+        common::TestClock::new(now),
+        true,
+    );
+    engine
+        .process(30, common::inbound(2001, 30, Some("hello"), now))
+        .await
+        .unwrap();
+    detector.set(common::DetectorMode::Spam);
+    engine
+        .process(31, common::inbound(2001, 31, Some("8"), now))
+        .await
+        .unwrap();
+
+    let state: String = sqlx::query_scalar("SELECT state FROM conversation WHERE chat_id = 2001")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let challenge: (i64, Option<String>) =
+        sqlx::query_as("SELECT attempts_used, closed_at FROM challenge WHERE chat_id = 2001")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "SPAM_SOFT_BLOCKED");
+    assert_eq!(challenge.0, 0);
+    assert!(challenge.1.is_some());
+}

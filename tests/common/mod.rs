@@ -572,6 +572,15 @@ pub fn inbound(
     }
 }
 
+pub fn inbound_photo(chat_id: i64, message_id: i64, now: DateTime<Utc>) -> RawBusinessEvent {
+    let mut event = inbound(chat_id, message_id, None, now);
+    event.content = Some(MessageContent {
+        media_kind: Some(chathygiene::detection::MediaKind::Photo),
+        ..MessageContent::default()
+    });
+    event
+}
+
 pub fn owner_message(chat_id: i64, message_id: i64, now: DateTime<Utc>) -> RawBusinessEvent {
     let mut event = inbound(chat_id, message_id, Some("owner reply"), now);
     event.kind = RawEventKind::ManualOwnerMessage;

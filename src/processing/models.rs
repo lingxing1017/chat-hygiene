@@ -64,7 +64,6 @@ pub(crate) enum InboundOutcome {
         exhausted: bool,
         block_expires_at: Option<DateTime<Utc>>,
     },
-    NonNumeric,
     Expired {
         challenge_id: i64,
     },
