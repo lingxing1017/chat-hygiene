@@ -2,6 +2,7 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnerCommand {
+    Help,
     Health,
     Inspect { chat_id: i64 },
     Reset { chat_id: i64 },
@@ -49,6 +50,7 @@ pub fn parse_owner_command(input: &str) -> Result<OwnerCommand, OwnerCommandPars
     }
     let arguments = parts.collect::<Vec<_>>();
     match name.to_ascii_lowercase().as_str() {
+        "help" if arguments.is_empty() => Ok(OwnerCommand::Help),
         "health" if arguments.is_empty() => Ok(OwnerCommand::Health),
         "inspect" => Ok(OwnerCommand::Inspect {
             chat_id: one_positive_id(&arguments)?,
@@ -69,7 +71,7 @@ pub fn parse_owner_command(input: &str) -> Result<OwnerCommand, OwnerCommandPars
         }),
         "mark_spam" if arguments.is_empty() => Ok(OwnerCommand::MarkSpam),
         "mark_ham" if arguments.is_empty() => Ok(OwnerCommand::MarkHam),
-        "health" | "dry_run" | "mark_spam" | "mark_ham" => {
+        "help" | "health" | "dry_run" | "mark_spam" | "mark_ham" => {
             Err(OwnerCommandParseError::InvalidArguments)
         }
         _ => Err(OwnerCommandParseError::Unknown),

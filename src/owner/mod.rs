@@ -13,6 +13,17 @@ use crate::storage::{
 
 pub use commands::{OwnerCommand, OwnerCommandParseError, parse_owner_command};
 
+const HELP_MESSAGE: &str = "owner commands:\n\
+/help - list owner commands\n\
+/health - show connection and dry-run status\n\
+/inspect <chat_id> - show conversation state\n\
+/reset <chat_id> - reset a non-ACTIVE conversation\n\
+/unblock <chat_id> - clear a local soft block\n\
+/dry_run on|off - set dry-run mode\n\
+/errors [1..20] - show recent errors\n\
+/mark_spam - label the replied message as spam\n\
+/mark_ham - label the replied message as ham";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabeledMessageBody {
     pub body: String,
@@ -123,6 +134,7 @@ impl OwnerCommandService {
         uow: &mut UnitOfWork<'_>,
     ) -> Result<String, OwnerCommandError> {
         match command {
+            OwnerCommand::Help => Ok(HELP_MESSAGE.to_owned()),
             OwnerCommand::Health => health(connection, self.default_destructive_mode, uow).await,
             OwnerCommand::Inspect { chat_id } => inspect(connection, chat_id, uow).await,
             OwnerCommand::Reset { chat_id } => {

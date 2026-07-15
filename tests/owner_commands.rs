@@ -18,6 +18,11 @@ fn owner(sample: Option<LabeledMessageBody>) -> OwnerCommandSource {
 
 #[test]
 fn parses_exact_commands_suffixes_and_arguments() {
+    assert_eq!(parse_owner_command("/help").unwrap(), OwnerCommand::Help);
+    assert_eq!(
+        parse_owner_command("/help@ChatHygieneBot").unwrap(),
+        OwnerCommand::Help
+    );
     assert_eq!(
         parse_owner_command("/health").unwrap(),
         OwnerCommand::Health
@@ -85,6 +90,7 @@ fn rejects_unknown_commands_invalid_ids_and_limits() {
         "/dry_run maybe",
         "/errors 1 extra",
         "/mark_spam extra",
+        "/help extra",
         "/health@",
     ] {
         assert!(
@@ -92,6 +98,33 @@ fn rejects_unknown_commands_invalid_ids_and_limits() {
             "accepted {invalid:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn help_lists_supported_owner_commands() {
+    let (_directory, pool) = common::processing_database().await;
+    let service = OwnerCommandService::at(common::at("2026-07-14T00:00:00Z"));
+    let mut uow = UnitOfWork::begin(&pool).await.unwrap();
+
+    let help = service
+        .execute(OwnerCommand::Help, owner(None), &mut uow)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        help,
+        "owner commands:\n\
+/help - list owner commands\n\
+/health - show connection and dry-run status\n\
+/inspect <chat_id> - show conversation state\n\
+/reset <chat_id> - reset a non-ACTIVE conversation\n\
+/unblock <chat_id> - clear a local soft block\n\
+/dry_run on|off - set dry-run mode\n\
+/errors [1..20] - show recent errors\n\
+/mark_spam - label the replied message as spam\n\
+/mark_ham - label the replied message as ham"
+    );
+    uow.rollback().await.unwrap();
 }
 
 #[tokio::test]
