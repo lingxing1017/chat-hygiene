@@ -474,6 +474,29 @@ pub async fn enqueue_outbox_action(
     Ok(result.rows_affected() == 1)
 }
 
+/// Lists every outbox action already created by one source update.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when `SQLite` cannot read or decode the actions.
+pub async fn list_outbox_actions_for_update(
+    uow: &mut UnitOfWork<'_>,
+    source_update_id: i64,
+) -> Result<Vec<OutboxActionRecord>, StorageError> {
+    let rows = sqlx::query_as::<_, OutboxActionRow>(
+        "SELECT id, source_update_id, connection_id, chat_id, action_type,
+                payload_json, status, attempts, claimed_at, next_attempt_at,
+                created_at, updated_at
+         FROM outbox_action
+         WHERE source_update_id = ?
+         ORDER BY id",
+    )
+    .bind(source_update_id)
+    .fetch_all(uow.connection())
+    .await?;
+    rows.into_iter().map(TryInto::try_into).collect()
+}
+
 /// Records one body-free lifecycle or decision audit row.
 ///
 /// # Errors

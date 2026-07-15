@@ -8,6 +8,7 @@ use crate::domain::ConversationState;
 use crate::events::PreparedEvent;
 use crate::storage::{
     ConversationKey, UnitOfWork, active_challenge, find_business_connection, find_conversation,
+    find_single_business_connection,
 };
 use crate::telegram::{RawBusinessEvent, RawEventKind};
 use crate::verification::{AnswerKind, ChallengeVerifier};
@@ -52,6 +53,9 @@ where
         raw: RawBusinessEvent,
         uow: &mut UnitOfWork<'_>,
     ) -> Result<PreparedEvent, ProcessingError> {
+        let destructive_mode = runtime_destructive_mode(uow, self.destructive_mode).await?;
+        let owner_user_id = trace_owner_user_id(&raw, uow).await?;
+        let state_before = trace_state_before(&raw, uow).await?;
         let action = if requires_known_connection(raw.kind)
             && !known_business_connection(&raw, uow).await?
         {
@@ -75,7 +79,7 @@ where
                     }
                 }
                 RawEventKind::InboundMessage | RawEventKind::EditedInboundMessage => {
-                    self.prepare_inbound(&raw, uow).await?
+                    self.prepare_inbound(&raw, destructive_mode, uow).await?
                 }
                 RawEventKind::ManualOwnerMessage => PreparedAction::ManualOwner,
                 RawEventKind::BotBusinessMessage => PreparedAction::BotMessage {
@@ -97,6 +101,10 @@ where
             user_id: chat_id,
             message_id: raw.message_id,
             media_group_id: raw.media_group_id,
+            owner_user_id,
+            event_kind: raw_event_name(raw.kind).to_owned(),
+            dry_run: !destructive_mode,
+            state_before,
             occurred_at: raw.occurred_at,
             action,
         };
@@ -111,6 +119,7 @@ where
     async fn prepare_inbound(
         &mut self,
         raw: &RawBusinessEvent,
+        runtime_destructive_mode: bool,
         uow: &mut UnitOfWork<'_>,
     ) -> Result<PreparedAction, ProcessingError> {
         let key = event_key(raw)?;
@@ -121,13 +130,12 @@ where
         if state == ConversationState::Active {
             return Ok(PreparedAction::ActiveInbound);
         }
-        let destructive_mode = runtime_destructive_mode(uow, self.destructive_mode).await?;
         let availability = business_availability(uow, &key).await?;
         if matches!(
             state,
             ConversationState::TempSoftBlocked | ConversationState::SpamSoftBlocked
         ) {
-            return Ok(if destructive_mode && availability.destructive {
+            return Ok(if runtime_destructive_mode && availability.destructive {
                 PreparedAction::BlockedInbound
             } else {
                 PreparedAction::BlockedFailOpen
@@ -150,7 +158,7 @@ where
             Err(error) => (DetectionFacts::failed(error.to_string()), true),
         };
         let is_spam = detection.decision == "SPAM";
-        let destructive_mode = destructive_mode && availability.destructive;
+        let destructive_mode = runtime_destructive_mode && availability.destructive;
         let dry_run_spam = is_spam && !destructive_mode;
         let outcome = if is_spam && destructive_mode {
             InboundOutcome::Spam
@@ -209,10 +217,15 @@ where
                             challenge_id: challenge.id,
                         },
                         AnswerKind::Incorrect | AnswerKind::NonNumeric => {
-                            let exhausted = challenge.attempts_used + 1 >= challenge.max_attempts;
+                            let attempts_used = challenge.attempts_used + 1;
+                            let exhausted = attempts_used >= challenge.max_attempts;
+                            let attempts_remaining =
+                                u8::try_from((challenge.max_attempts - attempts_used).max(0))
+                                    .unwrap_or_default();
                             InboundOutcome::Incorrect {
                                 challenge_id: challenge.id,
                                 exhausted,
+                                attempts_remaining,
                                 block_expires_at: exhausted
                                     .then(|| self.clock.now() + Duration::hours(24))
                                     .filter(|_| destructive_mode),
@@ -239,6 +252,51 @@ where
             expires_at: challenge.expires_at,
             max_attempts: challenge.max_attempts,
         }
+    }
+}
+
+async fn trace_owner_user_id(
+    raw: &RawBusinessEvent,
+    uow: &mut UnitOfWork<'_>,
+) -> Result<Option<i64>, ProcessingError> {
+    if let Some(connection) = raw.connection.as_ref() {
+        return Ok(Some(connection.owner_user_id));
+    }
+    if let Some(connection_id) = raw.connection_id.as_deref()
+        && let Some(connection) = find_business_connection(uow, connection_id).await?
+    {
+        return Ok(Some(connection.owner_user_id));
+    }
+    Ok(find_single_business_connection(uow)
+        .await?
+        .map(|connection| connection.owner_user_id))
+}
+
+async fn trace_state_before(
+    raw: &RawBusinessEvent,
+    uow: &mut UnitOfWork<'_>,
+) -> Result<Option<String>, ProcessingError> {
+    let (Some(connection_id), Some(chat_id)) = (raw.connection_id.as_deref(), raw.chat_id) else {
+        return Ok(None);
+    };
+    Ok(
+        find_conversation(uow, &ConversationKey::new(connection_id, chat_id))
+            .await?
+            .map(|conversation| conversation.state.as_str().to_owned()),
+    )
+}
+
+const fn raw_event_name(kind: RawEventKind) -> &'static str {
+    match kind {
+        RawEventKind::BusinessConnectionChanged => "BUSINESS_CONNECTION_CHANGED",
+        RawEventKind::InboundMessage => "INBOUND_MESSAGE",
+        RawEventKind::EditedInboundMessage => "EDITED_INBOUND_MESSAGE",
+        RawEventKind::ManualOwnerMessage => "MANUAL_OWNER_MESSAGE",
+        RawEventKind::BotBusinessMessage => "BOT_BUSINESS_MESSAGE",
+        RawEventKind::ImplicitOwnerMessage => "IMPLICIT_OWNER_MESSAGE",
+        RawEventKind::MessagesDeleted => "MESSAGES_DELETED",
+        RawEventKind::OwnerCommand => "OWNER_COMMAND",
+        RawEventKind::Ignored => "IGNORED",
     }
 }
 

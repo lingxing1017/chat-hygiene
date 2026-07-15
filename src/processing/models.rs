@@ -8,8 +8,20 @@ pub(crate) struct LifecycleFacts {
     pub user_id: Option<i64>,
     pub message_id: Option<i64>,
     pub media_group_id: Option<String>,
+    #[serde(default)]
+    pub owner_user_id: Option<i64>,
+    #[serde(default = "legacy_event_kind")]
+    pub event_kind: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub state_before: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub action: PreparedAction,
+}
+
+fn legacy_event_kind() -> String {
+    "LEGACY_LIFECYCLE".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,12 +74,18 @@ pub(crate) enum InboundOutcome {
     Incorrect {
         challenge_id: i64,
         exhausted: bool,
+        #[serde(default = "legacy_attempts_remaining")]
+        attempts_remaining: u8,
         block_expires_at: Option<DateTime<Utc>>,
     },
     Expired {
         challenge_id: i64,
     },
     Spam,
+}
+
+const fn legacy_attempts_remaining() -> u8 {
+    u8::MAX
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

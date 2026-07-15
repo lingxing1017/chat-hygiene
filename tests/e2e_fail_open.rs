@@ -60,7 +60,11 @@ async fn dry_run_records_spam_evidence_without_bodies_or_cleanup() {
     .unwrap();
     assert_eq!(
         actions,
-        vec!["PROPOSED_DESTRUCTIVE_ACTION", "SEND_CHALLENGE"]
+        vec![
+            "PROPOSED_DESTRUCTIVE_ACTION",
+            "SEND_CHALLENGE",
+            "SEND_OWNER_MESSAGE"
+        ]
     );
     let ordinary_rows: Vec<String> = sqlx::query_scalar(
         "SELECT event_json FROM processed_update

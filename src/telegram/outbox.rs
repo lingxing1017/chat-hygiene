@@ -177,15 +177,20 @@ impl<C: BusinessApi> OutboxDispatcher<C> {
                 Ok(ActionSuccess::Plain)
             }
             OutboxActionKind::SendOwnerMessage => {
-                let key = required_key(action)?;
-                let connection = load_connection(pool, &key.connection_id)
-                    .await?
-                    .ok_or(ActionFailure::RightsUnavailable)?;
                 let payload: OwnerAlertPayload = parse_payload(action)?;
+                let owner_user_id = if let Some(owner_user_id) = payload.owner_user_id {
+                    owner_user_id
+                } else {
+                    let key = required_key(action)?;
+                    load_connection(pool, &key.connection_id)
+                        .await?
+                        .ok_or(ActionFailure::RightsUnavailable)?
+                        .owner_user_id
+                };
                 self.client
                     .send_business_message(&SendAction {
                         business_connection_id: None,
-                        chat_id: connection.owner_user_id,
+                        chat_id: owner_user_id,
                         text: owner_alert_text(&payload),
                     })
                     .await?;
@@ -304,6 +309,7 @@ struct OwnerAlertPayload {
     alert: Option<String>,
     message: Option<String>,
     challenge_id: Option<i64>,
+    owner_user_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

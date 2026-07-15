@@ -14,8 +14,9 @@ pub use repositories::{
     close_challenge, create_challenge, disable_business_connection, eligible_deletion_ids,
     enqueue_outbox_action, find_business_connection, find_challenge_by_id, find_conversation,
     find_single_business_connection, get_or_create_conversation, increment_challenge_attempts,
-    insert_audit_event, mark_challenge_sent, mark_challenge_uncertain, mark_message_deleted,
-    mark_outbox_permanent_failure, mark_outbox_retry, mark_outbox_succeeded, mark_outbox_uncertain,
-    record_message, save_conversation, upsert_business_connection,
+    insert_audit_event, list_outbox_actions_for_update, mark_challenge_sent,
+    mark_challenge_uncertain, mark_message_deleted, mark_outbox_permanent_failure,
+    mark_outbox_retry, mark_outbox_succeeded, mark_outbox_uncertain, record_message,
+    save_conversation, upsert_business_connection,
 };
 pub use uow::UnitOfWork;

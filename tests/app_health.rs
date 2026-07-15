@@ -110,4 +110,11 @@ async fn runtime_recovers_recorded_events_before_readiness() {
         recovered,
         ("APPLIED".to_owned(), "recovered-business".to_owned())
     );
+    let trace_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox_action WHERE idempotency_key = '90:DRY_RUN_TRACE'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(trace_count, 0, "legacy events must not gain dry-run traces");
 }

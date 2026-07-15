@@ -7,15 +7,16 @@ use crate::storage::{
     BusinessConnectionRecord, ChallengeRecord, Conversation, ConversationKey, LedgerMessage,
     MessageDirection, NewAuditEvent, NewOutboxAction, OutboxActionKind, SenderKind, UnitOfWork,
     active_owner_reply_ids, close_active_challenge, close_challenge, create_challenge,
-    eligible_deletion_ids, enqueue_outbox_action, get_or_create_conversation,
-    increment_challenge_attempts, insert_audit_event, mark_message_deleted, record_message,
-    save_conversation, upsert_business_connection,
+    eligible_deletion_ids, enqueue_outbox_action, find_conversation, get_or_create_conversation,
+    increment_challenge_attempts, insert_audit_event, list_outbox_actions_for_update,
+    mark_message_deleted, record_message, save_conversation, upsert_business_connection,
 };
 use crate::telegram::delete_message_batches;
 
 use super::models::{
     DetectionFacts, InboundOutcome, LifecycleFacts, PreparedAction, PreparedSender,
 };
+use super::trace::ProcessingTrace;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LifecycleHandler;
@@ -107,12 +108,59 @@ impl EventApplier for LifecycleHandler {
                     self.apply_deletions(&facts, message_ids, uow).await?;
                 }
             }
+            self.enqueue_dry_run_trace(event, &facts, uow).await?;
             Ok(())
         })
     }
 }
 
 impl LifecycleHandler {
+    async fn enqueue_dry_run_trace(
+        self,
+        event: &PreparedEvent,
+        facts: &LifecycleFacts,
+        uow: &mut UnitOfWork<'_>,
+    ) -> Result<(), EventError> {
+        if !facts.dry_run {
+            return Ok(());
+        }
+        let Some(owner_user_id) = facts.owner_user_id else {
+            tracing::warn!(
+                update_id = event.update_id,
+                "dry-run trace has no trusted owner"
+            );
+            return Ok(());
+        };
+        let key = facts.optional_key();
+        let state_after = if let Some(key) = key.as_ref() {
+            find_conversation(uow, key)
+                .await?
+                .map(|conversation| conversation.state.as_str().to_owned())
+        } else {
+            None
+        };
+        let source_actions = list_outbox_actions_for_update(uow, event.update_id).await?;
+        let trace =
+            ProcessingTrace::from_lifecycle(event.update_id, facts, state_after, &source_actions);
+        enqueue_outbox_action(
+            uow,
+            &NewOutboxAction {
+                source_update_id: event.update_id,
+                key,
+                kind: OutboxActionKind::SendOwnerMessage,
+                payload_json: json!({
+                    "message": trace.render(),
+                    "owner_user_id": owner_user_id,
+                })
+                .to_string(),
+                idempotency_key: format!("{}:DRY_RUN_TRACE", event.update_id),
+                created_at: facts.occurred_at,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn apply_inbound(
         self,
         update_id: i64,
@@ -303,6 +351,7 @@ impl LifecycleHandler {
         let InboundOutcome::Incorrect {
             challenge_id,
             exhausted,
+            attempts_remaining,
             block_expires_at,
         } = outcome
         else {
@@ -310,15 +359,23 @@ impl LifecycleHandler {
                 "incorrect-answer outcome is required".to_owned(),
             ));
         };
-        let attempts = increment_challenge_attempts(uow, *challenge_id).await?;
+        let attempts_used = increment_challenge_attempts(uow, *challenge_id).await?;
         if !exhausted {
+            let attempts_remaining = if *attempts_remaining == u8::MAX {
+                i64::from(3_u8)
+                    .saturating_sub(attempts_used)
+                    .try_into()
+                    .unwrap_or_default()
+            } else {
+                *attempts_remaining
+            };
             return enqueue_challenge_edit(
                 uow,
                 context.update_id,
                 context.key,
                 *challenge_id,
                 "incorrect",
-                Some(3 - attempts),
+                Some(i64::from(attempts_remaining)),
                 context.facts.occurred_at,
             )
             .await;
@@ -487,6 +544,13 @@ impl LifecycleHandler {
 }
 
 impl LifecycleFacts {
+    fn optional_key(&self) -> Option<ConversationKey> {
+        Some(ConversationKey::new(
+            self.connection_id.as_deref()?,
+            self.chat_id?,
+        ))
+    }
+
     fn key(&self) -> Result<ConversationKey, EventError> {
         Ok(ConversationKey::new(
             self.connection_id

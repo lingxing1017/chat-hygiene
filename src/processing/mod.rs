@@ -3,6 +3,7 @@ mod models;
 mod notifications;
 mod preparer;
 mod service;
+mod trace;
 
 pub use handler::LifecycleHandler;
 pub use notifications::{

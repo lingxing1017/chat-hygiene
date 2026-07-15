@@ -24,6 +24,7 @@ enum Planned {
 struct FakeApi {
     planned: Arc<Mutex<VecDeque<Planned>>>,
     calls: Arc<Mutex<Vec<&'static str>>>,
+    sends: Arc<Mutex<Vec<SendAction>>>,
     edits: Arc<Mutex<Vec<EditAction>>>,
 }
 
@@ -32,6 +33,7 @@ impl FakeApi {
         Self {
             planned: Arc::new(Mutex::new(planned.into())),
             calls: Arc::new(Mutex::new(Vec::new())),
+            sends: Arc::new(Mutex::new(Vec::new())),
             edits: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -45,9 +47,10 @@ impl FakeApi {
 impl BusinessApi for FakeApi {
     fn send_business_message<'a>(
         &'a self,
-        _action: &'a SendAction,
+        action: &'a SendAction,
     ) -> Pin<Box<dyn Future<Output = Result<SentMessage, TelegramError>> + Send + 'a>> {
         Box::pin(async move {
+            self.sends.lock().unwrap().push(action.clone());
             let Planned::Send(result) = self.pop("send") else {
                 panic!("unexpected fake call")
             };
@@ -112,6 +115,50 @@ async fn start_challenge(pool: &sqlx::SqlitePool, now: DateTime<Utc>) {
         .process(1, common::inbound(1001, 10, Some("hello"), now))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn explicit_owner_message_dispatches_without_business_key() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES (700, 'ignored', '{}', 'APPLIED', ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox_action
+         (source_update_id, connection_id, chat_id, action_type, payload_json,
+          idempotency_key, status, attempts, created_at, updated_at)
+         VALUES (700, NULL, NULL, 'SEND_OWNER_MESSAGE',
+          '{\"message\":\"keyless trace\",\"owner_user_id\":4242}',
+          '700:DRY_RUN_TRACE', 'PENDING', 0, ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let api = FakeApi::with(vec![Planned::Send(Ok(SentMessage { message_id: 901 }))]);
+    let dispatcher = OutboxDispatcher::new(api.clone());
+
+    assert_eq!(
+        dispatcher.dispatch_next(now, &pool).await.unwrap(),
+        DispatchOutcome::Succeeded { action_id: 1 }
+    );
+    assert_eq!(
+        api.sends.lock().unwrap().as_slice(),
+        &[SendAction {
+            business_connection_id: None,
+            chat_id: 4242,
+            text: "keyless trace".to_owned(),
+        }]
+    );
 }
 
 #[tokio::test]

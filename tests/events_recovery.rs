@@ -8,6 +8,7 @@ use chathygiene::events::{
     EventApplier, EventError, PreparedEvent, apply_recorded_event, record_prepared_event,
     recover_recorded_events,
 };
+use chathygiene::processing::LifecycleHandler;
 use chathygiene::storage::{
     ConversationKey, UnitOfWork, connect, get_or_create_conversation, migrate,
 };
@@ -130,4 +131,87 @@ async fn failed_application_rolls_back_derived_state() {
             .await
             .expect("read status");
     assert_eq!(status, "RECORDED");
+}
+
+#[tokio::test]
+async fn legacy_incorrect_event_recovers_with_remaining_attempts() {
+    let (_directory, pool) = database().await;
+    let now = at("2026-07-14T00:00:00Z");
+    sqlx::query(
+        "INSERT INTO conversation
+         (connection_id, chat_id, user_id, state, created_at, updated_at)
+         VALUES ('business-1', 100, 100, 'VERIFY_PENDING', ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO challenge
+         (connection_id, chat_id, expression, answer_hmac, created_at, expires_at,
+          attempts_used, max_attempts, delivery_status)
+         VALUES ('business-1', 100, '7 + 5 - 3', 'legacy-hmac', ?, ?, 0, 3, 'SENT')",
+    )
+    .bind(now.to_rfc3339())
+    .bind((now + chrono::Duration::minutes(2)).to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    record_prepared_event(
+        &pool,
+        &PreparedEvent::new(
+            40,
+            "lifecycle",
+            now,
+            json!({
+                "connection_id": "business-1",
+                "chat_id": 100,
+                "user_id": 100,
+                "message_id": 11,
+                "media_group_id": null,
+                "occurred_at": now,
+                "action": {
+                    "kind": "INBOUND",
+                    "detection": {
+                        "decision": "ALLOW",
+                        "score": 0,
+                        "reasons": [],
+                        "matched_rules": [],
+                        "detector_name": "legacy",
+                        "detector_version": "1",
+                        "normalized_hash": "legacy-hash",
+                        "error": null
+                    },
+                    "outcome": {
+                        "kind": "INCORRECT",
+                        "challenge_id": 1,
+                        "exhausted": false,
+                        "block_expires_at": null
+                    },
+                    "dry_run_spam": false
+                }
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        recover_recorded_events(&pool, &LifecycleHandler)
+            .await
+            .unwrap(),
+        1
+    );
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload_json FROM outbox_action
+         WHERE source_update_id = 40 AND action_type = 'EDIT_CHALLENGE'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&payload).unwrap()["attempts_remaining"],
+        2
+    );
 }

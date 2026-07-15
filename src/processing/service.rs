@@ -19,6 +19,7 @@ use crate::retention::RetentionService;
 use crate::storage::{
     ConversationKey, NewOutboxAction, OutboxActionKind, StorageError, UnitOfWork,
     enqueue_outbox_action, find_business_connection, find_conversation,
+    list_outbox_actions_for_update,
 };
 use crate::telegram::{IngressError, RawBusinessEvent, RawEventKind, WebhookInbox};
 use crate::verification::ChallengeVerifier;
@@ -26,6 +27,7 @@ use crate::verification::ChallengeVerifier;
 use super::handler::LifecycleHandler;
 use super::notifications::{NewContactNotice, NewContactNotifier, NoopNewContactNotifier};
 use super::preparer::EventPreparer;
+use super::trace::ProcessingTrace;
 
 #[derive(Debug, Error)]
 pub enum ProcessingError {
@@ -148,6 +150,7 @@ where
                 _ => Err(ProcessingError::Event(EventError::InvalidStatus(status))),
             };
         }
+        let trace_enabled = dry_run_enabled(&mut uow, self.default_destructive_mode).await?;
 
         sqlx::query(
             "INSERT INTO processed_update
@@ -203,14 +206,13 @@ where
         let owner_chat_id = raw.chat_id.ok_or_else(|| {
             ProcessingError::InvalidEvent("owner command chat ID is missing".to_owned())
         })?;
+        let owner_message_id = raw.message_id;
+        let owner_key = ConversationKey::new(connection.connection_id, owner_chat_id);
         enqueue_outbox_action(
             &mut uow,
             &NewOutboxAction {
                 source_update_id: update_id,
-                key: Some(ConversationKey::new(
-                    connection.connection_id,
-                    owner_chat_id,
-                )),
+                key: Some(owner_key.clone()),
                 kind: OutboxActionKind::SendOwnerMessage,
                 payload_json: serde_json::json!({"message": response}).to_string(),
                 idempotency_key: format!("{update_id}:OWNER_COMMAND_REPLY"),
@@ -218,9 +220,66 @@ where
             },
         )
         .await?;
+        if trace_enabled {
+            enqueue_owner_command_trace(
+                &mut uow,
+                update_id,
+                owner_key,
+                connection.owner_user_id,
+                owner_chat_id,
+                owner_message_id,
+                raw.occurred_at,
+            )
+            .await?;
+        }
         uow.commit().await?;
         Ok(RecordReceipt::Recorded)
     }
+}
+
+async fn enqueue_owner_command_trace(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    owner_key: ConversationKey,
+    owner_user_id: i64,
+    owner_chat_id: i64,
+    owner_message_id: Option<i64>,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ProcessingError> {
+    let source_actions = list_outbox_actions_for_update(uow, update_id).await?;
+    let trace =
+        ProcessingTrace::owner_command(update_id, owner_chat_id, owner_message_id, &source_actions);
+    enqueue_outbox_action(
+        uow,
+        &NewOutboxAction {
+            source_update_id: update_id,
+            key: Some(owner_key),
+            kind: OutboxActionKind::SendOwnerMessage,
+            payload_json: serde_json::json!({
+                "message": trace.render(),
+                "owner_user_id": owner_user_id,
+            })
+            .to_string(),
+            idempotency_key: format!("{update_id}:DRY_RUN_TRACE"),
+            created_at: occurred_at,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn dry_run_enabled(
+    uow: &mut UnitOfWork<'_>,
+    default_destructive_mode: bool,
+) -> Result<bool, ProcessingError> {
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT value FROM runtime_setting WHERE key = 'destructive_mode'")
+            .fetch_optional(uow.connection())
+            .await
+            .map_err(StorageError::from)?;
+    Ok(!value
+        .as_deref()
+        .map_or(default_destructive_mode, |value| value == "true"))
 }
 
 async fn first_contact_notice(
