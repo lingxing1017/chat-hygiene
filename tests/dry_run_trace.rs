@@ -5,6 +5,30 @@ use chathygiene::processing::{EventPreparer, LifecycleHandler, ProcessingEngine}
 use chathygiene::storage::UnitOfWork;
 use chathygiene::telegram::{RawEventKind, parse_update};
 
+const CHALLENGE_TRACE: &str = concat!(
+    "[DRY-RUN 追踪]\n\n",
+    "更新 ID：1\n",
+    "联系人：Sample Contact @sample_contact\n",
+    "用户 ID：1001\n",
+    "消息 ID：10\n",
+    "事件：INBOUND_MESSAGE\n",
+    "状态：NEW -> VERIFY_PENDING\n\n",
+    "检测：\n",
+    "- 判定：ALLOW\n",
+    "- 分数：0\n",
+    "- 原因：无\n",
+    "- 规则：无\n",
+    "- 失败：false\n\n",
+    "验证：\n",
+    "- 结果：CHALLENGE_STARTED\n",
+    "- 剩余次数：3\n\n",
+    "操作：\n",
+    "- RECORD_MESSAGE：APPLIED\n",
+    "- CREATE_CHALLENGE：APPLIED\n",
+    "- UPDATE_CONVERSATION_STATE：APPLIED\n",
+    "- SEND_CHALLENGE：QUEUED\n",
+);
+
 async fn trace_messages(pool: &sqlx::SqlitePool, update_id: i64) -> Vec<String> {
     let payloads: Vec<String> = sqlx::query_scalar(
         "SELECT payload_json FROM outbox_action
@@ -39,14 +63,18 @@ async fn dry_run_spam_emits_one_body_free_trace_with_skipped_actions() {
         common::TestClock::new(now),
         false,
     );
-    engine
-        .process(1, common::inbound(1001, 10, Some("hello"), now))
-        .await
-        .unwrap();
+    let mut first = common::inbound(1001, 10, Some("hello"), now);
+    first.contact_display_name = Some("Sample Contact".to_owned());
+    first.contact_username = Some("sample_contact".to_owned());
+    engine.process(1, first).await.unwrap();
+
+    let challenge = trace_messages(&pool, 1).await;
+    assert_eq!(challenge, vec![CHALLENGE_TRACE]);
 
     detector.set(common::DetectorMode::Spam);
     let mut spam = common::inbound(1001, 11, Some("private-body-marker"), now);
-    spam.contact_username = Some("private_username_marker".to_owned());
+    spam.contact_display_name = Some("Sample Contact".to_owned());
+    spam.contact_username = Some("sample_contact".to_owned());
     let content = spam.content.as_mut().unwrap();
     content.caption = Some("private-caption-marker".to_owned());
     content.document_filename = Some("private-filename-marker.pdf".to_owned());
@@ -57,21 +85,25 @@ async fn dry_run_spam_emits_one_body_free_trace_with_skipped_actions() {
     assert_eq!(traces.len(), 1);
     let trace = &traces[0];
     for expected in [
-        "[DRY-RUN TRACE]",
-        "update_id: 2",
-        "contact: 1001",
-        "message_id: 11",
-        "event: INBOUND_MESSAGE",
-        "state: VERIFY_PENDING -> VERIFY_PENDING",
-        "- decision: SPAM",
-        "- score: 100",
-        "- reasons: simulated spam",
-        "- rules: test_spam",
-        "- result: NOT_EVALUATED_SPAM_FIRST",
-        "- RECORD_MESSAGE: APPLIED",
-        "- DELETE_MESSAGE: SKIPPED_DRY_RUN",
-        "- SPAM_BLOCK: SKIPPED_DRY_RUN",
-        "- KEEP_CHALLENGE_OPEN: APPLIED",
+        "[DRY-RUN 追踪]",
+        "更新 ID：2",
+        "联系人：Sample Contact @sample_contact",
+        "用户 ID：1001",
+        "消息 ID：11",
+        "事件：INBOUND_MESSAGE",
+        "状态：VERIFY_PENDING -> VERIFY_PENDING",
+        "检测：",
+        "- 判定：SPAM",
+        "- 分数：100",
+        "- 原因：simulated spam",
+        "- 规则：test_spam",
+        "- 失败：false",
+        "验证：\n- 结果：NOT_EVALUATED_SPAM_FIRST",
+        "操作：",
+        "- RECORD_MESSAGE：APPLIED",
+        "- DELETE_MESSAGE：SKIPPED_DRY_RUN",
+        "- SPAM_BLOCK：SKIPPED_DRY_RUN",
+        "- KEEP_CHALLENGE_OPEN：APPLIED",
     ] {
         assert!(
             trace.contains(expected),
@@ -82,7 +114,6 @@ async fn dry_run_spam_emits_one_body_free_trace_with_skipped_actions() {
         "private-body-marker",
         "private-caption-marker",
         "private-filename-marker.pdf",
-        "private_username_marker",
         "business-1",
     ] {
         assert!(
@@ -90,6 +121,54 @@ async fn dry_run_spam_emits_one_body_free_trace_with_skipped_actions() {
             "trace persisted private marker {private:?}: {trace}"
         );
     }
+    for old_label in [
+        "[DRY-RUN TRACE]",
+        "update_id:",
+        "contact:",
+        "message_id:",
+        "detection:",
+        "verification:",
+        "actions:",
+    ] {
+        assert!(!trace.contains(old_label), "old label remained: {trace}");
+    }
+    assert!(!trace.contains("剩余次数"));
+    let event_json: String =
+        sqlx::query_scalar("SELECT event_json FROM processed_update WHERE update_id = 2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(event_json.contains("Sample Contact"));
+    assert!(event_json.contains("sample_contact"));
+}
+
+#[tokio::test]
+async fn dry_run_trace_formats_missing_contact_identity() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    let mut engine = ProcessingEngine::new(
+        pool.clone(),
+        common::MutableDetector::new(common::DetectorMode::Allow),
+        common::FixedVerifier,
+        common::TestClock::new(now),
+        false,
+    );
+
+    let mut display_only = common::inbound(7001, 71, Some("hello"), now);
+    display_only.contact_display_name = Some("  Display\n Only  ".to_owned());
+    engine.process(701, display_only).await.unwrap();
+    assert!(trace_messages(&pool, 701).await[0].contains("联系人：Display Only\n用户 ID：7001"));
+
+    let mut username_only = common::inbound(7002, 72, Some("hello"), now);
+    username_only.contact_username = Some("username_only".to_owned());
+    engine.process(702, username_only).await.unwrap();
+    assert!(trace_messages(&pool, 702).await[0].contains("联系人：@username_only\n用户 ID：7002"));
+
+    engine
+        .process(703, common::inbound(7003, 73, Some("hello"), now))
+        .await
+        .unwrap();
+    assert!(trace_messages(&pool, 703).await[0].contains("联系人：无\n用户 ID：7003"));
 }
 
 #[tokio::test]
@@ -204,9 +283,9 @@ async fn dry_run_owner_command_emits_one_trace_without_command_text() {
 
     let traces = trace_messages(&pool, 200).await;
     assert_eq!(traces.len(), 1);
-    assert!(traces[0].contains("event: OWNER_COMMAND"));
-    assert!(traces[0].contains("- EXECUTE_OWNER_COMMAND: APPLIED"));
-    assert!(traces[0].contains("- SEND_OWNER_MESSAGE: QUEUED"));
+    assert!(traces[0].contains("事件：OWNER_COMMAND"));
+    assert!(traces[0].contains("- EXECUTE_OWNER_COMMAND：APPLIED"));
+    assert!(traces[0].contains("- SEND_OWNER_MESSAGE：QUEUED"));
     assert!(!traces[0].contains("/health"));
 }
 
@@ -271,14 +350,14 @@ async fn dry_run_exhaustion_traces_attempts_and_skipped_block() {
     }
 
     let second = trace_messages(&pool, 401).await;
-    assert!(second[0].contains("- result: INCORRECT attempts_remaining=2"));
+    assert!(second[0].contains("- 结果：INCORRECT\n- 剩余次数：2"));
     let exhausted = trace_messages(&pool, 403).await;
     for expected in [
-        "state: VERIFY_PENDING -> NEW",
-        "- result: INCORRECT attempts_remaining=0",
-        "- CLOSE_CHALLENGE: APPLIED",
-        "- UPDATE_CONVERSATION_STATE: APPLIED",
-        "- TEMP_SOFT_BLOCK: SKIPPED_DRY_RUN",
+        "状态：VERIFY_PENDING -> NEW",
+        "- 结果：INCORRECT\n- 剩余次数：0",
+        "- CLOSE_CHALLENGE：APPLIED",
+        "- UPDATE_CONVERSATION_STATE：APPLIED",
+        "- TEMP_SOFT_BLOCK：SKIPPED_DRY_RUN",
     ] {
         assert!(exhausted[0].contains(expected));
     }

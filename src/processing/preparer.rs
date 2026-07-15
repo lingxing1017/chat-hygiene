@@ -56,6 +56,14 @@ where
         let destructive_mode = runtime_destructive_mode(uow, self.destructive_mode).await?;
         let owner_user_id = trace_owner_user_id(&raw, uow).await?;
         let state_before = trace_state_before(&raw, uow).await?;
+        let (contact_display_name, contact_username) = if destructive_mode {
+            (None, None)
+        } else {
+            (
+                raw.contact_display_name.clone(),
+                raw.contact_username.clone(),
+            )
+        };
         let action = if requires_known_connection(raw.kind)
             && !known_business_connection(&raw, uow).await?
         {
@@ -94,6 +102,9 @@ where
                 RawEventKind::OwnerCommand | RawEventKind::Ignored => PreparedAction::Ignore,
             }
         };
+        let state_before = state_before.or_else(|| {
+            creates_conversation(&action).then(|| ConversationState::New.as_str().to_owned())
+        });
         let chat_id = raw.chat_id;
         let facts = LifecycleFacts {
             connection_id: raw.connection_id.clone(),
@@ -101,6 +112,8 @@ where
             user_id: chat_id,
             message_id: raw.message_id,
             media_group_id: raw.media_group_id,
+            contact_display_name,
+            contact_username,
             owner_user_id,
             event_kind: raw_event_name(raw.kind).to_owned(),
             dry_run: !destructive_mode,
@@ -283,6 +296,18 @@ async fn trace_state_before(
         find_conversation(uow, &ConversationKey::new(connection_id, chat_id))
             .await?
             .map(|conversation| conversation.state.as_str().to_owned()),
+    )
+}
+
+const fn creates_conversation(action: &PreparedAction) -> bool {
+    matches!(
+        action,
+        PreparedAction::Inbound { .. }
+            | PreparedAction::BlockedInbound
+            | PreparedAction::BlockedFailOpen
+            | PreparedAction::ManualOwner
+            | PreparedAction::BotMessage { .. }
+            | PreparedAction::MessagesDeleted { .. }
     )
 }
 

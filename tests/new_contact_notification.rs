@@ -32,7 +32,7 @@ impl NewContactNotifier for CapturingNotifier {
 }
 
 #[tokio::test]
-async fn first_inbound_notifies_once_without_persisting_username() {
+async fn first_inbound_notifies_once_without_live_identity_persistence() {
     let (_directory, pool) = common::processing_database().await;
     let now = common::at("2026-07-14T00:00:00Z");
     let notifier = CapturingNotifier::default();
@@ -46,7 +46,8 @@ async fn first_inbound_notifies_once_without_persisting_username() {
     .with_new_contact_notifier(notifier.clone());
 
     let mut first = common::inbound(1001, 10, Some("hello"), now);
-    first.contact_username = Some("sample_user".to_owned());
+    first.contact_display_name = Some("Live Contact Marker".to_owned());
+    first.contact_username = Some("live_contact_marker".to_owned());
     engine.process(1, first).await.unwrap();
     engine
         .process(2, common::inbound(1001, 11, Some("9"), now))
@@ -58,7 +59,7 @@ async fn first_inbound_notifies_once_without_persisting_username() {
         &[NewContactNotice {
             owner_user_id: 42,
             contact_chat_id: 1001,
-            username: Some("sample_user".to_owned()),
+            username: Some("live_contact_marker".to_owned()),
         }]
     );
 
@@ -72,7 +73,9 @@ async fn first_inbound_notifies_once_without_persisting_username() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert!(durable_rows.iter().all(|row| !row.contains("sample_user")));
+    for identity in ["Live Contact Marker", "live_contact_marker"] {
+        assert!(durable_rows.iter().all(|row| !row.contains(identity)));
+    }
 }
 
 #[tokio::test]

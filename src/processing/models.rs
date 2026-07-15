@@ -9,6 +9,10 @@ pub(crate) struct LifecycleFacts {
     pub message_id: Option<i64>,
     pub media_group_id: Option<String>,
     #[serde(default)]
+    pub contact_display_name: Option<String>,
+    #[serde(default)]
+    pub contact_username: Option<String>,
+    #[serde(default)]
     pub owner_user_id: Option<i64>,
     #[serde(default = "legacy_event_kind")]
     pub event_kind: String,
