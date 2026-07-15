@@ -97,7 +97,9 @@ async fn spam_cleanup_batches_every_known_message_at_telegram_limit() {
 
     let payloads: Vec<String> = sqlx::query_scalar(
         "SELECT payload_json FROM outbox_action
-         WHERE chat_id = 5010 AND action_type = 'DELETE_BUSINESS_MESSAGES'
+         WHERE source_update_id = 500
+           AND chat_id = 5010
+           AND action_type = 'DELETE_BUSINESS_MESSAGES'
          ORDER BY id",
     )
     .fetch_all(&harness.pool)
