@@ -198,16 +198,27 @@ precedence across restarts.
 Docker Compose is the intended deployment path:
 
 ```bash
+mkdir -p data
 docker compose up -d --build
 curl --fail http://127.0.0.1:8080/health/ready
 docker compose logs -f chathygiene
 ```
 
-The image builds with Rust 1.96, runs as an unprivileged `chathygiene` user,
-and stores SQLite data in the `chathygiene-data` named volume. Keep
-`CHATHYGIENE_DESTRUCTIVE_MODE=false` for initial observation. Connect the bot,
-confirm `/health`, inspect dry-run evidence, and only then send `/dry_run off`
-from the authorized private bot chat.
+The image builds and runs on Alpine 3.24 with Rust 1.96 and starts as the
+container's default root user. Compose mounts host `./data` at `/data`, so the
+SQLite database and its WAL/SHM files remain directly visible in the project's
+`data/` directory without a separate `chown`. Running as root simplifies
+bind-mount permissions but provides less isolation than an unprivileged
+container.
+
+Before upgrading an installation that used the `chathygiene-data` named
+volume, stop the service and back up or copy the database, WAL, and SHM files
+into `./data`. This change neither migrates nor deletes the old named volume
+automatically; starting without migration creates a new database in `./data`.
+
+Keep `CHATHYGIENE_DESTRUCTIVE_MODE=false` for initial observation. Connect the
+bot, confirm `/health`, inspect dry-run evidence, and only then send
+`/dry_run off` from the authorized private bot chat.
 
 To run without a container:
 

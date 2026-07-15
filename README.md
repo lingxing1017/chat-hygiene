@@ -139,12 +139,17 @@ openssl rand -hex 32
 推荐使用 Docker Compose 部署：
 
 ```bash
+mkdir -p data
 docker compose up -d --build
 curl --fail http://127.0.0.1:8080/health/ready
 docker compose logs -f chathygiene
 ```
 
-镜像使用 Rust 1.96 构建，以非特权 `chathygiene` 用户运行，并将 SQLite 数据存储在名为 `chathygiene-data` 的卷中。初次观察时请保持 `CHATHYGIENE_DESTRUCTIVE_MODE=false`。连接机器人，确认 `/health`，检查试运行证据，然后再从已授权的私人机器人聊天中发送 `/dry_run off`。
+镜像使用 Rust 1.96 在 Alpine 3.24 上构建和运行，并以容器默认的 root 用户启动。Compose 将宿主机的 `./data` 挂载到容器内的 `/data`，因此 SQLite 数据库及其 WAL/SHM 文件会直接保存在项目的 `data/` 目录中，无需额外执行 `chown`。root 运行简化了 bind mount 权限处理，但隔离性弱于非特权容器。
+
+从使用 `chathygiene-data` 命名卷的旧版本升级时，请先停止服务并备份或复制数据库、WAL 和 SHM 文件到 `./data`。本次变更不会自动迁移或删除旧命名卷；如果未迁移就启动，应用会在 `./data` 中创建新的数据库。
+
+初次观察时请保持 `CHATHYGIENE_DESTRUCTIVE_MODE=false`。连接机器人，确认 `/health`，检查试运行证据，然后再从已授权的私人机器人聊天中发送 `/dry_run off`。
 
 不使用容器运行：
 
