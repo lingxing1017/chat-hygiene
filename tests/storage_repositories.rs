@@ -2,10 +2,10 @@ mod common;
 
 use chathygiene::domain::ConversationState;
 use chathygiene::storage::{
-    ChallengeRecord, ConversationKey, LedgerMessage, MessageDirection, SenderKind, StorageError,
-    UnitOfWork, active_challenge, active_owner_reply_ids, close_challenge, connect,
-    create_challenge, eligible_deletion_ids, get_or_create_conversation, mark_message_deleted,
-    migrate, record_message, save_conversation,
+    BusinessConnectionRecord, ChallengeRecord, ConversationKey, LedgerMessage, MessageDirection,
+    SenderKind, StorageError, UnitOfWork, active_challenge, active_owner_reply_ids,
+    close_challenge, connect, create_challenge, eligible_deletion_ids, get_or_create_conversation,
+    mark_message_deleted, migrate, record_message, save_conversation, upsert_business_connection,
 };
 use chrono::{DateTime, Duration, Utc};
 use sqlx::SqlitePool;
@@ -184,4 +184,236 @@ async fn challenge_repository_closes_the_single_active_challenge() {
     );
     assert!(active_challenge(&mut uow, &key).await.unwrap().is_none());
     uow.commit().await.expect("commit challenge");
+}
+
+type OutboxSnapshot = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+async fn seed_replacement_fixture(pool: &SqlitePool, created_at: DateTime<Utc>) {
+    let old_key = ConversationKey::new("business-1", 100);
+    let mut uow = UnitOfWork::begin(pool).await.expect("begin setup");
+    get_or_create_conversation(&mut uow, &old_key, 100, created_at)
+        .await
+        .expect("create old conversation");
+    record_message(
+        &mut uow,
+        &LedgerMessage::new(
+            old_key.clone(),
+            10,
+            MessageDirection::Inbound,
+            SenderKind::External,
+            false,
+            created_at,
+        ),
+    )
+    .await
+    .expect("record old message");
+    create_challenge(
+        &mut uow,
+        &ChallengeRecord::pending(
+            old_key,
+            "7 + 5 - 3",
+            "answer-hmac",
+            created_at,
+            created_at + Duration::minutes(2),
+        ),
+    )
+    .await
+    .expect("create old challenge");
+    uow.commit().await.expect("commit old state");
+
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES (8000, 'lifecycle', '{}', 'APPLIED', ?, ?)",
+    )
+    .bind(created_at.to_rfc3339())
+    .bind(created_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .expect("seed processed update");
+    sqlx::query(
+        "INSERT INTO outbox_action
+         (source_update_id, connection_id, chat_id, action_type, payload_json,
+          idempotency_key, status, attempts, claimed_at, next_attempt_at,
+          created_at, updated_at)
+         VALUES
+          (8000, 'business-1', 100, 'READ_BUSINESS_MESSAGE', '{}',
+           'old-pending', 'PENDING', 0, ?, NULL, ?, ?),
+          (8000, 'business-1', 100, 'DELETE_BUSINESS_MESSAGES', '{}',
+           'old-retry', 'RETRY', 1, ?, ?, ?, ?),
+          (8000, 'business-1', 100, 'SEND_OWNER_MESSAGE', '{}',
+           'old-succeeded', 'SUCCEEDED', 1, NULL, NULL, ?, ?)",
+    )
+    .bind(created_at.to_rfc3339())
+    .bind(created_at.to_rfc3339())
+    .bind(created_at.to_rfc3339())
+    .bind(created_at.to_rfc3339())
+    .bind((created_at + Duration::minutes(5)).to_rfc3339())
+    .bind(created_at.to_rfc3339())
+    .bind(created_at.to_rfc3339())
+    .bind(created_at.to_rfc3339())
+    .bind(created_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .expect("seed outbox actions");
+    sqlx::query(
+        "INSERT INTO runtime_setting(key, value, updated_at)
+         VALUES ('destructive_mode', 'true', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                        updated_at = excluded.updated_at",
+    )
+    .bind(created_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .expect("enable destructive mode");
+}
+
+async fn replace_connection(pool: &SqlitePool, replaced_at: DateTime<Utc>) {
+    let mut uow = UnitOfWork::begin(pool).await.expect("begin replacement");
+    upsert_business_connection(
+        &mut uow,
+        &BusinessConnectionRecord {
+            connection_id: "business-2".to_owned(),
+            owner_user_id: 42,
+            rights_json: r#"{"can_reply":true}"#.to_owned(),
+            enabled: true,
+            updated_at: replaced_at,
+        },
+    )
+    .await
+    .expect("replace connection for owner");
+    uow.commit().await.expect("commit replacement");
+}
+
+async fn assert_replacement_state(pool: &SqlitePool, replaced_at: DateTime<Utc>) {
+    let connections: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT connection_id, enabled FROM business_connection ORDER BY connection_id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("load connections");
+    assert_eq!(connections, vec![("business-2".to_owned(), true)]);
+    for table in ["conversation", "message_ledger", "challenge"] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE connection_id = 'business-1'"
+        ))
+        .fetch_one(pool)
+        .await
+        .expect("count stale rows");
+        assert_eq!(count, 0, "stale {table} rows must be removed");
+    }
+
+    let outbox: Vec<OutboxSnapshot> = sqlx::query_as(
+        "SELECT idempotency_key, status, last_error, claimed_at, next_attempt_at
+             FROM outbox_action ORDER BY idempotency_key",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("load outbox actions");
+    assert_eq!(
+        outbox,
+        vec![
+            (
+                "old-pending".to_owned(),
+                "PERMANENT_FAILURE".to_owned(),
+                Some("business_connection_replaced".to_owned()),
+                None,
+                None,
+            ),
+            (
+                "old-retry".to_owned(),
+                "PERMANENT_FAILURE".to_owned(),
+                Some("business_connection_replaced".to_owned()),
+                None,
+                None,
+            ),
+            (
+                "old-succeeded".to_owned(),
+                "SUCCEEDED".to_owned(),
+                None,
+                None,
+                None,
+            ),
+        ]
+    );
+    let runtime: (String, String) = sqlx::query_as(
+        "SELECT value, updated_at FROM runtime_setting WHERE key = 'destructive_mode'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("load runtime setting");
+    assert_eq!(runtime, ("false".to_owned(), replaced_at.to_rfc3339()));
+    let processed_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM processed_update WHERE update_id = 8000")
+            .fetch_one(pool)
+            .await
+            .expect("count processed update");
+    assert_eq!(processed_count, 1);
+}
+
+#[tokio::test]
+async fn replacement_connection_retires_stale_state_and_forces_dry_run() {
+    let (_directory, pool) = database().await;
+    let created_at = at("2026-07-14T00:00:00Z");
+    let replaced_at = at("2026-07-15T06:04:40Z");
+
+    seed_replacement_fixture(&pool, created_at).await;
+    replace_connection(&pool, replaced_at).await;
+    assert_replacement_state(&pool, replaced_at).await;
+}
+
+#[tokio::test]
+async fn refreshing_same_connection_preserves_state_and_runtime_mode() {
+    let (_directory, pool) = database().await;
+    let key = ConversationKey::new("business-1", 100);
+    let now = at("2026-07-15T06:04:40Z");
+    let mut uow = UnitOfWork::begin(&pool).await.expect("begin setup");
+    get_or_create_conversation(&mut uow, &key, 100, now)
+        .await
+        .expect("create conversation");
+    uow.commit().await.expect("commit conversation");
+    sqlx::query(
+        "INSERT INTO runtime_setting(key, value, updated_at)
+         VALUES ('destructive_mode', 'true', ?)",
+    )
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("enable destructive mode");
+
+    let mut uow = UnitOfWork::begin(&pool).await.expect("begin refresh");
+    upsert_business_connection(
+        &mut uow,
+        &BusinessConnectionRecord {
+            connection_id: "business-1".to_owned(),
+            owner_user_id: 42,
+            rights_json: r#"{"can_reply":false}"#.to_owned(),
+            enabled: false,
+            updated_at: now + Duration::seconds(1),
+        },
+    )
+    .await
+    .expect("refresh connection");
+    uow.commit().await.expect("commit refresh");
+
+    let conversation_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation
+         WHERE connection_id = 'business-1' AND chat_id = 100",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count conversation");
+    assert_eq!(conversation_count, 1);
+    let runtime: String =
+        sqlx::query_scalar("SELECT value FROM runtime_setting WHERE key = 'destructive_mode'")
+            .fetch_one(&pool)
+            .await
+            .expect("load runtime setting");
+    assert_eq!(runtime, "true");
 }

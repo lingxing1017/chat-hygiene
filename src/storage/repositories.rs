@@ -121,7 +121,11 @@ pub async fn find_conversation(
         .transpose()
 }
 
-/// Inserts or refreshes the one configured Business connection.
+/// Inserts, refreshes, or replaces the one configured Business connection.
+///
+/// Telegram can issue a new connection ID for an owner whose previous
+/// connection is still stored. Replacement retires unfinished actions and
+/// resets destructive mode before connection-scoped state is removed.
 ///
 /// # Errors
 ///
@@ -130,6 +134,44 @@ pub async fn upsert_business_connection(
     uow: &mut UnitOfWork<'_>,
     connection: &BusinessConnectionRecord,
 ) -> Result<(), StorageError> {
+    let stale_connection_id: Option<String> = sqlx::query_scalar(
+        "SELECT connection_id FROM business_connection
+         WHERE owner_user_id = ? AND connection_id != ?",
+    )
+    .bind(connection.owner_user_id)
+    .bind(&connection.connection_id)
+    .fetch_optional(uow.connection())
+    .await?;
+
+    if let Some(stale_connection_id) = stale_connection_id {
+        sqlx::query(
+            "UPDATE outbox_action
+             SET status = 'PERMANENT_FAILURE', claimed_at = NULL,
+                 next_attempt_at = NULL,
+                 last_error = 'business_connection_replaced', updated_at = ?
+             WHERE connection_id = ? AND status IN ('PENDING', 'RETRY')",
+        )
+        .bind(connection.updated_at.to_rfc3339())
+        .bind(&stale_connection_id)
+        .execute(uow.connection())
+        .await?;
+
+        sqlx::query("DELETE FROM business_connection WHERE connection_id = ?")
+            .bind(&stale_connection_id)
+            .execute(uow.connection())
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO runtime_setting(key, value, updated_at)
+             VALUES ('destructive_mode', 'false', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                            updated_at = excluded.updated_at",
+        )
+        .bind(connection.updated_at.to_rfc3339())
+        .execute(uow.connection())
+        .await?;
+    }
+
     sqlx::query(
         "INSERT INTO business_connection
          (connection_id, owner_user_id, rights_json, enabled, updated_at)
