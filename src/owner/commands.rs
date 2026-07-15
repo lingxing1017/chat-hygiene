@@ -64,23 +64,32 @@ pub fn parse_owner_command(input: &str) -> Result<OwnerCommand, OwnerCommandPars
             "off" => Ok(OwnerCommand::DryRun { enabled: false }),
             _ => Err(OwnerCommandParseError::InvalidArguments),
         },
-        "errors" if arguments.len() <= 1 => {
-            let limit = arguments.first().map_or(Ok(10), |value| {
-                value
-                    .parse::<u8>()
-                    .ok()
-                    .filter(|limit| (1..=20).contains(limit))
-                    .ok_or(OwnerCommandParseError::InvalidArguments)
-            })?;
-            Ok(OwnerCommand::Errors { limit })
-        }
+        "errors" => Ok(OwnerCommand::Errors {
+            limit: normalized_error_limit(&arguments)?,
+        }),
         "mark_spam" if arguments.is_empty() => Ok(OwnerCommand::MarkSpam),
         "mark_ham" if arguments.is_empty() => Ok(OwnerCommand::MarkHam),
-        "health" | "dry_run" | "errors" | "mark_spam" | "mark_ham" => {
+        "health" | "dry_run" | "mark_spam" | "mark_ham" => {
             Err(OwnerCommandParseError::InvalidArguments)
         }
         _ => Err(OwnerCommandParseError::Unknown),
     }
+}
+
+fn normalized_error_limit(arguments: &[&str]) -> Result<u8, OwnerCommandParseError> {
+    if arguments.len() > 1 {
+        return Err(OwnerCommandParseError::InvalidArguments);
+    }
+    let Some(value) = arguments.first() else {
+        return Ok(10);
+    };
+    let Ok(value) = value.parse::<i128>() else {
+        return Ok(10);
+    };
+    if value <= 0 {
+        return Ok(10);
+    }
+    Ok(u8::try_from(value.min(20)).unwrap_or(20))
 }
 
 fn one_positive_id(arguments: &[&str]) -> Result<i64, OwnerCommandParseError> {

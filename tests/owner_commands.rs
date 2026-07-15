@@ -46,14 +46,22 @@ fn parses_exact_commands_suffixes_and_arguments() {
         parse_owner_command("/dry_run off").unwrap(),
         OwnerCommand::DryRun { enabled: false }
     );
-    assert_eq!(
-        parse_owner_command("/errors").unwrap(),
-        OwnerCommand::Errors { limit: 10 }
-    );
-    assert_eq!(
-        parse_owner_command("/errors 20").unwrap(),
-        OwnerCommand::Errors { limit: 20 }
-    );
+    for (input, expected) in [
+        ("/errors", 10),
+        ("/errors nope", 10),
+        ("/errors -3", 10),
+        ("/errors 0", 10),
+        ("/errors 1", 1),
+        ("/errors 20", 20),
+        ("/errors 21", 20),
+        ("/errors 255", 20),
+    ] {
+        assert_eq!(
+            parse_owner_command(input).unwrap(),
+            OwnerCommand::Errors { limit: expected },
+            "unexpected normalization for {input:?}"
+        );
+    }
     assert_eq!(
         parse_owner_command("/mark_spam").unwrap(),
         OwnerCommand::MarkSpam
@@ -75,8 +83,7 @@ fn rejects_unknown_commands_invalid_ids_and_limits() {
         "/inspect nope",
         "/reset 1 extra",
         "/dry_run maybe",
-        "/errors 0",
-        "/errors 21",
+        "/errors 1 extra",
         "/mark_spam extra",
         "/health@",
     ] {
