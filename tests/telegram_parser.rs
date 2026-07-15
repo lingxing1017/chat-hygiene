@@ -118,3 +118,30 @@ fn recognizes_owner_commands_and_rejects_invalid_required_fields() {
     assert!(parse_update(br#"{"update_id":110,"business_message":{}}"#, 42).is_err());
     assert!(parse_update(b"not json", 42).is_err());
 }
+
+#[test]
+fn parses_username_only_into_transient_event_context() {
+    let parsed = parse(
+        r#"{
+          "update_id": 120,
+          "business_message": {
+            "message_id": 530,
+            "business_connection_id": "business-1",
+            "from": {
+              "id": 1001,
+              "is_bot": false,
+              "first_name": "Sample",
+              "username": "sample_user"
+            },
+            "chat": {"id": 1001, "type": "private"},
+            "date": 1783987280,
+            "text": "hello"
+          }
+        }"#,
+    );
+
+    assert_eq!(
+        parsed.event.contact_username.as_deref(),
+        Some("sample_user")
+    );
+}

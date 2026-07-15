@@ -59,6 +59,7 @@ pub struct RawBusinessEvent {
     pub deleted_message_ids: Vec<i64>,
     pub connection: Option<BusinessConnectionSnapshot>,
     pub owner_command: Option<OwnerCommandSnapshot>,
+    pub contact_username: Option<String>,
     pub occurred_at: DateTime<Utc>,
 }
 

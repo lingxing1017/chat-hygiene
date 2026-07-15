@@ -91,6 +91,7 @@ pub trait BusinessApi: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), TelegramError>> + Send + 'a>>;
 }
 
+#[derive(Clone)]
 pub struct TelegramClient {
     http: reqwest::Client,
     token: SecretString,

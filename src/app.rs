@@ -12,7 +12,9 @@ use crate::detection::{DetectorError, RuleDetector};
 use crate::events::{EventError, recover_recorded_events, spawn_outbox_worker};
 use crate::processing::{LifecycleHandler, ProcessingEngine, spawn_processing_worker};
 use crate::storage::{StorageError, connect, migrate};
-use crate::telegram::{OutboxDispatcher, TelegramClient, WebhookInbox, webhook_router};
+use crate::telegram::{
+    OutboxDispatcher, TelegramClient, WebhookInbox, spawn_new_contact_notifier, webhook_router,
+};
 use crate::verification::ArithmeticVerifier;
 
 #[derive(Serialize)]
@@ -58,15 +60,17 @@ pub async fn build_runtime_router(settings: Arc<Settings>) -> Result<Router, App
     recover_recorded_events(&pool, &LifecycleHandler).await?;
     let detector = RuleDetector::from_defaults()?;
     let verifier = ArithmeticVerifier::from_os_rng(settings.challenge_hmac_key.clone());
+    let telegram = TelegramClient::new(settings.bot_token.clone());
+    let notifier = spawn_new_contact_notifier(telegram.clone(), 32);
     let engine = ProcessingEngine::new(
         pool.clone(),
         detector,
         verifier,
         SystemClock,
         settings.destructive_mode,
-    );
+    )
+    .with_new_contact_notifier(notifier);
     let inbox = Arc::new(spawn_processing_worker(engine, 128));
-    let telegram = TelegramClient::new(settings.bot_token.clone());
     std::mem::drop(spawn_outbox_worker(
         OutboxDispatcher::new(telegram),
         pool,

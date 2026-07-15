@@ -32,6 +32,7 @@ struct Envelope {
 #[derive(Deserialize)]
 struct User {
     id: i64,
+    username: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +187,7 @@ fn connection_event(
         deleted_message_ids: Vec::new(),
         connection: Some(snapshot),
         owner_command: None,
+        contact_username: None,
         occurred_at,
     })
 }
@@ -201,6 +203,7 @@ fn ignored_event(occurred_at: DateTime<Utc>) -> RawBusinessEvent {
         deleted_message_ids: Vec::new(),
         connection: None,
         owner_command: None,
+        contact_username: None,
         occurred_at,
     }
 }
@@ -223,6 +226,7 @@ fn message_event(
         deleted_message_ids: Vec::new(),
         connection: None,
         owner_command: None,
+        contact_username: message.from.username.clone(),
         occurred_at,
     })
 }
@@ -271,6 +275,7 @@ fn bot_message_event(message: BotMessage) -> Result<RawBusinessEvent, ParseError
             text: command_text,
             replied_sample,
         }),
+        contact_username: None,
         occurred_at,
     })
 }
@@ -373,6 +378,7 @@ fn deletion_event(deleted: DeletedBusinessMessages) -> RawBusinessEvent {
         deleted_message_ids: deleted.message_ids,
         connection: None,
         owner_command: None,
+        contact_username: None,
         occurred_at: Utc::now(),
     }
 }

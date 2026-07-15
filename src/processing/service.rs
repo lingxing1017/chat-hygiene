@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::SqlitePool;
@@ -17,12 +18,13 @@ use crate::owner::{
 use crate::retention::RetentionService;
 use crate::storage::{
     ConversationKey, NewOutboxAction, OutboxActionKind, StorageError, UnitOfWork,
-    enqueue_outbox_action,
+    enqueue_outbox_action, find_business_connection, find_conversation,
 };
 use crate::telegram::{IngressError, RawBusinessEvent, RawEventKind, WebhookInbox};
 use crate::verification::ChallengeVerifier;
 
 use super::handler::LifecycleHandler;
+use super::notifications::{NewContactNotice, NewContactNotifier, NoopNewContactNotifier};
 use super::preparer::EventPreparer;
 
 #[derive(Debug, Error)]
@@ -43,6 +45,7 @@ pub struct ProcessingEngine<D, V, C> {
     retention: RetentionService<C>,
     handler: LifecycleHandler,
     default_destructive_mode: bool,
+    new_contact_notifier: Arc<dyn NewContactNotifier>,
 }
 
 struct WorkItem {
@@ -73,7 +76,17 @@ where
             retention: RetentionService::new(clock),
             handler: LifecycleHandler,
             default_destructive_mode: destructive_mode,
+            new_contact_notifier: Arc::new(NoopNewContactNotifier),
         }
+    }
+
+    #[must_use]
+    pub fn with_new_contact_notifier<N>(mut self, notifier: N) -> Self
+    where
+        N: NewContactNotifier + 'static,
+    {
+        self.new_contact_notifier = Arc::new(notifier);
+        self
     }
 
     /// Serially prepares, records, and atomically applies one raw update.
@@ -91,6 +104,7 @@ where
             return self.process_owner_command(update_id, raw).await;
         }
         let mut read = UnitOfWork::begin(&self.pool).await?;
+        let first_contact_notice = first_contact_notice(&raw, &mut read).await?;
         let prepared = self.preparer.prepare(update_id, raw, &mut read).await?;
         read.rollback().await?;
 
@@ -99,6 +113,17 @@ where
             return Ok(receipt);
         }
         apply_recorded_event(&self.pool, update_id, &self.handler).await?;
+        if let Some(notice) = first_contact_notice {
+            let owner_user_id = notice.owner_user_id;
+            let contact_chat_id = notice.contact_chat_id;
+            if self.new_contact_notifier.try_notify(notice).is_err() {
+                tracing::warn!(
+                    owner_user_id,
+                    contact_chat_id,
+                    "new-contact notification was not queued"
+                );
+            }
+        }
         Ok(receipt)
     }
 
@@ -196,6 +221,31 @@ where
         uow.commit().await?;
         Ok(RecordReceipt::Recorded)
     }
+}
+
+async fn first_contact_notice(
+    raw: &RawBusinessEvent,
+    uow: &mut UnitOfWork<'_>,
+) -> Result<Option<NewContactNotice>, ProcessingError> {
+    if raw.kind != RawEventKind::InboundMessage {
+        return Ok(None);
+    }
+    let (Some(connection_id), Some(contact_chat_id)) = (raw.connection_id.as_deref(), raw.chat_id)
+    else {
+        return Ok(None);
+    };
+    let Some(connection) = find_business_connection(uow, connection_id).await? else {
+        return Ok(None);
+    };
+    let key = ConversationKey::new(connection_id, contact_chat_id);
+    if find_conversation(uow, &key).await?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(NewContactNotice {
+        owner_user_id: connection.owner_user_id,
+        contact_chat_id,
+        username: raw.contact_username.clone(),
+    }))
 }
 
 /// Starts the single bounded lifecycle worker used by the MVP.
