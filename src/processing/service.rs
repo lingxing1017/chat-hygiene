@@ -13,7 +13,7 @@ use crate::detection::SpamDetector;
 use crate::events::{EventError, RecordReceipt, apply_recorded_event, record_prepared_event};
 use crate::owner::{
     LabeledMessageBody, OwnerCommandError, OwnerCommandService, OwnerCommandSource,
-    parse_owner_command,
+    OwnerTelegramAction, parse_owner_command,
 };
 use crate::retention::RetentionService;
 use crate::storage::{
@@ -21,7 +21,9 @@ use crate::storage::{
     enqueue_outbox_action, find_business_connection, find_conversation,
     list_outbox_actions_for_update,
 };
-use crate::telegram::{IngressError, RawBusinessEvent, RawEventKind, WebhookInbox};
+use crate::telegram::{
+    IngressError, RawBusinessEvent, RawEventKind, WebhookInbox, delete_message_batches,
+};
 use crate::verification::ChallengeVerifier;
 
 use super::handler::LifecycleHandler;
@@ -190,36 +192,28 @@ where
             }
             Err(error) => return Err(ProcessingError::InvalidEvent(error.to_string())),
         };
-        let response = match parse_owner_command(&snapshot.text) {
+        let (response, telegram_actions) = match parse_owner_command(&snapshot.text) {
             Ok(command) => match service
                 .execute_authorized(command, source, &connection, &mut uow)
                 .await
             {
-                Ok(response) => response,
+                Ok(execution) => (execution.response, execution.telegram_actions),
                 Err(OwnerCommandError::Storage(error)) => {
                     return Err(ProcessingError::InvalidEvent(error));
                 }
-                Err(error) => format!("error={error}"),
+                Err(error) => (format!("error={error}"), Vec::new()),
             },
-            Err(error) => format!("error={error}"),
+            Err(error) => (format!("error={error}"), Vec::new()),
         };
+        enqueue_owner_telegram_actions(&mut uow, update_id, telegram_actions, raw.occurred_at)
+            .await?;
         let owner_chat_id = raw.chat_id.ok_or_else(|| {
             ProcessingError::InvalidEvent("owner command chat ID is missing".to_owned())
         })?;
         let owner_message_id = raw.message_id;
         let owner_key = ConversationKey::new(connection.connection_id, owner_chat_id);
-        enqueue_outbox_action(
-            &mut uow,
-            &NewOutboxAction {
-                source_update_id: update_id,
-                key: Some(owner_key.clone()),
-                kind: OutboxActionKind::SendOwnerMessage,
-                payload_json: serde_json::json!({"message": response}).to_string(),
-                idempotency_key: format!("{update_id}:OWNER_COMMAND_REPLY"),
-                created_at: raw.occurred_at,
-            },
-        )
-        .await?;
+        enqueue_owner_command_reply(&mut uow, update_id, &owner_key, &response, raw.occurred_at)
+            .await?;
         if trace_enabled {
             enqueue_owner_command_trace(
                 &mut uow,
@@ -235,6 +229,62 @@ where
         uow.commit().await?;
         Ok(RecordReceipt::Recorded)
     }
+}
+
+async fn enqueue_owner_command_reply(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    owner_key: &ConversationKey,
+    response: &str,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ProcessingError> {
+    enqueue_outbox_action(
+        uow,
+        &NewOutboxAction {
+            source_update_id: update_id,
+            key: Some(owner_key.clone()),
+            kind: OutboxActionKind::SendOwnerMessage,
+            payload_json: serde_json::json!({"message": response}).to_string(),
+            idempotency_key: format!("{update_id}:OWNER_COMMAND_REPLY"),
+            created_at: occurred_at,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn enqueue_owner_telegram_actions(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    actions: Vec<OwnerTelegramAction>,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ProcessingError> {
+    for action in actions {
+        match action {
+            OwnerTelegramAction::DeleteBusinessMessages { key, message_ids } => {
+                for (batch_index, batch) in
+                    delete_message_batches(&message_ids).into_iter().enumerate()
+                {
+                    enqueue_outbox_action(
+                        uow,
+                        &NewOutboxAction {
+                            source_update_id: update_id,
+                            key: Some(key.clone()),
+                            kind: OutboxActionKind::DeleteBusinessMessages,
+                            payload_json: serde_json::json!({"message_ids": batch}).to_string(),
+                            idempotency_key: format!(
+                                "{update_id}:DELETE_BUSINESS_MESSAGES:{}:{}:{batch_index}",
+                                key.connection_id, key.chat_id
+                            ),
+                            created_at: occurred_at,
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn enqueue_owner_command_trace(

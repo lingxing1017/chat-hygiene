@@ -290,6 +290,150 @@ async fn dry_run_owner_command_emits_one_trace_without_command_text() {
 }
 
 #[tokio::test]
+async fn dry_run_reset_queues_real_deletion_and_traces_it() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    let mut engine = ProcessingEngine::new(
+        pool.clone(),
+        common::MutableDetector::new(common::DetectorMode::Allow),
+        common::FixedVerifier,
+        common::TestClock::new(now),
+        false,
+    );
+    engine
+        .process(800, common::inbound(1001, 10, Some("hello"), now))
+        .await
+        .unwrap();
+    engine
+        .process(801, common::owner_message(1001, 11, now))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE challenge
+         SET prompt_message_id = 901, delivery_status = 'SENT'
+         WHERE chat_id = 1001",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE outbox_action SET status = 'SUCCEEDED'
+         WHERE connection_id = 'business-1' AND chat_id = 1001
+           AND action_type = 'SEND_CHALLENGE'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let command = owner_command(900, "/reset 1001");
+    engine
+        .process(command.update_id, command.event)
+        .await
+        .unwrap();
+
+    let deletion_payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM outbox_action
+         WHERE source_update_id = 900
+           AND action_type = 'DELETE_BUSINESS_MESSAGES'
+         ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(deletion_payloads.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&deletion_payloads[0]).unwrap(),
+        serde_json::json!({"message_ids": [10, 11, 901]})
+    );
+    let proposed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox_action
+         WHERE source_update_id = 900
+           AND action_type = 'PROPOSED_DESTRUCTIVE_ACTION'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(proposed, 0);
+    let state: String = sqlx::query_scalar("SELECT state FROM conversation WHERE chat_id = 1001")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "NEW");
+    for table in ["message_ledger", "challenge"] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE chat_id = 1001"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "{table} was not purged");
+    }
+    let traces = trace_messages(&pool, 900).await;
+    assert_eq!(traces.len(), 1);
+    assert!(traces[0].contains("- DELETE_BUSINESS_MESSAGES：QUEUED"));
+}
+
+#[tokio::test]
+async fn reset_batches_owner_authorized_deletion_at_telegram_limit() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    let mut engine = ProcessingEngine::new(
+        pool.clone(),
+        common::MutableDetector::new(common::DetectorMode::Allow),
+        common::FixedVerifier,
+        common::TestClock::new(now),
+        false,
+    );
+    engine
+        .process(910, common::inbound(2001, 1, Some("hello"), now))
+        .await
+        .unwrap();
+    for message_id in 2..=101 {
+        sqlx::query(
+            "INSERT INTO message_ledger
+             (connection_id, chat_id, message_id, direction, sender_kind,
+              manual_owner_reply, sent_at, eligible_for_deletion)
+             VALUES ('business-1', 2001, ?, 'INBOUND', 'EXTERNAL', 0, ?, 1)",
+        )
+        .bind(message_id)
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let command = owner_command(911, "/reset 2001");
+    engine
+        .process(command.update_id, command.event)
+        .await
+        .unwrap();
+
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM outbox_action
+         WHERE source_update_id = 911
+           AND action_type = 'DELETE_BUSINESS_MESSAGES'
+         ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let batches = payloads
+        .iter()
+        .map(|payload| {
+            serde_json::from_str::<serde_json::Value>(payload).unwrap()["message_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_i64().unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0], (1..=100).collect::<Vec<_>>());
+    assert_eq!(batches[1], vec![101]);
+}
+
+#[tokio::test]
 async fn recorded_lifecycle_recovery_inserts_trace_once() {
     let (_directory, pool) = common::processing_database().await;
     let now = common::at("2026-07-14T00:00:00Z");

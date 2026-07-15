@@ -7,8 +7,8 @@ use thiserror::Error;
 
 use crate::detection::normalized_text_hash;
 use crate::storage::{
-    BusinessConnectionRecord, ConversationKey, StorageError, UnitOfWork, find_conversation,
-    find_single_business_connection,
+    BusinessConnectionRecord, ConversationKey, StorageError, UnitOfWork, eligible_deletion_ids,
+    find_conversation, find_single_business_connection,
 };
 
 pub use commands::{OwnerCommand, OwnerCommandParseError, parse_owner_command};
@@ -17,7 +17,7 @@ const HELP_MESSAGE: &str = "owner commands:\n\
 /help - list owner commands\n\
 /health - show connection and dry-run status\n\
 /inspect <chat_id> - show conversation state\n\
-/reset <chat_id> - reset a non-ACTIVE conversation\n\
+/reset <chat_id> - delete known messages and reset the conversation\n\
 /unblock <chat_id> - clear a local soft block\n\
 /dry_run on|off - set dry-run mode\n\
 /errors [1..20] - show recent errors\n\
@@ -39,6 +39,29 @@ pub struct OwnerCommandSource {
     pub replied_sample: Option<LabeledMessageBody>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerCommandExecution {
+    pub response: String,
+    pub telegram_actions: Vec<OwnerTelegramAction>,
+}
+
+impl OwnerCommandExecution {
+    fn plain(response: String) -> Self {
+        Self {
+            response,
+            telegram_actions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerTelegramAction {
+    DeleteBusinessMessages {
+        key: ConversationKey,
+        message_ids: Vec<i64>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum OwnerCommandError {
     #[error("unauthorized owner command")]
@@ -53,8 +76,6 @@ pub enum OwnerCommandError {
     TargetNotFound,
     #[error("target conversation is not soft blocked")]
     TargetNotBlocked,
-    #[error("ACTIVE conversation cannot be reset while owner replies remain")]
-    ActiveConversation,
     #[error("owner command storage failed: {0}")]
     Storage(String),
 }
@@ -103,7 +124,7 @@ impl OwnerCommandService {
         command: OwnerCommand,
         source: OwnerCommandSource,
         uow: &mut UnitOfWork<'_>,
-    ) -> Result<String, OwnerCommandError> {
+    ) -> Result<OwnerCommandExecution, OwnerCommandError> {
         let connection = self.authorize(&source, uow).await?;
         self.execute_authorized(command, source, &connection, uow)
             .await
@@ -132,27 +153,33 @@ impl OwnerCommandService {
         source: OwnerCommandSource,
         connection: &BusinessConnectionRecord,
         uow: &mut UnitOfWork<'_>,
-    ) -> Result<String, OwnerCommandError> {
+    ) -> Result<OwnerCommandExecution, OwnerCommandError> {
         match command {
-            OwnerCommand::Help => Ok(HELP_MESSAGE.to_owned()),
-            OwnerCommand::Health => health(connection, self.default_destructive_mode, uow).await,
-            OwnerCommand::Inspect { chat_id } => inspect(connection, chat_id, uow).await,
+            OwnerCommand::Help => Ok(OwnerCommandExecution::plain(HELP_MESSAGE.to_owned())),
+            OwnerCommand::Health => Ok(OwnerCommandExecution::plain(
+                health(connection, self.default_destructive_mode, uow).await?,
+            )),
+            OwnerCommand::Inspect { chat_id } => Ok(OwnerCommandExecution::plain(
+                inspect(connection, chat_id, uow).await?,
+            )),
             OwnerCommand::Reset { chat_id } => {
-                reset(connection, chat_id, false, self.now, uow).await
+                reset_conversation(connection, chat_id, self.now, uow).await
             }
-            OwnerCommand::Unblock { chat_id } => {
-                reset(connection, chat_id, true, self.now, uow).await
-            }
-            OwnerCommand::DryRun { enabled } => {
-                set_dry_run(connection, enabled, self.now, uow).await
-            }
-            OwnerCommand::Errors { limit } => recent_errors(limit, uow).await,
-            OwnerCommand::MarkSpam => {
-                label_sample("spam_sample", source.replied_sample, self.now, uow).await
-            }
-            OwnerCommand::MarkHam => {
-                label_sample("ham_sample", source.replied_sample, self.now, uow).await
-            }
+            OwnerCommand::Unblock { chat_id } => Ok(OwnerCommandExecution::plain(
+                unblock_conversation(connection, chat_id, self.now, uow).await?,
+            )),
+            OwnerCommand::DryRun { enabled } => Ok(OwnerCommandExecution::plain(
+                set_dry_run(connection, enabled, self.now, uow).await?,
+            )),
+            OwnerCommand::Errors { limit } => Ok(OwnerCommandExecution::plain(
+                recent_errors(limit, uow).await?,
+            )),
+            OwnerCommand::MarkSpam => Ok(OwnerCommandExecution::plain(
+                label_sample("spam_sample", source.replied_sample, self.now, uow).await?,
+            )),
+            OwnerCommand::MarkHam => Ok(OwnerCommandExecution::plain(
+                label_sample("ham_sample", source.replied_sample, self.now, uow).await?,
+            )),
         }
     }
 }
@@ -198,31 +225,99 @@ async fn inspect(
     ))
 }
 
-async fn reset(
+async fn reset_conversation(
     connection: &BusinessConnectionRecord,
     chat_id: i64,
-    blocked_only: bool,
+    now: DateTime<Utc>,
+    uow: &mut UnitOfWork<'_>,
+) -> Result<OwnerCommandExecution, OwnerCommandError> {
+    let key = ConversationKey::new(&connection.connection_id, chat_id);
+    find_conversation(uow, &key)
+        .await?
+        .ok_or(OwnerCommandError::TargetNotFound)?;
+
+    let mut message_ids = eligible_deletion_ids(uow, &key).await?;
+    let prompt_message_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT prompt_message_id FROM challenge
+         WHERE connection_id = ? AND chat_id = ?
+           AND prompt_message_id IS NOT NULL",
+    )
+    .bind(&key.connection_id)
+    .bind(key.chat_id)
+    .fetch_all(uow.connection())
+    .await?;
+    message_ids.extend(prompt_message_ids);
+    message_ids.sort_unstable();
+    message_ids.dedup();
+
+    sqlx::query(
+        "DELETE FROM outbox_action
+         WHERE connection_id = ? AND chat_id = ?
+           AND status IN ('PENDING', 'RETRY')",
+    )
+    .bind(&key.connection_id)
+    .bind(key.chat_id)
+    .execute(uow.connection())
+    .await?;
+    sqlx::query("DELETE FROM challenge WHERE connection_id = ? AND chat_id = ?")
+        .bind(&key.connection_id)
+        .bind(key.chat_id)
+        .execute(uow.connection())
+        .await?;
+    sqlx::query("DELETE FROM message_ledger WHERE connection_id = ? AND chat_id = ?")
+        .bind(&key.connection_id)
+        .bind(key.chat_id)
+        .execute(uow.connection())
+        .await?;
+    sqlx::query(
+        "UPDATE conversation
+         SET state = 'NEW', block_expires_at = NULL, block_reason = NULL,
+             block_count = 0, updated_at = ?, state_version = state_version + 1
+         WHERE connection_id = ? AND chat_id = ?",
+    )
+    .bind(now.to_rfc3339())
+    .bind(&key.connection_id)
+    .bind(key.chat_id)
+    .execute(uow.connection())
+    .await?;
+    insert_recovery_audit(uow, &key.connection_id, key.chat_id, "reset", now).await?;
+
+    let message_count = message_ids.len();
+    Ok(OwnerCommandExecution {
+        response: format!(
+            "reset chat_id={chat_id} telegram_delete={} message_count={message_count}",
+            if message_ids.is_empty() {
+                "none"
+            } else {
+                "queued"
+            }
+        ),
+        telegram_actions: (!message_ids.is_empty())
+            .then_some(OwnerTelegramAction::DeleteBusinessMessages { key, message_ids })
+            .into_iter()
+            .collect(),
+    })
+}
+
+async fn unblock_conversation(
+    connection: &BusinessConnectionRecord,
+    chat_id: i64,
     now: DateTime<Utc>,
     uow: &mut UnitOfWork<'_>,
 ) -> Result<String, OwnerCommandError> {
-    let state_filter = if blocked_only {
-        " AND state IN ('TEMP_SOFT_BLOCKED', 'SPAM_SOFT_BLOCKED')"
-    } else {
-        " AND state != 'ACTIVE'"
-    };
-    let query = format!(
+    let changed = sqlx::query(
         "UPDATE conversation
          SET state = 'NEW', block_expires_at = NULL, block_reason = NULL,
              updated_at = ?, state_version = state_version + 1
-         WHERE connection_id = ? AND chat_id = ?{state_filter}"
-    );
-    let changed = sqlx::query(&query)
-        .bind(now.to_rfc3339())
-        .bind(&connection.connection_id)
-        .bind(chat_id)
-        .execute(uow.connection())
-        .await?
-        .rows_affected();
+         WHERE connection_id = ? AND chat_id = ?
+           AND state IN ('TEMP_SOFT_BLOCKED', 'SPAM_SOFT_BLOCKED')",
+    )
+    .bind(now.to_rfc3339())
+    .bind(&connection.connection_id)
+    .bind(chat_id)
+    .execute(uow.connection())
+    .await?
+    .rows_affected();
     if changed == 0 {
         let state: Option<String> = sqlx::query_scalar(
             "SELECT state FROM conversation WHERE connection_id = ? AND chat_id = ?",
@@ -233,7 +328,6 @@ async fn reset(
         .await?;
         return Err(match state.as_deref() {
             None => OwnerCommandError::TargetNotFound,
-            Some("ACTIVE") if !blocked_only => OwnerCommandError::ActiveConversation,
             Some(_) => OwnerCommandError::TargetNotBlocked,
         });
     }
@@ -246,18 +340,8 @@ async fn reset(
     .bind(chat_id)
     .execute(uow.connection())
     .await?;
-    insert_recovery_audit(
-        uow,
-        &connection.connection_id,
-        chat_id,
-        if blocked_only { "unblock" } else { "reset" },
-        now,
-    )
-    .await?;
-    Ok(format!(
-        "{} chat_id={chat_id}",
-        if blocked_only { "unblocked" } else { "reset" }
-    ))
+    insert_recovery_audit(uow, &connection.connection_id, chat_id, "unblock", now).await?;
+    Ok(format!("unblocked chat_id={chat_id}"))
 }
 
 #[derive(Debug, Deserialize)]
