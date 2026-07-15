@@ -46,9 +46,9 @@ Only a high-confidence spam result can trigger cleanup.
 verification, inbound ledger tracking, or cleanup in that conversation. It
 only records manual owner reply IDs and Telegram deletion updates. The
 conversation becomes `NEW` again after Telegram reports that every observed
-manual owner reply has been deleted. Clearing the conversation therefore
-causes the sender to be challenged again, provided Telegram delivers the
-deletion updates.
+manual owner reply has been deleted. If clearing or deleting the chat does not
+produce complete deletion updates, the owner can use `/reset <chat_id>` to
+explicitly start a new `NEW` cycle.
 
 ### Verification
 
@@ -191,7 +191,9 @@ SQLite database, its WAL/SHM files, logs, or the bot token.
 
 `CHATHYGIENE_DESTRUCTIVE_MODE` is only the startup default. Once the owner
 uses `/dry_run on` or `/dry_run off`, the persisted runtime setting takes
-precedence across restarts.
+precedence across restarts. Dry-run suppresses automatic destructive actions,
+but an explicit owner `/reset <chat_id>` is an exception: it still deletes
+known messages and records those actions in the dry-run trace.
 
 ## Run with Docker Compose
 
@@ -243,9 +245,9 @@ a manual owner reply, not as an administration command.
 | --- | --- |
 | `/health` | `status=ok connection=enabled|disabled dry_run=on|off` |
 | `/inspect <chat_id>` | Current state, block reason, and block count. |
-| `/reset <chat_id>` | Close a challenge and return a non-`ACTIVE` conversation to `NEW`. |
+| `/reset <chat_id>` | Delete recorded conversation messages, clear local lifecycle data, and reset any state to `NEW`. |
 | `/unblock <chat_id>` | Clear a temporary or persistent local soft block. |
-| `/dry_run on` | Disable destructive actions immediately and persist the override. |
+| `/dry_run on` | Disable automatic destructive actions and persist the override; explicit `/reset` is exempt. |
 | `/dry_run off` | Enable destructive actions only if the connection is enabled and all four rights are present. |
 | `/errors [1..20]` | Show recent timestamped error code/message rows; default 10. |
 | `/mark_spam` | Store the text/caption of the replied message as a labeled spam sample. |
@@ -255,11 +257,15 @@ To label a sample, forward or copy it into the normal private bot chat, then
 reply to that message with `/mark_spam` or `/mark_ham`. These two commands are
 the only paths that intentionally persist a message body.
 
-`/reset` refuses an `ACTIVE` conversation while any observed manual owner
-reply remains. `/unblock` changes only local state; it cannot restore deleted
-messages. An owner message sent directly into a blocked Business conversation
-is authoritative: it clears the local block and moves the conversation to
-`ACTIVE`.
+When Telegram reports the last manual owner reply deleted, `ACTIVE`
+automatically returns to `NEW`. If clearing history or deleting a chat produces
+no deletion update, `/reset <chat_id>` accepts every state, including `ACTIVE`.
+It queues every known undeleted message, including a confirmed challenge
+prompt, for Telegram deletion; clears the local ledger and challenge history;
+and starts a new `NEW` cycle. `telegram_delete=queued` means the request is
+durable in the outbox, not that Telegram has completed it; final failures are
+visible through `/errors`. `/unblock` still clears only a local soft block and
+does not delete messages or conversation data.
 
 ## Privacy and retention
 
@@ -274,7 +280,7 @@ history hourly:
 | Data | Retention |
 | --- | --- |
 | Ordinary inbound message IDs | 72 hours, unless needed by a pending deletion. |
-| Manual owner reply IDs | Kept so `ACTIVE` can be reset by deletion updates. |
+| Manual owner reply IDs | Kept until Telegram reports deletion or the owner runs `/reset`. |
 | Applied update records | 7 days when no outbox/audit row still references them. |
 | Successful outbox actions | 30 days. |
 | Failed or uncertain outbox actions | 90 days. |
@@ -282,7 +288,7 @@ history hourly:
 | Detailed audit events | 90 days, while preserving the newest audit for each persistent spam block. |
 | Conversations and persistent blocks | Not automatically purged. |
 | Business connection, rule metadata, and labeled samples | Not automatically purged. |
-| Challenge rows and outbound ledger IDs | Not automatically purged in the MVP. |
+| Challenge rows and outbound ledger IDs | Not automatically purged; `/reset` clears them for its target conversation. |
 
 SQLite can comfortably hold a large local soft-block index because it is
 mostly numeric IDs and timestamps; message bodies are the data that need the
@@ -306,7 +312,9 @@ cleanup action does not hide an unclassified private message.
 - Pending and due-retry outbox actions resume after restart.
 - A timeout while sending a challenge is `UNCERTAIN` and is never
   automatically repeated, avoiding duplicate prompts. The owner receives an
-  alert; use `/reset <chat_id>` when the conversation is not `ACTIVE`.
+  alert and can use `/reset <chat_id>` to clear the affected conversation. If
+  Telegram supplied no message ID for an uncertain send, the bot cannot delete
+  that unknown message automatically.
 - Telegram rate limits and retryable server failures use bounded retries.
 - A rights error returned by Telegram disables the stored Business connection,
   forces dry-run, and retains messages. Restore the rights or reconnect the
@@ -315,13 +323,13 @@ cleanup action does not hide an unclassified private message.
   needed, and use `/unblock <chat_id>` only when the local block should be
   cleared. Deleted messages cannot be reconstructed.
 - If Telegram misses deletion updates for owner replies, a conversation may
-  remain `ACTIVE`. The MVP has no force-reset command because overriding
-  observed owner replies would weaken the no-check guarantee.
+  remain `ACTIVE`; `/reset <chat_id>` explicitly ends the old cycle and cleans
+  up the messages known to the bot.
 
 Rotate a compromised bot token in BotFather and set the webhook again. Rotate
 the webhook secret in both Telegram and `.env`. Rotating the challenge HMAC
 key invalidates active answers; wait two minutes for expiry or reset affected
-non-`ACTIVE` conversations.
+conversations.
 
 ## Known limits
 
@@ -366,4 +374,4 @@ docker build --tag chathygiene:test .
 The test suite includes real Axum ingress, SQLite migrations and recovery,
 single-worker lifecycle processing, Telegram outbox behavior against a local
 HTTP stub, privacy assertions, duplicate updates, edits, albums, dry-run,
-verification, soft blocks, and `ACTIVE` reset semantics.
+verification, soft blocks, and reset cleanup semantics.
