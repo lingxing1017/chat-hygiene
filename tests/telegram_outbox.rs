@@ -24,6 +24,7 @@ enum Planned {
 struct FakeApi {
     planned: Arc<Mutex<VecDeque<Planned>>>,
     calls: Arc<Mutex<Vec<&'static str>>>,
+    edits: Arc<Mutex<Vec<EditAction>>>,
 }
 
 impl FakeApi {
@@ -31,6 +32,7 @@ impl FakeApi {
         Self {
             planned: Arc::new(Mutex::new(planned.into())),
             calls: Arc::new(Mutex::new(Vec::new())),
+            edits: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -55,9 +57,10 @@ impl BusinessApi for FakeApi {
 
     fn edit_business_message<'a>(
         &'a self,
-        _action: &'a EditAction,
+        action: &'a EditAction,
     ) -> Pin<Box<dyn Future<Output = Result<(), TelegramError>> + Send + 'a>> {
         Box::pin(async move {
+            self.edits.lock().unwrap().push(action.clone());
             let Planned::Edit(result) = self.pop("edit") else {
                 panic!("unexpected fake call")
             };
@@ -109,6 +112,68 @@ async fn start_challenge(pool: &sqlx::SqlitePool, now: DateTime<Utc>) {
         .process(1, common::inbound(1001, 10, Some("hello"), now))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn challenge_edits_keep_expression_and_use_mode_specific_copy() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    start_challenge(&pool, now).await;
+    let api = FakeApi::with(vec![
+        Planned::Send(Ok(SentMessage { message_id: 901 })),
+        Planned::Edit(Ok(())),
+        Planned::Edit(Ok(())),
+        Planned::Edit(Ok(())),
+    ]);
+    let dispatcher = OutboxDispatcher::new(api.clone());
+    dispatcher.dispatch_next(now, &pool).await.unwrap();
+
+    for (idempotency_suffix, status, attempts_remaining) in [
+        ("incorrect", "incorrect", 2),
+        ("exhausted-dry-run", "exhausted_dry_run", 0),
+        ("exhausted", "exhausted", 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO outbox_action
+             (source_update_id, connection_id, chat_id, action_type, payload_json,
+              idempotency_key, status, attempts, created_at, updated_at)
+             VALUES (?, 'business-1', 1001, 'EDIT_CHALLENGE', ?, ?,
+              'PENDING', 0, ?, ?)",
+        )
+        .bind(1_i64)
+        .bind(
+            serde_json::json!({
+                "challenge_id": 1,
+                "status": status,
+                "attempts_remaining": attempts_remaining,
+            })
+            .to_string(),
+        )
+        .bind(format!("edit-copy-{idempotency_suffix}"))
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    for _ in 0..3 {
+        assert!(matches!(
+            dispatcher.dispatch_next(now, &pool).await.unwrap(),
+            DispatchOutcome::Succeeded { .. }
+        ));
+    }
+
+    let edits = api.edits.lock().unwrap();
+    assert_eq!(
+        edits[0].text,
+        "答案不正确，还可尝试 2 次。\n\n请重新回答：\n7 + 5 - 3 = ?"
+    );
+    assert_eq!(
+        edits[1].text,
+        "验证失败。\nDry-run：正式模式下将软屏蔽 24 小时，本次未执行屏蔽。"
+    );
+    assert_eq!(edits[2].text, "验证失败，请 24 小时后再试。");
 }
 
 #[tokio::test]

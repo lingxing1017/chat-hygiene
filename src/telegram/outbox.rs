@@ -146,7 +146,7 @@ impl<C: BusinessApi> OutboxDispatcher<C> {
                         business_connection_id: key.connection_id.clone(),
                         chat_id: key.chat_id,
                         message_id,
-                        text: challenge_status_text(&payload),
+                        text: challenge_status_text(&challenge, &payload),
                     })
                     .await?;
                 Ok(ActionSuccess::Plain)
@@ -609,13 +609,17 @@ fn challenge_prompt(challenge: &ChallengeRecord) -> String {
     )
 }
 
-fn challenge_status_text(payload: &EditPayload) -> String {
+fn challenge_status_text(challenge: &ChallengeRecord, payload: &EditPayload) -> String {
     match payload.status.as_str() {
         "success" => "验证通过，消息已放行。".to_owned(),
         "incorrect" => format!(
-            "答案不正确，还可尝试 {} 次。",
-            payload.attempts_remaining.unwrap_or_default()
+            "答案不正确，还可尝试 {} 次。\n\n请重新回答：\n{} = ?",
+            payload.attempts_remaining.unwrap_or_default(),
+            challenge.expression
         ),
+        "exhausted_dry_run" => {
+            "验证失败。\nDry-run：正式模式下将软屏蔽 24 小时，本次未执行屏蔽。".to_owned()
+        }
         "exhausted" => "验证失败，请 24 小时后再试。".to_owned(),
         "expired" => "验证已过期，请重新发送消息开始验证。".to_owned(),
         _ => "验证状态已更新。".to_owned(),

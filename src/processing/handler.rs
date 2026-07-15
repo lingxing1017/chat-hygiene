@@ -351,12 +351,17 @@ impl LifecycleHandler {
             )
             .await?;
         }
+        let status = if block_expires_at.is_some() {
+            "exhausted"
+        } else {
+            "exhausted_dry_run"
+        };
         enqueue_challenge_edit(
             uow,
             context.update_id,
             context.key,
             *challenge_id,
-            "exhausted",
+            status,
             Some(0),
             context.facts.occurred_at,
         )
