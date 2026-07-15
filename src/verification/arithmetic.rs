@@ -126,6 +126,13 @@ impl Operator {
             Self::Multiply => left * right,
         }
     }
+
+    const fn precedence(self) -> u8 {
+        match self {
+            Self::Add | Self::Subtract => 1,
+            Self::Multiply => 2,
+        }
+    }
 }
 
 fn random_candidate<R: RngCore>(rng: &mut R) -> Option<(String, i32)> {
@@ -134,14 +141,7 @@ fn random_candidate<R: RngCore>(rng: &mut R) -> Option<(String, i32)> {
     let third = rng.random_range(0..=99_i32);
     let first_operator = random_operator(rng);
     let second_operator = random_operator(rng);
-    let intermediate = first_operator.apply(first, second);
-    if !(0..=99).contains(&intermediate) {
-        return None;
-    }
-    let answer = second_operator.apply(intermediate, third);
-    if !(0..=99).contains(&answer) {
-        return None;
-    }
+    let answer = bounded_answer(first, first_operator, second, second_operator, third)?;
 
     Some((
         format!(
@@ -151,6 +151,23 @@ fn random_candidate<R: RngCore>(rng: &mut R) -> Option<(String, i32)> {
         ),
         answer,
     ))
+}
+
+fn bounded_answer(
+    first: i32,
+    first_operator: Operator,
+    second: i32,
+    second_operator: Operator,
+    third: i32,
+) -> Option<i32> {
+    let (intermediate, answer) = if second_operator.precedence() > first_operator.precedence() {
+        let intermediate = second_operator.apply(second, third);
+        (intermediate, first_operator.apply(first, intermediate))
+    } else {
+        let intermediate = first_operator.apply(first, second);
+        (intermediate, second_operator.apply(intermediate, third))
+    };
+    ((0..=99).contains(&intermediate) && (0..=99).contains(&answer)).then_some(answer)
 }
 
 fn random_operator<R: RngCore>(rng: &mut R) -> Operator {
@@ -176,4 +193,29 @@ fn normalize_answer(raw: &str) -> Option<String> {
     } else {
         canonical.to_owned()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Operator, bounded_answer};
+
+    #[test]
+    fn candidate_answers_follow_standard_operator_precedence() {
+        assert_eq!(
+            bounded_answer(42, Operator::Subtract, 33, Operator::Multiply, 3),
+            None
+        );
+        assert_eq!(
+            bounded_answer(33, Operator::Subtract, 8, Operator::Multiply, 0),
+            Some(33)
+        );
+        assert_eq!(
+            bounded_answer(2, Operator::Add, 3, Operator::Multiply, 4),
+            Some(14)
+        );
+        assert_eq!(
+            bounded_answer(2, Operator::Multiply, 3, Operator::Add, 4),
+            Some(10)
+        );
+    }
 }

@@ -20,7 +20,23 @@ fn solve(challenge: &GeneratedChallenge) -> i32 {
     let first = parts[0].parse::<i32>().expect("first operand");
     let second = parts[2].parse::<i32>().expect("second operand");
     let third = parts[4].parse::<i32>().expect("third operand");
-    apply(apply(first, parts[1], second), parts[3], third)
+    calculate(first, parts[1], second, parts[3], third).1
+}
+
+fn calculate(
+    first: i32,
+    first_operator: &str,
+    second: i32,
+    second_operator: &str,
+    third: i32,
+) -> (i32, i32) {
+    if second_operator == "×" && first_operator != "×" {
+        let intermediate = apply(second, second_operator, third);
+        (intermediate, apply(first, first_operator, intermediate))
+    } else {
+        let intermediate = apply(first, first_operator, second);
+        (intermediate, apply(intermediate, second_operator, third))
+    }
 }
 
 fn apply(left: i32, operator: &str, right: i32) -> i32 {
@@ -101,8 +117,7 @@ fn generates_one_thousand_bounded_challenges() {
         let first = parts[0].parse::<i32>().unwrap();
         let second = parts[2].parse::<i32>().unwrap();
         let third = parts[4].parse::<i32>().unwrap();
-        let intermediate = apply(first, parts[1], second);
-        let result = apply(intermediate, parts[3], third);
+        let (intermediate, result) = calculate(first, parts[1], second, parts[3], third);
         assert!((0..=99).contains(&intermediate));
         assert!((0..=99).contains(&result));
         assert_eq!(

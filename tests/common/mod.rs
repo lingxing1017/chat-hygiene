@@ -418,8 +418,13 @@ pub fn challenge_answer(expression: &str) -> String {
     let first = parts[0].parse::<i32>().expect("first operand");
     let second = parts[2].parse::<i32>().expect("second operand");
     let third = parts[4].parse::<i32>().expect("third operand");
-    let intermediate = apply_operator(first, parts[1], second);
-    apply_operator(intermediate, parts[3], third).to_string()
+    if parts[3] == "×" && parts[1] != "×" {
+        let product = apply_operator(second, parts[3], third);
+        apply_operator(first, parts[1], product).to_string()
+    } else {
+        let intermediate = apply_operator(first, parts[1], second);
+        apply_operator(intermediate, parts[3], third).to_string()
+    }
 }
 
 fn apply_operator(left: i32, operator: &str, right: i32) -> i32 {
