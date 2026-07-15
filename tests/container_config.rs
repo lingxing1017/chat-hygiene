@@ -7,28 +7,42 @@ fn read(path: &str) -> String {
 }
 
 #[test]
-fn dockerfile_builds_locked_release_and_runs_minimal_non_root_image() {
+fn dockerfile_builds_locked_release_on_minimal_alpine_image() {
     let dockerfile = read("Dockerfile");
-    assert!(dockerfile.contains("FROM rust:1.96-bookworm AS builder"));
+    assert!(dockerfile.contains("FROM rust:1.96-alpine3.24 AS builder"));
+    assert!(dockerfile.contains("apk add --no-cache musl-dev pkgconfig"));
     assert!(dockerfile.contains("RUN cargo build --locked --release"));
-    assert!(dockerfile.contains("FROM debian:bookworm-slim AS runtime"));
-    assert!(dockerfile.contains("ca-certificates curl"));
-    assert!(dockerfile.contains("USER chathygiene"));
+    assert!(dockerfile.contains("FROM alpine:3.24 AS runtime"));
+    assert!(dockerfile.contains("apk add --no-cache ca-certificates curl"));
     assert!(dockerfile.contains("COPY --from=builder"));
     assert!(dockerfile.contains("/target/release/chathygiene"));
     assert!(dockerfile.contains("EXPOSE 8080"));
     assert!(dockerfile.contains("/health/ready"));
+
     let runtime = dockerfile
-        .split("FROM debian:bookworm-slim AS runtime")
+        .split("FROM alpine:3.24 AS runtime")
         .nth(1)
         .expect("runtime stage");
-    for forbidden in ["cargo", "rustc", "COPY src", "COPY tests", "apt cache"] {
+    assert!(
+        !runtime
+            .lines()
+            .any(|line| line.trim_start().starts_with("USER "))
+    );
+    for forbidden in [
+        "cargo",
+        "rustc",
+        "COPY src",
+        "COPY tests",
+        "apt-get",
+        "useradd",
+        "groupadd",
+    ] {
         assert!(!runtime.contains(forbidden), "runtime contains {forbidden}");
     }
 }
 
 #[test]
-fn compose_runs_one_dry_run_service_with_persistent_data() {
+fn compose_runs_one_dry_run_service_with_bind_mounted_data() {
     let compose = read("compose.yml");
     assert_eq!(
         compose
@@ -42,8 +56,8 @@ fn compose_runs_one_dry_run_service_with_persistent_data() {
     assert!(
         compose.contains("CHATHYGIENE_DESTRUCTIVE_MODE: ${CHATHYGIENE_DESTRUCTIVE_MODE:-false}")
     );
-    assert!(compose.contains("chathygiene-data:/data"));
-    assert!(compose.contains("chathygiene-data:"));
+    assert!(compose.contains("./data:/data"));
+    assert!(!compose.contains("chathygiene-data"));
     assert!(!compose.contains("replicas:"));
 
     let example = read(".env.example");

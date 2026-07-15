@@ -13,7 +13,4 @@ services:
     ports:
       - "${CHATHYGIENE_PORT:-8080}:8080"
     volumes:
-      - chathygiene-data:/data
-
-volumes:
-  chathygiene-data:
+      - ./data:/data
