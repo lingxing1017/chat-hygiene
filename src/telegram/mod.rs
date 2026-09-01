@@ -1,4 +1,5 @@
 mod client;
+mod connection_state;
 mod contact_notifier;
 mod models;
 mod outbox;
@@ -8,6 +9,12 @@ mod webhook;
 pub use client::{
     BusinessApi, DeleteAction, EditAction, ReadAction, SendAction, SentMessage, TelegramClient,
     TelegramError, delete_message_batches,
+};
+pub use connection_state::{
+    AuthenticatedBot, AuthoritativeBusinessConnection, AuthoritativeLookupError, BotIdentityApi,
+    BoxFuture, BusinessConnectionApi, lookup_authenticated_bot,
+    lookup_authenticated_bot_with_delay, lookup_business_connection,
+    lookup_business_connection_with_delay,
 };
 pub use contact_notifier::{NewContactNotifierHandle, spawn_new_contact_notifier};
 pub use models::{

@@ -6,8 +6,8 @@ use axum::http::StatusCode;
 use axum::routing::any;
 use axum::{Json, Router};
 use chathygiene::telegram::{
-    BusinessApi, DeleteAction, EditAction, ReadAction, SendAction, TelegramClient, TelegramError,
-    delete_message_batches,
+    BotIdentityApi, BusinessApi, BusinessConnectionApi, DeleteAction, EditAction, ReadAction,
+    SendAction, TelegramClient, TelegramError, delete_message_batches,
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -185,6 +185,289 @@ async fn client_parses_retry_after_and_rejects_invalid_delete_batches() {
             .await
             .unwrap_err();
         assert!(matches!(error, TelegramError::InvalidRequest(_)));
+    }
+}
+
+#[tokio::test]
+async fn client_queries_exact_authoritative_endpoints_and_discards_profile_fields() {
+    let (base_url, requests) = stub(vec![
+        (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "result": {
+                    "id": 123_456,
+                    "is_bot": true,
+                    "first_name": "must be discarded",
+                    "username": "must_not_escape"
+                }
+            }),
+        ),
+        (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "result": {
+                    "id": "business-full",
+                    "user": {"id": 42, "first_name": "discarded"},
+                    "user_chat_id": 4200,
+                    "date": 1_789_000_000,
+                    "rights": {
+                        "can_reply": true,
+                        "can_read_messages": true,
+                        "can_delete_sent_messages": true,
+                        "can_delete_all_messages": true
+                    },
+                    "is_enabled": true
+                }
+            }),
+        ),
+        (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "result": {
+                    "id": "business-limited",
+                    "user": {"id": 42},
+                    "date": 1_789_000_001,
+                    "rights": {
+                        "can_reply": false,
+                        "can_read_messages": true,
+                        "can_delete_sent_messages": false,
+                        "can_delete_all_messages": false
+                    },
+                    "is_enabled": false
+                }
+            }),
+        ),
+    ])
+    .await;
+    let token = "123456:authoritative-secret";
+    let client = TelegramClient::with_base_url(
+        reqwest::Client::new(),
+        SecretString::from(token.to_owned()),
+        base_url,
+    );
+
+    assert_eq!(client.get_me().await.unwrap().id, 123_456);
+    let full = client
+        .get_business_connection("business-full")
+        .await
+        .unwrap();
+    assert_eq!(full.connection_id, "business-full");
+    assert_eq!(full.business_user_id, 42);
+    assert_eq!(full.user_chat_id, Some(4200));
+    assert_eq!(full.connection_established_at, 1_789_000_000);
+    assert!(full.enabled);
+    assert!(full.rights.can_reply);
+    assert!(full.rights.can_read_messages);
+    assert!(full.rights.can_delete_sent_messages);
+    assert!(full.rights.can_delete_all_messages);
+    let limited = client
+        .get_business_connection("business-limited")
+        .await
+        .unwrap();
+    assert_eq!(limited.user_chat_id, None);
+    assert!(!limited.enabled);
+    assert!(!limited.rights.can_reply);
+    assert!(limited.rights.can_read_messages);
+    assert!(!limited.rights.can_delete_sent_messages);
+    assert!(!limited.rights.can_delete_all_messages);
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0].0, format!("/bot{token}/getMe"));
+    assert_eq!(requests[0].1, json!({}));
+    assert_eq!(
+        requests[1],
+        (
+            format!("/bot{token}/getBusinessConnection"),
+            json!({"business_connection_id": "business-full"})
+        )
+    );
+    assert_eq!(
+        requests[2],
+        (
+            format!("/bot{token}/getBusinessConnection"),
+            json!({"business_connection_id": "business-limited"})
+        )
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn client_strictly_rejects_malformed_authoritative_successes() {
+    let valid_rights = json!({
+        "can_reply": true,
+        "can_read_messages": true,
+        "can_delete_sent_messages": true,
+        "can_delete_all_messages": true
+    });
+    let responses = vec![
+        (StatusCode::OK, json!({"ok": true})),
+        (
+            StatusCode::OK,
+            json!({"ok": true, "result": {"id": 1, "is_bot": false}}),
+        ),
+        (
+            StatusCode::OK,
+            json!({"ok": true, "result": {"id": "1", "is_bot": true}}),
+        ),
+        (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "result": {
+                    "id": "different-id",
+                    "user": {"id": 42},
+                    "user_chat_id": 4200,
+                    "date": 100,
+                    "rights": valid_rights,
+                    "is_enabled": true
+                }
+            }),
+        ),
+        (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "result": {
+                    "id": "expected-id",
+                    "user": {"id": 0},
+                    "user_chat_id": 4200,
+                    "date": 100,
+                    "rights": valid_rights,
+                    "is_enabled": true
+                }
+            }),
+        ),
+        (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "result": {
+                    "id": "expected-id",
+                    "user": {"id": 42},
+                    "user_chat_id": 0,
+                    "date": 100,
+                    "rights": valid_rights,
+                    "is_enabled": true
+                }
+            }),
+        ),
+        (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "result": {
+                    "id": "expected-id",
+                    "user": {"id": 42},
+                    "date": "100",
+                    "rights": valid_rights,
+                    "is_enabled": true
+                }
+            }),
+        ),
+        (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "result": {
+                    "id": "expected-id",
+                    "user": {"id": 42},
+                    "date": 100,
+                    "rights": {
+                        "can_reply": true,
+                        "can_read_messages": true,
+                        "can_delete_sent_messages": true
+                    },
+                    "is_enabled": true
+                }
+            }),
+        ),
+        (
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "result": {
+                    "id": "expected-id",
+                    "user": {"id": 42},
+                    "date": 100,
+                    "rights": {
+                        "can_reply": true,
+                        "can_read_messages": true,
+                        "can_delete_sent_messages": true,
+                        "can_delete_all_messages": true,
+                        "unexpected": true
+                    },
+                    "is_enabled": true
+                }
+            }),
+        ),
+        (StatusCode::OK, json!({"ok": true})),
+    ];
+    let (base_url, _) = stub(responses).await;
+    let client = TelegramClient::with_base_url(
+        reqwest::Client::new(),
+        SecretString::from("strict-token".to_owned()),
+        base_url,
+    );
+
+    for result in [
+        client.get_me().await,
+        client.get_me().await,
+        client.get_me().await,
+    ] {
+        assert!(matches!(result.unwrap_err(), TelegramError::Protocol(_)));
+    }
+    for _ in 0..7 {
+        assert!(matches!(
+            client
+                .get_business_connection("expected-id")
+                .await
+                .unwrap_err(),
+            TelegramError::Protocol(_)
+        ));
+    }
+    assert!(matches!(
+        client.get_business_connection(" ").await.unwrap_err(),
+        TelegramError::InvalidRequest(_)
+    ));
+}
+
+#[tokio::test]
+async fn authoritative_client_errors_redact_request_and_response_values() {
+    let token = "123456:sentinel-token";
+    let connection_id = "sentinel-connection-id";
+    let description = "sentinel response description";
+    let (base_url, _) = stub(vec![(
+        StatusCode::BAD_REQUEST,
+        json!({
+            "ok": false,
+            "error_code": 400,
+            "description": description,
+            "sentinel_body": "sentinel response body"
+        }),
+    )])
+    .await;
+    let base_url_text = base_url.to_string();
+    let client = TelegramClient::with_base_url(
+        reqwest::Client::new(),
+        SecretString::from(token.to_owned()),
+        base_url,
+    );
+    let error = client
+        .get_business_connection(connection_id)
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:?} {error} {client:?}");
+    for secret in [
+        token,
+        connection_id,
+        description,
+        "sentinel response body",
+        &base_url_text,
+    ] {
+        assert!(!rendered.contains(secret));
     }
 }
 

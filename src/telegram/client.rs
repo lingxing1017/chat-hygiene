@@ -1,6 +1,7 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use reqwest::StatusCode;
 use secrecy::{ExposeSecret, SecretString};
@@ -9,7 +10,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
+use super::connection_state::{
+    AuthenticatedBot, AuthoritativeBusinessConnection, BotIdentityApi, BoxFuture,
+    BusinessConnectionApi,
+};
+use super::models::BusinessRights;
+
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org/";
+const AUTHORITATIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const RECOGNIZED_CONNECTION_NOT_FOUND: &str = "Bad Request: business connection not found";
+const SAFE_CONNECTION_NOT_FOUND: &str = "recognized business connection not found";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SendAction {
@@ -141,6 +151,19 @@ impl TelegramClient {
         Request: Serialize + ?Sized,
         Response: DeserializeOwned,
     {
+        self.call_with_timeout(method, request, None).await
+    }
+
+    async fn call_with_timeout<Request, Response>(
+        &self,
+        method: &str,
+        request: &Request,
+        timeout: Option<Duration>,
+    ) -> Result<Response, TelegramError>
+    where
+        Request: Serialize + ?Sized,
+        Response: DeserializeOwned,
+    {
         let mut endpoint = self.base_url.clone();
         endpoint
             .path_segments_mut()
@@ -148,19 +171,17 @@ impl TelegramClient {
             .pop_if_empty()
             .push(&format!("bot{}", self.token.expose_secret()))
             .push(method);
-        let response = self
-            .http
-            .post(endpoint)
-            .json(request)
-            .send()
-            .await
-            .map_err(|error| {
-                if error.is_timeout() {
-                    TelegramError::Timeout
-                } else {
-                    TelegramError::Transport
-                }
-            })?;
+        let mut request_builder = self.http.post(endpoint).json(request);
+        if let Some(timeout) = timeout {
+            request_builder = request_builder.timeout(timeout);
+        }
+        let response = request_builder.send().await.map_err(|error| {
+            if error.is_timeout() {
+                TelegramError::Timeout
+            } else {
+                TelegramError::Transport
+            }
+        })?;
         let status = response.status();
         let envelope = response
             .json::<ApiEnvelope<Response>>()
@@ -177,6 +198,75 @@ impl TelegramClient {
                 .description
                 .unwrap_or_else(|| "Telegram rejected the request".to_owned()),
             retry_after: envelope.parameters.and_then(|value| value.retry_after),
+        })
+    }
+}
+
+impl BotIdentityApi for TelegramClient {
+    fn get_me(&self) -> BoxFuture<'_, Result<AuthenticatedBot, TelegramError>> {
+        Box::pin(async move {
+            let raw = self
+                .call_with_timeout::<_, RawAuthenticatedBot>(
+                    "getMe",
+                    &EmptyRequest {},
+                    Some(AUTHORITATIVE_REQUEST_TIMEOUT),
+                )
+                .await
+                .map_err(|error| sanitize_authoritative_error(error, false))?;
+            if raw.id <= 0 || !raw.is_bot {
+                return Err(TelegramError::Protocol(
+                    "invalid authoritative bot response".to_owned(),
+                ));
+            }
+            Ok(AuthenticatedBot { id: raw.id })
+        })
+    }
+}
+
+impl BusinessConnectionApi for TelegramClient {
+    fn get_business_connection<'a>(
+        &'a self,
+        connection_id: &'a str,
+    ) -> BoxFuture<'a, Result<AuthoritativeBusinessConnection, TelegramError>> {
+        Box::pin(async move {
+            if connection_id.trim().is_empty() {
+                return Err(TelegramError::InvalidRequest(
+                    "authoritative connection ID is invalid".to_owned(),
+                ));
+            }
+            let raw = self
+                .call_with_timeout::<_, RawBusinessConnection>(
+                    "getBusinessConnection",
+                    &BusinessConnectionRequest {
+                        business_connection_id: connection_id,
+                    },
+                    Some(AUTHORITATIVE_REQUEST_TIMEOUT),
+                )
+                .await
+                .map_err(|error| sanitize_authoritative_error(error, true))?;
+            if raw.id.trim().is_empty()
+                || raw.id != connection_id
+                || raw.user.id <= 0
+                || raw.user_chat_id.is_some_and(|chat_id| chat_id <= 0)
+                || raw.date <= 0
+            {
+                return Err(TelegramError::Protocol(
+                    "invalid authoritative connection response".to_owned(),
+                ));
+            }
+            Ok(AuthoritativeBusinessConnection {
+                connection_id: raw.id,
+                business_user_id: raw.user.id,
+                user_chat_id: raw.user_chat_id,
+                connection_established_at: raw.date,
+                rights: BusinessRights {
+                    can_reply: raw.rights.can_reply,
+                    can_read_messages: raw.rights.can_read_messages,
+                    can_delete_sent_messages: raw.rights.can_delete_sent_messages,
+                    can_delete_all_messages: raw.rights.can_delete_all_messages,
+                },
+                enabled: raw.is_enabled,
+            })
         })
     }
 }
@@ -240,6 +330,77 @@ struct ApiEnvelope<T> {
 #[derive(Deserialize)]
 struct ResponseParameters {
     retry_after: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct EmptyRequest {}
+
+#[derive(Deserialize)]
+struct RawAuthenticatedBot {
+    id: i64,
+    is_bot: bool,
+}
+
+#[derive(Serialize)]
+struct BusinessConnectionRequest<'a> {
+    business_connection_id: &'a str,
+}
+
+#[derive(Deserialize)]
+struct RawBusinessConnection {
+    id: String,
+    user: RawBusinessUser,
+    user_chat_id: Option<i64>,
+    date: i64,
+    rights: RawBusinessRights,
+    is_enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct RawBusinessUser {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+struct RawBusinessRights {
+    can_reply: bool,
+    can_read_messages: bool,
+    can_delete_sent_messages: bool,
+    can_delete_all_messages: bool,
+}
+
+fn sanitize_authoritative_error(error: TelegramError, recognize_not_found: bool) -> TelegramError {
+    match error {
+        TelegramError::Api {
+            error_code,
+            description,
+            retry_after: _,
+        } if recognize_not_found
+            && error_code == 400
+            && description == RECOGNIZED_CONNECTION_NOT_FOUND =>
+        {
+            TelegramError::Protocol(SAFE_CONNECTION_NOT_FOUND.to_owned())
+        }
+        TelegramError::Api {
+            error_code,
+            retry_after,
+            ..
+        } => TelegramError::Api {
+            error_code,
+            description: "Telegram rejected authoritative lookup".to_owned(),
+            retry_after,
+        },
+        TelegramError::Protocol(_) => {
+            TelegramError::Protocol("invalid authoritative response".to_owned())
+        }
+        TelegramError::InvalidRequest(_) => {
+            TelegramError::InvalidRequest("invalid authoritative request".to_owned())
+        }
+        TelegramError::Timeout => TelegramError::Timeout,
+        TelegramError::Transport => TelegramError::Transport,
+    }
 }
 
 fn protocol_error(status: StatusCode) -> TelegramError {
