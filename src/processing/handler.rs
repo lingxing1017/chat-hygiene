@@ -190,7 +190,7 @@ impl LifecycleHandler {
                 enabled,
                 connection_established_at: None,
                 state_revision: 0,
-                reconciliation_state: ReconciliationState::Confirmed,
+                reconciliation_state: ReconciliationState::Pending,
                 updated_at: occurred_at,
             },
         )

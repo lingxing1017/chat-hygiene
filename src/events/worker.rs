@@ -115,6 +115,41 @@ pub async fn recover_recorded_events<A: EventApplier>(
     Ok(recovered_count)
 }
 
+/// Replays only pre-authoritative Business connection facts from an older
+/// schema generation so Owner import can observe their provisional state.
+///
+/// # Errors
+///
+/// Returns [`EventError`] when recorded events cannot be decoded or applied.
+pub async fn recover_legacy_recorded_connection_events<A: EventApplier>(
+    pool: &SqlitePool,
+    applier: &A,
+) -> Result<usize, EventError> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT update_id, event_json FROM processed_update
+         WHERE status = 'RECORDED' ORDER BY update_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StorageError::from)?;
+
+    let mut recovered_count = 0;
+    for (update_id, event_json) in rows {
+        let event: serde_json::Value = serde_json::from_str(&event_json)?;
+        if event
+            .pointer("/facts/action/kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("CONNECTION_CHANGED")
+        {
+            continue;
+        }
+        if apply_recorded_event(pool, update_id, applier).await? == ApplyReceipt::Applied {
+            recovered_count += 1;
+        }
+    }
+    Ok(recovered_count)
+}
+
 fn is_authoritative_connection_trigger(
     event_type: &str,
     event_json: &str,

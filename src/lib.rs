@@ -4,6 +4,7 @@ pub mod config;
 pub mod detection;
 pub mod domain;
 pub mod events;
+pub mod health;
 pub mod installation;
 pub mod owner;
 pub mod processing;

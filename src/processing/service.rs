@@ -32,6 +32,7 @@ use crate::storage::{
     load_owner_identity, load_telegram_reconciliation_state, promote_claim_candidate,
     promote_owner_chat, prune_connection_candidates, reconcile_authoritative_trusted_connection,
     retire_trusted_connection_not_found, set_telegram_auth_failed,
+    transition_telegram_reconciliation_ready,
 };
 use crate::telegram::{
     AuthoritativeBusinessConnection, AuthoritativeLookupError, BoxFuture, BusinessConnectionApi,
@@ -61,6 +62,83 @@ pub enum ProcessingError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FatalRuntimeEvent {
     TelegramAuthentication,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrustedStartupReconciliation {
+    Converged,
+    Pending { transient: bool },
+    AuthenticationFailed,
+}
+
+pub(crate) async fn reconcile_trusted_current_state<A>(
+    pool: &SqlitePool,
+    api: &A,
+    connection_id: &str,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> Result<TrustedStartupReconciliation, ProcessingError>
+where
+    A: BusinessConnectionApi + ?Sized,
+{
+    let mut snapshot_uow = UnitOfWork::begin_immediate(pool).await?;
+    let snapshot = connection_reconciliation_snapshot(&mut snapshot_uow, connection_id).await?;
+    snapshot_uow.rollback().await?;
+
+    let authoritative = match lookup_business_connection(api, connection_id).await {
+        Ok(authoritative) => authoritative,
+        Err(AuthoritativeLookupError::ConnectionNotFound { .. }) => {
+            let mut uow = UnitOfWork::begin_immediate(pool).await?;
+            let outcome = retire_trusted_connection_not_found(
+                &mut uow,
+                connection_id,
+                snapshot.trusted_revision.unwrap_or_default(),
+            )
+            .await?;
+            uow.commit().await?;
+            return Ok(if outcome == TrustedConnectionWrite::Reconciled {
+                TrustedStartupReconciliation::Converged
+            } else {
+                TrustedStartupReconciliation::Pending { transient: true }
+            });
+        }
+        Err(AuthoritativeLookupError::BotAuthentication { .. }) => {
+            let mut uow = UnitOfWork::begin_immediate(pool).await?;
+            set_telegram_auth_failed(&mut uow, observed_at).await?;
+            uow.commit().await?;
+            return Ok(TrustedStartupReconciliation::AuthenticationFailed);
+        }
+        Err(error) => {
+            return Ok(TrustedStartupReconciliation::Pending {
+                transient: matches!(error, AuthoritativeLookupError::TransientExhausted { .. }),
+            });
+        }
+    };
+    if authoritative.connection_id != connection_id {
+        return Ok(TrustedStartupReconciliation::Pending { transient: false });
+    }
+
+    let candidate = authoritative_candidate(&authoritative, observed_at)?;
+    let mut uow = UnitOfWork::begin_immediate(pool).await?;
+    let outcome = reconcile_authoritative_trusted_connection(
+        &mut uow,
+        &candidate,
+        snapshot.trusted_revision,
+        snapshot.candidate_revision,
+        snapshot.guard_revision,
+    )
+    .await?;
+    uow.commit().await?;
+    Ok(match outcome {
+        TrustedConnectionWrite::Installed
+        | TrustedConnectionWrite::Reconciled
+        | TrustedConnectionWrite::Replaced => TrustedStartupReconciliation::Converged,
+        TrustedConnectionWrite::Ambiguous
+        | TrustedConnectionWrite::RevisionConflict
+        | TrustedConnectionWrite::UserConflict
+        | TrustedConnectionWrite::GenerationConflict => {
+            TrustedStartupReconciliation::Pending { transient: true }
+        }
+    })
 }
 
 pub trait FatalRuntimeNotifier: Send + Sync {
@@ -161,6 +239,8 @@ pub struct ProcessingEngine<D, V, C> {
     owner_identity: Option<OwnerIdentityHandle>,
     claim_file_manager: Option<ClaimFileManager>,
     claim_setup_capability: ClaimSetupCapability,
+    startup_pending_connection_id: Option<String>,
+    startup_pending_retry: Option<ConnectionRetry>,
     #[cfg(test)]
     claim_retirement_test_seam: Option<Arc<dyn ClaimRetirementTestSeam>>,
 }
@@ -231,6 +311,8 @@ where
             owner_identity: None,
             claim_file_manager: None,
             claim_setup_capability: ClaimSetupCapability::Unavailable,
+            startup_pending_connection_id: None,
+            startup_pending_retry: None,
             #[cfg(test)]
             claim_retirement_test_seam: None,
         }
@@ -286,6 +368,16 @@ where
         self
     }
 
+    #[must_use]
+    pub(crate) fn with_startup_pending_connection(mut self, connection_id: Option<String>) -> Self {
+        self.startup_pending_retry = connection_id.as_ref().map(|_| ConnectionRetry {
+            failures: 0,
+            due_at: tokio::time::Instant::now(),
+        });
+        self.startup_pending_connection_id = connection_id;
+        self
+    }
+
     #[cfg(test)]
     fn with_claim_retirement_test_seam(mut self, seam: Arc<dyn ClaimRetirementTestSeam>) -> Self {
         self.claim_retirement_test_seam = Some(seam);
@@ -329,6 +421,7 @@ where
             })?;
             self.reconcile_connection_trigger(update_id, connection_id, prepared.occurred_at)
                 .await?;
+            self.publish_ready_if_drained().await?;
             return Ok(receipt);
         }
         apply_recorded_event(&self.pool, update_id, &self.handler).await?;
@@ -905,6 +998,7 @@ where
     }
 
     async fn retry_due_connection_triggers(&mut self) -> Result<(), ProcessingError> {
+        self.retry_startup_pending_trusted().await?;
         let now = tokio::time::Instant::now();
         let due = self
             .connection_retries
@@ -912,6 +1006,7 @@ where
             .filter_map(|(update_id, retry)| (retry.due_at <= now).then_some(*update_id))
             .collect::<Vec<_>>();
         if due.is_empty() {
+            self.publish_ready_if_drained().await?;
             return Ok(());
         }
         let recorded = recorded_connection_triggers(&self.pool).await?;
@@ -926,6 +1021,90 @@ where
                 self.connection_retries.remove(&update_id);
             }
         }
+        self.publish_ready_if_drained().await?;
+        Ok(())
+    }
+
+    async fn recover_startup_barrier(&mut self) -> Result<(), ProcessingError> {
+        self.retry_startup_pending_trusted().await?;
+        self.recover_recorded_connection_triggers().await?;
+        self.publish_ready_if_drained().await
+    }
+
+    async fn retry_startup_pending_trusted(&mut self) -> Result<(), ProcessingError> {
+        let Some(connection_id) = self.startup_pending_connection_id.clone() else {
+            return Ok(());
+        };
+        if self
+            .startup_pending_retry
+            .is_some_and(|retry| retry.due_at > tokio::time::Instant::now())
+        {
+            return Ok(());
+        }
+        match reconcile_trusted_current_state(
+            &self.pool,
+            self.business_connection_api.as_ref(),
+            &connection_id,
+            self.clock.now(),
+        )
+        .await?
+        {
+            TrustedStartupReconciliation::Converged => {
+                self.startup_pending_connection_id = None;
+                self.startup_pending_retry = None;
+            }
+            TrustedStartupReconciliation::AuthenticationFailed => {
+                if !self.fatal_notified {
+                    self.fatal_notified = true;
+                    self.fatal_runtime_notifier
+                        .notify(FatalRuntimeEvent::TelegramAuthentication);
+                }
+            }
+            TrustedStartupReconciliation::Pending { transient } => {
+                let failures = self.startup_pending_retry.map_or(0, |retry| retry.failures);
+                let delay = if transient {
+                    const BACKOFF: [u64; 6] = [1, 2, 4, 8, 16, 30];
+                    BACKOFF[failures.min(BACKOFF.len() - 1)]
+                } else {
+                    300
+                };
+                self.startup_pending_retry = Some(ConnectionRetry {
+                    failures: failures.saturating_add(1),
+                    due_at: tokio::time::Instant::now() + Duration::from_secs(delay),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn publish_ready_if_drained(&mut self) -> Result<(), ProcessingError> {
+        if self.startup_pending_connection_id.is_some() {
+            return Ok(());
+        }
+        let mut uow = UnitOfWork::begin_immediate(&self.pool).await?;
+        let global = load_telegram_reconciliation_state(&mut uow).await?;
+        if global.state == GlobalReconciliationState::Ready {
+            uow.commit().await?;
+            return Ok(());
+        }
+        if global.state != GlobalReconciliationState::Pending {
+            uow.rollback().await?;
+            return Ok(());
+        }
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM processed_update
+             WHERE status = 'RECORDED' AND event_type = 'business_connection_changed'",
+        )
+        .fetch_one(uow.connection())
+        .await
+        .map_err(StorageError::from)?;
+        if remaining != 0 {
+            uow.rollback().await?;
+            return Ok(());
+        }
+        transition_telegram_reconciliation_ready(&mut uow, global.state_revision, self.clock.now())
+            .await?;
+        uow.commit().await?;
         Ok(())
     }
 
@@ -1658,8 +1837,34 @@ async fn first_contact_notice(
 
 /// Starts the single bounded lifecycle worker used by the MVP.
 pub fn spawn_processing_worker<D, V, C>(
+    engine: ProcessingEngine<D, V, C>,
+    capacity: usize,
+) -> ProcessingWorker
+where
+    D: SpamDetector + 'static,
+    V: ChallengeVerifier + 'static,
+    C: Clock + 'static,
+{
+    spawn_processing_worker_inner(engine, capacity, None)
+}
+
+pub(crate) fn spawn_processing_worker_after_start<D, V, C>(
+    engine: ProcessingEngine<D, V, C>,
+    capacity: usize,
+    start: oneshot::Receiver<()>,
+) -> ProcessingWorker
+where
+    D: SpamDetector + 'static,
+    V: ChallengeVerifier + 'static,
+    C: Clock + 'static,
+{
+    spawn_processing_worker_inner(engine, capacity, Some(start))
+}
+
+fn spawn_processing_worker_inner<D, V, C>(
     mut engine: ProcessingEngine<D, V, C>,
     capacity: usize,
+    start: Option<oneshot::Receiver<()>>,
 ) -> ProcessingWorker
 where
     D: SpamDetector + 'static,
@@ -1669,6 +1874,18 @@ where
     let (sender, mut receiver) = mpsc::channel::<WorkItem>(capacity.max(1));
     let (stop, mut stopped) = watch::channel(false);
     let task = tokio::spawn(async move {
+        if let Some(start) = start
+            && start.await.is_err()
+        {
+            return;
+        }
+        if let Err(error) = engine.recover_startup_barrier().await {
+            tracing::error!(
+                error_code = "connection_startup_barrier_failed",
+                error = %error,
+                "connection startup barrier remains pending"
+            );
+        }
         let mut connection_retry_tick = interval(Duration::from_millis(250));
         connection_retry_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut expiry_tick = interval(Duration::from_secs(15));

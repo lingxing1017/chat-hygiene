@@ -1,9 +1,8 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use chathygiene::app::serve_runtime;
+use chathygiene::app::prepare_runtime;
 use chathygiene::config::Settings;
-use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -14,8 +13,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let settings = Arc::new(Settings::from_env()?);
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    serve_runtime(settings, listener, shutdown_signal()).await?;
+    prepare_runtime(settings)
+        .await?
+        .bind(std::net::SocketAddr::from(([0, 0, 0, 0], 8080)))
+        .await?
+        .reconcile()
+        .await?
+        .serve(shutdown_signal())
+        .await?;
     Ok(())
 }
 

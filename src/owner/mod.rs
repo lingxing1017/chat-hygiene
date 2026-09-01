@@ -9,6 +9,7 @@ use sqlx::Row;
 use thiserror::Error;
 
 use crate::detection::normalized_text_hash;
+use crate::health::classify_readiness_in;
 use crate::storage::{
     BusinessConnectionRecord, ConversationKey, OwnerChatSource, OwnerIdentity, StorageError,
     UnitOfWork, eligible_deletion_ids, find_conversation, find_single_business_connection,
@@ -211,12 +212,7 @@ impl OwnerCommandService {
         match command {
             OwnerCommand::Help => Ok(OwnerCommandExecution::plain(HELP_MESSAGE.to_owned())),
             OwnerCommand::Health => Ok(OwnerCommandExecution::plain(
-                health(
-                    owner.connection.as_ref(),
-                    self.default_destructive_mode,
-                    uow,
-                )
-                .await?,
+                health(self.now, self.default_destructive_mode, uow).await?,
             )),
             OwnerCommand::Inspect { chat_id } => Ok(OwnerCommandExecution::plain(
                 inspect(required_connection(owner)?, chat_id, uow).await?,
@@ -253,10 +249,13 @@ fn required_connection(
 }
 
 async fn health(
-    connection: Option<&BusinessConnectionRecord>,
+    now: DateTime<Utc>,
     default_destructive_mode: bool,
     uow: &mut UnitOfWork<'_>,
 ) -> Result<String, OwnerCommandError> {
+    let Ok(snapshot) = classify_readiness_in(uow, now).await else {
+        return Ok("status=unavailable".to_owned());
+    };
     let destructive: Option<String> =
         sqlx::query_scalar("SELECT value FROM runtime_setting WHERE key = 'destructive_mode'")
             .fetch_optional(uow.connection())
@@ -266,11 +265,7 @@ async fn health(
         .map_or(default_destructive_mode, |value| value == "true");
     Ok(format!(
         "status=ok owner=claimed connection={} dry_run={}",
-        connection.map_or("missing", |connection| if connection.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        }),
+        snapshot.connection.as_str(),
         if destructive_mode { "off" } else { "on" }
     ))
 }

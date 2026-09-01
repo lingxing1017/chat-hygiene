@@ -230,6 +230,30 @@ pub async fn pin_or_verify_telegram_bot_id(
     }
 }
 
+/// Strictly reloads the positive Telegram bot ID from committed key material.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the singleton, seed, checksum, or bot pin is
+/// missing or corrupt.
+pub async fn load_persisted_telegram_bot_id(pool: &SqlitePool) -> Result<i64, StorageError> {
+    let mut uow = UnitOfWork::begin(pool).await?;
+    let metadata = load_metadata(uow.connection()).await?;
+    let MaterialState::Ready {
+        telegram_bot_id: Some(telegram_bot_id),
+        ..
+    } = validate_metadata(&metadata)?
+    else {
+        return Err(StorageError::InvalidKeyMaterial(
+            "persisted Telegram bot id is missing",
+        ));
+    };
+    let seed = load_and_validate_ready_seed(uow.connection(), metadata.key_version).await?;
+    drop(seed);
+    uow.commit().await?;
+    Ok(telegram_bot_id)
+}
+
 async fn load_metadata(
     connection: &mut SqliteConnection,
 ) -> Result<MaterialMetadata, StorageError> {

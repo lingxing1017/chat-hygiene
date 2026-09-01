@@ -605,18 +605,30 @@ pub async fn claim_due_outbox_action(
     uow: &mut UnitOfWork<'_>,
     now: DateTime<Utc>,
 ) -> Result<Option<OutboxActionRecord>, StorageError> {
-    let row = sqlx::query_as::<_, OutboxActionRow>(
+    let business_effects_ready = crate::health::classify_readiness_in(uow, now).await.is_ok();
+    let query = if business_effects_ready {
         "SELECT id, source_update_id, connection_id, chat_id, action_type,
                 payload_json, status, attempts, claimed_at, next_attempt_at,
                 created_at, updated_at
          FROM outbox_action
          WHERE status IN ('PENDING', 'RETRY')
            AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-         ORDER BY id LIMIT 1",
-    )
-    .bind(now.to_rfc3339())
-    .fetch_optional(uow.connection())
-    .await?;
+         ORDER BY id LIMIT 1"
+    } else {
+        "SELECT id, source_update_id, connection_id, chat_id, action_type,
+                payload_json, status, attempts, claimed_at, next_attempt_at,
+                created_at, updated_at
+         FROM outbox_action
+         WHERE status IN ('PENDING', 'RETRY')
+           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+           AND connection_id IS NULL
+           AND action_type IN ('SEND_PRIVATE_MESSAGE', 'SEND_OWNER_MESSAGE')
+         ORDER BY id LIMIT 1"
+    };
+    let row = sqlx::query_as::<_, OutboxActionRow>(query)
+        .bind(now.to_rfc3339())
+        .fetch_optional(uow.connection())
+        .await?;
     let Some(row) = row else {
         return Ok(None);
     };

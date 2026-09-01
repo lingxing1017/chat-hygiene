@@ -12,15 +12,18 @@ pub use connection_candidate::{
     apply_authoritative_candidate, candidates_for_user, clear_connection_candidates,
     connection_reconciliation_snapshot, delete_connection_candidate,
     delete_connection_candidates_for_other_users, gate_matching_trusted_for_reconciliation,
-    load_candidate_guard, load_telegram_reconciliation_state, normalize_startup_reconciliation,
-    owner_generation_floor, promote_claim_candidate, prune_connection_candidates,
-    reconcile_authoritative_trusted_connection, retain_connection_candidates,
-    retire_trusted_connection_not_found, set_telegram_auth_failed,
+    list_connection_candidates, load_candidate_guard, load_telegram_reconciliation_state,
+    normalize_startup_reconciliation, owner_generation_floor, promote_claim_candidate,
+    prune_connection_candidates, reconcile_authoritative_trusted_connection,
+    retain_connection_candidates, retire_trusted_connection_not_found, set_telegram_auth_failed,
     transition_telegram_reconciliation_ready,
 };
 pub(crate) use database::ServiceDatabaseDescriptor;
 pub use database::{StorageError, connect, migrate};
-pub use key_material::{MasterSeed, load_or_initialize_master_seed, pin_or_verify_telegram_bot_id};
+pub use key_material::{
+    MasterSeed, load_or_initialize_master_seed, load_persisted_telegram_bot_id,
+    pin_or_verify_telegram_bot_id,
+};
 pub use models::{
     BusinessConnectionRecord, ChallengeHmacUpgradeRecord, ChallengeRecord, Conversation,
     ConversationKey, LedgerMessage, MessageDirection, NewAuditEvent, NewOutboxAction,

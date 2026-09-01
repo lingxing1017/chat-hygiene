@@ -14,3 +14,7 @@ pub use service::{
     ClaimSetupCapability, FatalRuntimeEvent, FatalRuntimeNotifier, NoopFatalRuntimeNotifier,
     ProcessingEngine, ProcessingError, ProcessingHandle, ProcessingWorker, spawn_processing_worker,
 };
+pub(crate) use service::{
+    TrustedStartupReconciliation, reconcile_trusted_current_state,
+    spawn_processing_worker_after_start,
+};

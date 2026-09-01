@@ -4,18 +4,106 @@ use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use chathygiene::app::{build_router, serve_runtime};
+use chathygiene::app::{build_router, prepare_runtime_with_telegram};
 use chathygiene::config::Settings;
 use chathygiene::events::{PreparedEvent, record_prepared_event};
 use chathygiene::storage::{connect, migrate};
+use chathygiene::telegram::{
+    AuthenticatedBot, AuthoritativeBusinessConnection, BotIdentityApi, BoxFuture, BusinessApi,
+    BusinessConnectionApi, BusinessRights, DeleteAction, EditAction, ReadAction, SendAction,
+    SentMessage, TelegramError, WebhookApi,
+};
 use chrono::Utc;
 use secrecy::SecretString;
 use serde_json::json;
 use tower::ServiceExt;
+use url::Url;
+
+#[derive(Clone, Default)]
+struct StartupTelegram;
+
+impl BotIdentityApi for StartupTelegram {
+    fn get_me(&self) -> BoxFuture<'_, Result<AuthenticatedBot, TelegramError>> {
+        Box::pin(async { Ok(AuthenticatedBot { id: 7001 }) })
+    }
+}
+
+impl BusinessConnectionApi for StartupTelegram {
+    fn get_business_connection<'a>(
+        &'a self,
+        connection_id: &'a str,
+    ) -> BoxFuture<'a, Result<AuthoritativeBusinessConnection, TelegramError>> {
+        Box::pin(async move {
+            Ok(AuthoritativeBusinessConnection {
+                connection_id: connection_id.to_owned(),
+                business_user_id: 42,
+                user_chat_id: Some(42),
+                connection_established_at: 1,
+                rights: BusinessRights {
+                    can_reply: true,
+                    can_read_messages: true,
+                    can_delete_sent_messages: true,
+                    can_delete_all_messages: true,
+                },
+                enabled: true,
+            })
+        })
+    }
+}
+
+impl WebhookApi for StartupTelegram {
+    fn set_webhook<'a>(
+        &'a self,
+        _public_url: &'a Url,
+        _secret: &'a SecretString,
+    ) -> BoxFuture<'a, Result<(), TelegramError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl BusinessApi for StartupTelegram {
+    fn send_business_message<'a>(
+        &'a self,
+        _action: &'a SendAction,
+    ) -> BoxFuture<'a, Result<SentMessage, TelegramError>> {
+        Box::pin(async { Err(TelegramError::Transport) })
+    }
+
+    fn edit_business_message<'a>(
+        &'a self,
+        _action: &'a EditAction,
+    ) -> BoxFuture<'a, Result<(), TelegramError>> {
+        Box::pin(async { Err(TelegramError::Transport) })
+    }
+
+    fn read_business_message<'a>(
+        &'a self,
+        _action: &'a ReadAction,
+    ) -> BoxFuture<'a, Result<(), TelegramError>> {
+        Box::pin(async { Err(TelegramError::Transport) })
+    }
+
+    fn delete_business_messages<'a>(
+        &'a self,
+        _action: &'a DeleteAction,
+    ) -> BoxFuture<'a, Result<(), TelegramError>> {
+        Box::pin(async { Err(TelegramError::Transport) })
+    }
+}
 
 async fn start_and_stop(settings: Arc<Settings>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    serve_runtime(settings, listener, async {}).await.unwrap();
+    prepare_runtime_with_telegram(settings, StartupTelegram)
+        .await
+        .unwrap()
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap()
+        .reconcile()
+        .await
+        .unwrap()
+        .serve(async {})
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

@@ -1108,6 +1108,31 @@ async fn load_candidate(
     row.as_ref().map(decode_candidate).transpose()
 }
 
+/// Strictly loads every retained Business connection candidate.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when a candidate is corrupt or the query fails.
+pub async fn list_connection_candidates(
+    uow: &mut UnitOfWork<'_>,
+) -> Result<Vec<BusinessConnectionCandidate>, StorageError> {
+    let rows = sqlx::query(
+        "SELECT connection_id, typeof(connection_id) AS connection_id_type,
+                business_user_id, typeof(business_user_id) AS business_user_id_type,
+                user_chat_id, typeof(user_chat_id) AS user_chat_id_type,
+                rights_json, typeof(rights_json) AS rights_json_type,
+                enabled, typeof(enabled) AS enabled_type,
+                connection_established_at,
+                typeof(connection_established_at) AS established_at_type,
+                state_revision, typeof(state_revision) AS revision_type,
+                observed_at, typeof(observed_at) AS observed_at_type
+         FROM business_connection_candidate ORDER BY connection_id",
+    )
+    .fetch_all(uow.connection())
+    .await?;
+    rows.iter().map(decode_candidate).collect()
+}
+
 fn decode_candidate(
     row: &sqlx::sqlite::SqliteRow,
 ) -> Result<BusinessConnectionCandidate, StorageError> {
