@@ -88,23 +88,6 @@ where
             PreparedAction::Ignore
         } else {
             match raw.kind {
-                RawEventKind::BusinessConnectionChanged => {
-                    let connection = raw.connection.as_ref().ok_or_else(|| {
-                        ProcessingError::InvalidEvent("connection snapshot is missing".to_owned())
-                    })?;
-                    let rights_json = serde_json::to_string(&serde_json::json!({
-                        "can_reply": connection.rights.can_reply,
-                        "can_read_messages": connection.rights.can_read_messages,
-                        "can_delete_sent_messages": connection.rights.can_delete_sent_messages,
-                        "can_delete_all_messages": connection.rights.can_delete_all_messages,
-                    }))?;
-                    PreparedAction::ConnectionChanged {
-                        owner_user_id: connection.owner_user_id,
-                        owner_chat_id: connection.owner_chat_id,
-                        enabled: connection.enabled,
-                        rights_json,
-                    }
-                }
                 RawEventKind::InboundMessage | RawEventKind::EditedInboundMessage => {
                     self.prepare_inbound(&raw, destructive_mode, uow).await?
                 }
@@ -118,7 +101,9 @@ where
                 RawEventKind::MessagesDeleted => PreparedAction::MessagesDeleted {
                     message_ids: raw.deleted_message_ids.clone(),
                 },
-                RawEventKind::OwnerCommand | RawEventKind::Ignored => PreparedAction::Ignore,
+                RawEventKind::BusinessConnectionChanged
+                | RawEventKind::OwnerCommand
+                | RawEventKind::Ignored => PreparedAction::Ignore,
             }
         };
         let state_before = state_before.or_else(|| {
@@ -141,9 +126,14 @@ where
             occurred_at: raw.occurred_at,
             action,
         };
+        let event_type = if raw.kind == RawEventKind::BusinessConnectionChanged {
+            "business_connection_changed"
+        } else {
+            "lifecycle"
+        };
         Ok(PreparedEvent::new(
             update_id,
-            "lifecycle",
+            event_type,
             raw.occurred_at,
             serde_json::to_value(facts)?,
         ))

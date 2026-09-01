@@ -194,7 +194,7 @@ async fn live_mode_emits_no_debug_trace() {
 }
 
 #[tokio::test]
-async fn dry_run_traces_every_supported_lifecycle_event() {
+async fn dry_run_traces_supported_events_but_not_reconciliation_triggers() {
     let (_directory, pool) = common::processing_database().await;
     let now = common::at("2026-07-14T00:00:00Z");
     let mut engine = ProcessingEngine::new(
@@ -205,12 +205,13 @@ async fn dry_run_traces_every_supported_lifecycle_event() {
         false,
     );
 
-    let connection = parse_update(
+    let mut connection = parse_update(
         include_bytes!("fixtures/telegram/business_connection.json"),
         42,
     )
     .unwrap()
     .event;
+    connection.connection_id = Some("unrelated-trigger".to_owned());
     engine.process(100, connection).await.unwrap();
     engine
         .process(101, common::inbound(2001, 20, Some("hello"), now))
@@ -243,7 +244,8 @@ async fn dry_run_traces_every_supported_lifecycle_event() {
     ignored.message_id = None;
     engine.process(107, ignored).await.unwrap();
 
-    for update_id in 100..=107 {
+    assert!(trace_messages(&pool, 100).await.is_empty());
+    for update_id in 101..=107 {
         assert_eq!(
             trace_messages(&pool, update_id).await.len(),
             1,
@@ -592,7 +594,7 @@ async fn dispatching_trace_notifications_does_not_create_more_traces() {
     .fetch_one(&harness.pool)
     .await
     .unwrap();
-    assert_eq!(before, 2);
+    assert_eq!(before, 1);
     assert_eq!(after, before);
 }
 

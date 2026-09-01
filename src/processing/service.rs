@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,16 +18,23 @@ use crate::owner::{
 };
 use crate::retention::RetentionService;
 use crate::storage::{
-    ConversationKey, NewOutboxAction, OutboxActionKind, OwnerIdentity, StorageError, UnitOfWork,
-    enqueue_outbox_action, find_business_connection, find_conversation,
-    list_outbox_actions_for_update,
+    BusinessConnectionCandidate, CandidateWrite, ConnectionReconciliationSnapshot, ConversationKey,
+    NewAuditEvent, NewOutboxAction, OutboxActionKind, OwnerChatSource, OwnerIdentity, StorageError,
+    TrustedConnectionWrite, UnitOfWork, apply_authoritative_candidate,
+    connection_reconciliation_snapshot, enqueue_outbox_action, find_business_connection,
+    find_conversation, insert_audit_event, list_outbox_actions_for_update, promote_owner_chat,
+    prune_connection_candidates, reconcile_authoritative_trusted_connection,
+    retire_trusted_connection_not_found, set_telegram_auth_failed,
 };
 use crate::telegram::{
-    IngressError, RawBusinessEvent, RawEventKind, WebhookInbox, delete_message_batches,
+    AuthoritativeBusinessConnection, AuthoritativeLookupError, BoxFuture, BusinessConnectionApi,
+    IngressError, RawBusinessEvent, RawEventKind, TelegramError, WebhookInbox,
+    delete_message_batches, lookup_business_connection,
 };
 use crate::verification::ChallengeVerifier;
 
 use super::handler::LifecycleHandler;
+use super::models::{LifecycleFacts, PreparedAction};
 use super::notifications::{NewContactNotice, NewContactNotifier, NoopNewContactNotifier};
 use super::preparer::{EventPreparer, OwnerLifecycleState, load_owner_lifecycle_state};
 use super::trace::ProcessingTrace;
@@ -43,13 +51,68 @@ pub enum ProcessingError {
     InvalidEvent(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatalRuntimeEvent {
+    TelegramAuthentication,
+}
+
+pub trait FatalRuntimeNotifier: Send + Sync {
+    fn notify(&self, event: FatalRuntimeEvent);
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopFatalRuntimeNotifier;
+
+impl FatalRuntimeNotifier for NoopFatalRuntimeNotifier {
+    fn notify(&self, _event: FatalRuntimeEvent) {}
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct UnavailableBusinessConnectionApi;
+
+impl BusinessConnectionApi for UnavailableBusinessConnectionApi {
+    fn get_business_connection<'a>(
+        &'a self,
+        _connection_id: &'a str,
+    ) -> BoxFuture<'a, Result<AuthoritativeBusinessConnection, TelegramError>> {
+        Box::pin(async {
+            Err(TelegramError::InvalidRequest(
+                "authoritative Business API is unavailable".to_owned(),
+            ))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConnectionRetry {
+    failures: usize,
+    due_at: tokio::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerApplication {
+    Commit,
+    Retry { transient: bool },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClaimedOwner {
+    user_id: i64,
+    chat_source: OwnerChatSource,
+}
+
 pub struct ProcessingEngine<D, V, C> {
     pool: SqlitePool,
+    clock: C,
     preparer: EventPreparer<D, V, C>,
     retention: RetentionService<C>,
     handler: LifecycleHandler,
     default_destructive_mode: bool,
     new_contact_notifier: Arc<dyn NewContactNotifier>,
+    business_connection_api: Arc<dyn BusinessConnectionApi>,
+    fatal_runtime_notifier: Arc<dyn FatalRuntimeNotifier>,
+    fatal_notified: bool,
+    connection_retries: HashMap<i64, ConnectionRetry>,
 }
 
 struct WorkItem {
@@ -76,11 +139,16 @@ where
     {
         Self {
             pool,
+            clock: clock.clone(),
             preparer: EventPreparer::new(detector, verifier, clock.clone(), destructive_mode),
             retention: RetentionService::new(clock),
             handler: LifecycleHandler,
             default_destructive_mode: destructive_mode,
             new_contact_notifier: Arc::new(NoopNewContactNotifier),
+            business_connection_api: Arc::new(UnavailableBusinessConnectionApi),
+            fatal_runtime_notifier: Arc::new(NoopFatalRuntimeNotifier),
+            fatal_notified: false,
+            connection_retries: HashMap::new(),
         }
     }
 
@@ -93,6 +161,24 @@ where
         self
     }
 
+    #[must_use]
+    pub fn with_business_connection_api<A>(mut self, api: A) -> Self
+    where
+        A: BusinessConnectionApi + 'static,
+    {
+        self.business_connection_api = Arc::new(api);
+        self
+    }
+
+    #[must_use]
+    pub fn with_fatal_runtime_notifier<N>(mut self, notifier: N) -> Self
+    where
+        N: FatalRuntimeNotifier + 'static,
+    {
+        self.fatal_runtime_notifier = Arc::new(notifier);
+        self
+    }
+
     /// Serially prepares, records, and atomically applies one raw update.
     ///
     /// # Errors
@@ -102,18 +188,28 @@ where
     pub async fn process(
         &mut self,
         update_id: i64,
-        raw: RawBusinessEvent,
+        mut raw: RawBusinessEvent,
     ) -> Result<RecordReceipt, ProcessingError> {
         if raw.kind == RawEventKind::OwnerCommand {
             return self.process_owner_command(update_id, raw).await;
         }
         let mut read = UnitOfWork::begin(&self.pool).await?;
+        make_preclaim_business_event_inert(&mut raw, &mut read).await?;
         let first_contact_notice = first_contact_notice(&raw, &mut read).await?;
         let prepared = self.preparer.prepare(update_id, raw, &mut read).await?;
         read.rollback().await?;
 
         let receipt = record_prepared_event(&self.pool, &prepared).await?;
         if receipt == RecordReceipt::DuplicateApplied {
+            return Ok(receipt);
+        }
+        if prepared.event_type == "business_connection_changed" {
+            let facts: LifecycleFacts = serde_json::from_value(prepared.facts.clone())?;
+            let connection_id = facts.connection_id.as_deref().ok_or_else(|| {
+                ProcessingError::InvalidEvent("connection trigger ID is missing".to_owned())
+            })?;
+            self.reconcile_connection_trigger(update_id, connection_id, prepared.occurred_at)
+                .await?;
             return Ok(receipt);
         }
         apply_recorded_event(&self.pool, update_id, &self.handler).await?;
@@ -129,6 +225,243 @@ where
             }
         }
         Ok(receipt)
+    }
+
+    async fn reconcile_connection_trigger(
+        &mut self,
+        update_id: i64,
+        connection_id: &str,
+        occurred_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), ProcessingError> {
+        let mut snapshot_uow = UnitOfWork::begin_immediate(&self.pool).await?;
+        let owner = match load_owner_lifecycle_state(&mut snapshot_uow).await? {
+            OwnerLifecycleState::Pending => {
+                snapshot_uow.rollback().await?;
+                self.schedule_connection_retry(update_id, false);
+                return Ok(());
+            }
+            OwnerLifecycleState::Ready(owner) => owner,
+        };
+        let snapshot = connection_reconciliation_snapshot(&mut snapshot_uow, connection_id).await?;
+        snapshot_uow.rollback().await?;
+
+        let authoritative =
+            match lookup_business_connection(self.business_connection_api.as_ref(), connection_id)
+                .await
+            {
+                Ok(authoritative) => authoritative,
+                Err(AuthoritativeLookupError::ConnectionNotFound { .. }) => {
+                    self.apply_connection_not_found(update_id, connection_id, owner, &snapshot)
+                        .await?;
+                    return Ok(());
+                }
+                Err(AuthoritativeLookupError::BotAuthentication { .. }) => {
+                    let mut uow = UnitOfWork::begin_immediate(&self.pool).await?;
+                    set_telegram_auth_failed(&mut uow, self.clock.now()).await?;
+                    uow.commit().await?;
+                    if !self.fatal_notified {
+                        self.fatal_notified = true;
+                        self.fatal_runtime_notifier
+                            .notify(FatalRuntimeEvent::TelegramAuthentication);
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.schedule_connection_retry(
+                        update_id,
+                        matches!(error, AuthoritativeLookupError::TransientExhausted { .. }),
+                    );
+                    return Ok(());
+                }
+            };
+
+        self.apply_authoritative_connection_trigger(
+            update_id,
+            occurred_at,
+            owner,
+            snapshot,
+            authoritative,
+        )
+        .await
+    }
+
+    async fn apply_connection_not_found(
+        &mut self,
+        update_id: i64,
+        connection_id: &str,
+        expected_owner: OwnerIdentity,
+        snapshot: &ConnectionReconciliationSnapshot,
+    ) -> Result<(), ProcessingError> {
+        let mut uow = UnitOfWork::begin_immediate(&self.pool).await?;
+        let current_owner = match load_owner_lifecycle_state(&mut uow).await? {
+            OwnerLifecycleState::Pending => {
+                uow.rollback().await?;
+                self.schedule_connection_retry(update_id, false);
+                return Ok(());
+            }
+            OwnerLifecycleState::Ready(owner) => owner,
+        };
+        if current_owner != expected_owner {
+            uow.rollback().await?;
+            self.schedule_connection_retry(update_id, true);
+            return Ok(());
+        }
+        let outcome = retire_trusted_connection_not_found(
+            &mut uow,
+            connection_id,
+            snapshot.trusted_revision.unwrap_or_default(),
+        )
+        .await?;
+        match outcome {
+            TrustedConnectionWrite::Reconciled => {
+                mark_connection_trigger_applied(&mut uow, update_id, self.clock.now()).await?;
+                uow.commit().await?;
+                self.connection_retries.remove(&update_id);
+            }
+            TrustedConnectionWrite::RevisionConflict => {
+                uow.rollback().await?;
+                self.schedule_connection_retry(update_id, true);
+            }
+            TrustedConnectionWrite::UserConflict | TrustedConnectionWrite::GenerationConflict => {
+                uow.rollback().await?;
+                self.schedule_connection_retry(update_id, false);
+            }
+            TrustedConnectionWrite::Installed
+            | TrustedConnectionWrite::Replaced
+            | TrustedConnectionWrite::Ambiguous => {
+                return Err(ProcessingError::InvalidEvent(
+                    "unexpected connection-not-found outcome".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_authoritative_connection_trigger(
+        &mut self,
+        update_id: i64,
+        occurred_at: chrono::DateTime<chrono::Utc>,
+        expected_owner: OwnerIdentity,
+        snapshot: ConnectionReconciliationSnapshot,
+        authoritative: AuthoritativeBusinessConnection,
+    ) -> Result<(), ProcessingError> {
+        let service_now = self.clock.now();
+        let candidate = authoritative_candidate(&authoritative, service_now)?;
+        let mut uow = UnitOfWork::begin_immediate(&self.pool).await?;
+        let current_owner = match load_owner_lifecycle_state(&mut uow).await? {
+            OwnerLifecycleState::Pending => {
+                uow.rollback().await?;
+                self.schedule_connection_retry(update_id, false);
+                return Ok(());
+            }
+            OwnerLifecycleState::Ready(owner) => owner,
+        };
+        if current_owner != expected_owner {
+            uow.rollback().await?;
+            self.schedule_connection_retry(update_id, true);
+            return Ok(());
+        }
+        let application = match current_owner {
+            OwnerIdentity::Unclaimed => {
+                apply_unclaimed_connection_trigger(
+                    &mut uow,
+                    &candidate,
+                    &snapshot,
+                    update_id,
+                    occurred_at,
+                    service_now,
+                )
+                .await?
+            }
+            OwnerIdentity::Claimed {
+                owner_user_id,
+                owner_chat_source,
+                ..
+            } => {
+                apply_claimed_connection_trigger(
+                    &mut uow,
+                    &authoritative,
+                    &candidate,
+                    &snapshot,
+                    ClaimedOwner {
+                        user_id: owner_user_id,
+                        chat_source: owner_chat_source,
+                    },
+                    update_id,
+                    occurred_at,
+                )
+                .await?
+            }
+        };
+        if let TriggerApplication::Retry { transient } = application {
+            uow.rollback().await?;
+            self.schedule_connection_retry(update_id, transient);
+            return Ok(());
+        }
+        mark_connection_trigger_applied(&mut uow, update_id, service_now).await?;
+        uow.commit().await?;
+        self.connection_retries.remove(&update_id);
+        Ok(())
+    }
+
+    fn schedule_connection_retry(&mut self, update_id: i64, transient: bool) {
+        const BACKOFF: [u64; 6] = [1, 2, 4, 8, 16, 30];
+        let current = self.connection_retries.get(&update_id).copied();
+        let failures = current.map_or(0, |retry| retry.failures);
+        let delay = if transient {
+            BACKOFF[failures.min(BACKOFF.len() - 1)]
+        } else {
+            300
+        };
+        self.connection_retries.insert(
+            update_id,
+            ConnectionRetry {
+                failures: failures.saturating_add(1),
+                due_at: tokio::time::Instant::now() + Duration::from_secs(delay),
+            },
+        );
+    }
+
+    /// Attempts every recorded connection trigger once without interpreting
+    /// update-ID order as lifecycle chronology.
+    ///
+    /// # Errors
+    ///
+    /// Returns a processing error for corrupt recorded facts or storage state.
+    pub async fn recover_recorded_connection_triggers(&mut self) -> Result<usize, ProcessingError> {
+        let triggers = recorded_connection_triggers(&self.pool).await?;
+        let mut attempted = 0;
+        for (update_id, connection_id, occurred_at) in triggers {
+            self.reconcile_connection_trigger(update_id, &connection_id, occurred_at)
+                .await?;
+            attempted += 1;
+        }
+        Ok(attempted)
+    }
+
+    async fn retry_due_connection_triggers(&mut self) -> Result<(), ProcessingError> {
+        let now = tokio::time::Instant::now();
+        let due = self
+            .connection_retries
+            .iter()
+            .filter_map(|(update_id, retry)| (retry.due_at <= now).then_some(*update_id))
+            .collect::<Vec<_>>();
+        if due.is_empty() {
+            return Ok(());
+        }
+        let recorded = recorded_connection_triggers(&self.pool).await?;
+        for update_id in due {
+            if let Some((_, connection_id, occurred_at)) = recorded
+                .iter()
+                .find(|(candidate, _, _)| *candidate == update_id)
+            {
+                self.reconcile_connection_trigger(update_id, connection_id, *occurred_at)
+                    .await?;
+            } else {
+                self.connection_retries.remove(&update_id);
+            }
+        }
+        Ok(())
     }
 
     async fn process_owner_command(
@@ -228,6 +561,228 @@ where
         uow.commit().await?;
         Ok(RecordReceipt::Recorded)
     }
+}
+
+async fn apply_unclaimed_connection_trigger(
+    uow: &mut UnitOfWork<'_>,
+    candidate: &BusinessConnectionCandidate,
+    snapshot: &ConnectionReconciliationSnapshot,
+    update_id: i64,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    service_now: chrono::DateTime<chrono::Utc>,
+) -> Result<TriggerApplication, ProcessingError> {
+    match apply_authoritative_candidate(uow, candidate, snapshot.candidate_revision).await? {
+        CandidateWrite::RevisionConflict => {
+            return Ok(TriggerApplication::Retry { transient: true });
+        }
+        CandidateWrite::UserConflict | CandidateWrite::GenerationConflict => {
+            insert_connection_audit(uow, update_id, "connection_candidate_conflict", occurred_at)
+                .await?;
+        }
+        CandidateWrite::Inserted | CandidateWrite::Reconciled => {}
+    }
+    prune_connection_candidates(uow, service_now - chrono::Duration::days(7), 256).await?;
+    Ok(TriggerApplication::Commit)
+}
+
+async fn apply_claimed_connection_trigger(
+    uow: &mut UnitOfWork<'_>,
+    authoritative: &AuthoritativeBusinessConnection,
+    candidate: &BusinessConnectionCandidate,
+    snapshot: &ConnectionReconciliationSnapshot,
+    owner: ClaimedOwner,
+    update_id: i64,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<TriggerApplication, ProcessingError> {
+    let matching_trusted =
+        snapshot.trusted_connection_id.as_deref() == Some(candidate.connection_id.as_str());
+    if authoritative.business_user_id == owner.user_id {
+        let outcome = reconcile_authoritative_trusted_connection(
+            uow,
+            candidate,
+            snapshot.trusted_revision,
+            snapshot.candidate_revision,
+            snapshot.guard_revision,
+        )
+        .await?;
+        match outcome {
+            TrustedConnectionWrite::RevisionConflict => {
+                return Ok(TriggerApplication::Retry { transient: true });
+            }
+            TrustedConnectionWrite::UserConflict | TrustedConnectionWrite::GenerationConflict
+                if matching_trusted =>
+            {
+                return Ok(TriggerApplication::Retry { transient: false });
+            }
+            TrustedConnectionWrite::UserConflict | TrustedConnectionWrite::GenerationConflict => {
+                insert_connection_audit(
+                    uow,
+                    update_id,
+                    "connection_generation_rejected",
+                    occurred_at,
+                )
+                .await?;
+            }
+            TrustedConnectionWrite::Installed
+            | TrustedConnectionWrite::Reconciled
+            | TrustedConnectionWrite::Replaced
+            | TrustedConnectionWrite::Ambiguous => {
+                if owner.chat_source == OwnerChatSource::LegacyFallback
+                    && let Some(owner_chat_id) = authoritative.user_chat_id
+                {
+                    promote_owner_chat(
+                        uow,
+                        owner.user_id,
+                        owner_chat_id,
+                        OwnerChatSource::BusinessConnection,
+                    )
+                    .await?;
+                }
+            }
+        }
+    } else if matching_trusted {
+        return Ok(TriggerApplication::Retry { transient: false });
+    } else {
+        insert_connection_audit(uow, update_id, "connection_owner_mismatch", occurred_at).await?;
+    }
+    Ok(TriggerApplication::Commit)
+}
+
+fn authoritative_candidate(
+    connection: &AuthoritativeBusinessConnection,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> Result<BusinessConnectionCandidate, ProcessingError> {
+    let rights_json = serde_json::to_string(&serde_json::json!({
+        "can_reply": connection.rights.can_reply,
+        "can_read_messages": connection.rights.can_read_messages,
+        "can_delete_sent_messages": connection.rights.can_delete_sent_messages,
+        "can_delete_all_messages": connection.rights.can_delete_all_messages,
+    }))?;
+    Ok(BusinessConnectionCandidate {
+        connection_id: connection.connection_id.clone(),
+        business_user_id: connection.business_user_id,
+        user_chat_id: connection.user_chat_id,
+        rights_json,
+        enabled: connection.enabled,
+        connection_established_at: connection.connection_established_at,
+        state_revision: 0,
+        observed_at,
+    })
+}
+
+async fn mark_connection_trigger_applied(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    applied_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ProcessingError> {
+    let result = sqlx::query(
+        "UPDATE processed_update
+         SET status = 'APPLIED', applied_at = ?, error_code = NULL,
+             error_message = NULL
+         WHERE update_id = ? AND status = 'RECORDED'",
+    )
+    .bind(applied_at.to_rfc3339())
+    .bind(update_id)
+    .execute(uow.connection())
+    .await
+    .map_err(StorageError::from)?;
+    if result.rows_affected() != 1 {
+        return Err(ProcessingError::Event(EventError::InvalidStatus(
+            "connection trigger changed during application".to_owned(),
+        )));
+    }
+    Ok(())
+}
+
+async fn insert_connection_audit(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    event_kind: &str,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ProcessingError> {
+    insert_audit_event(
+        uow,
+        &NewAuditEvent {
+            source_update_id: update_id,
+            key: None,
+            event_kind: event_kind.to_owned(),
+            state_before: None,
+            state_after: None,
+            score: None,
+            reasons_json: None,
+            rule_ids_json: None,
+            normalized_hash: None,
+            rule_version: None,
+            error_code: None,
+            error_message: None,
+            occurred_at,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn recorded_connection_triggers(
+    pool: &SqlitePool,
+) -> Result<Vec<(i64, String, chrono::DateTime<chrono::Utc>)>, ProcessingError> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT update_id, event_json FROM processed_update
+         WHERE status = 'RECORDED' AND event_type = 'business_connection_changed'
+         ORDER BY update_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StorageError::from)?;
+    let mut triggers = Vec::new();
+    for (update_id, event_json) in rows {
+        let event: crate::events::PreparedEvent = serde_json::from_str(&event_json)?;
+        let facts: LifecycleFacts = serde_json::from_value(event.facts)?;
+        if matches!(facts.action, PreparedAction::Ignore) {
+            let connection_id = facts.connection_id.ok_or_else(|| {
+                ProcessingError::InvalidEvent(
+                    "recorded connection trigger ID is missing".to_owned(),
+                )
+            })?;
+            if connection_id.trim().is_empty() {
+                return Err(ProcessingError::InvalidEvent(
+                    "recorded connection trigger ID is invalid".to_owned(),
+                ));
+            }
+            triggers.push((update_id, connection_id, event.occurred_at));
+        }
+    }
+    Ok(triggers)
+}
+
+async fn make_preclaim_business_event_inert(
+    raw: &mut RawBusinessEvent,
+    uow: &mut UnitOfWork<'_>,
+) -> Result<(), ProcessingError> {
+    if !matches!(
+        raw.kind,
+        RawEventKind::InboundMessage
+            | RawEventKind::EditedInboundMessage
+            | RawEventKind::ManualOwnerMessage
+            | RawEventKind::BotBusinessMessage
+            | RawEventKind::ImplicitOwnerMessage
+            | RawEventKind::MessagesDeleted
+    ) || !matches!(
+        load_owner_lifecycle_state(uow).await?,
+        OwnerLifecycleState::Ready(OwnerIdentity::Unclaimed)
+    ) {
+        return Ok(());
+    }
+    raw.kind = RawEventKind::Ignored;
+    raw.connection_id = None;
+    raw.chat_id = None;
+    raw.message_id = None;
+    raw.media_group_id = None;
+    raw.content = None;
+    raw.deleted_message_ids.clear();
+    raw.connection = None;
+    raw.contact_display_name = None;
+    raw.contact_username = None;
+    Ok(())
 }
 
 async fn enqueue_owner_command_reply(
@@ -378,6 +933,8 @@ where
 {
     let (sender, mut receiver) = mpsc::channel::<WorkItem>(capacity.max(1));
     tokio::spawn(async move {
+        let mut connection_retry_tick = interval(Duration::from_millis(250));
+        connection_retry_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut expiry_tick = interval(Duration::from_secs(15));
         expiry_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut purge_tick = interval(Duration::from_hours(1));
@@ -391,6 +948,15 @@ where
                     };
                     let result = engine.process(item.update_id, item.raw).await;
                     let _ = item.receipt.send(result);
+                }
+                _ = connection_retry_tick.tick() => {
+                    if let Err(error) = engine.retry_due_connection_triggers().await {
+                        tracing::error!(
+                            error_code = "connection_reconciliation_retry_failed",
+                            error = %error,
+                            "connection reconciliation retry pass failed"
+                        );
+                    }
                 }
                 _ = expiry_tick.tick() => {
                     if let Err(error) = engine.retention.expire_due_state(&engine.pool).await {

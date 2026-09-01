@@ -21,9 +21,13 @@ use chathygiene::detection::{
     SpamDetector,
 };
 use chathygiene::processing::{ProcessingEngine, spawn_processing_worker};
-use chathygiene::storage::{connect, migrate};
+use chathygiene::storage::{
+    UnitOfWork, claim_owner, connect, initialize_or_load_owner_identity, migrate,
+};
 use chathygiene::telegram::{
+    AuthoritativeBusinessConnection, BoxFuture, BusinessConnectionApi, BusinessRights,
     DispatchOutcome, OutboxDispatcher, RawBusinessEvent, RawEventKind, TelegramClient,
+    TelegramError,
 };
 use chathygiene::verification::{
     AnswerKind, ArithmeticVerifier, ChallengeVerifier, GeneratedChallenge,
@@ -149,6 +153,59 @@ impl TelegramStub {
     }
 }
 
+#[derive(Clone, Default)]
+struct TestBusinessConnectionApi {
+    response: Arc<Mutex<Option<AuthoritativeBusinessConnection>>>,
+}
+
+impl TestBusinessConnectionApi {
+    fn stage_from_update(&self, update: &Value) {
+        let Some(connection) = update.get("business_connection") else {
+            return;
+        };
+        let rights = connection.get("rights").unwrap_or(&Value::Null);
+        let mut response = self.response.lock().unwrap();
+        let connection_id = connection["id"].as_str().unwrap().to_owned();
+        let connection_established_at = response
+            .as_ref()
+            .filter(|current| current.connection_id == connection_id)
+            .map_or_else(
+                || connection["date"].as_i64().unwrap(),
+                |current| current.connection_established_at,
+            );
+        *response = Some(AuthoritativeBusinessConnection {
+            connection_id,
+            business_user_id: connection["user"]["id"].as_i64().unwrap(),
+            user_chat_id: connection["user_chat_id"].as_i64(),
+            connection_established_at,
+            rights: BusinessRights {
+                can_reply: rights["can_reply"].as_bool().unwrap_or(false),
+                can_read_messages: rights["can_read_messages"].as_bool().unwrap_or(false),
+                can_delete_sent_messages: rights["can_delete_sent_messages"]
+                    .as_bool()
+                    .unwrap_or(false),
+                can_delete_all_messages: rights["can_delete_all_messages"]
+                    .as_bool()
+                    .unwrap_or(false),
+            },
+            enabled: connection["is_enabled"].as_bool().unwrap_or(false),
+        });
+    }
+}
+
+impl BusinessConnectionApi for TestBusinessConnectionApi {
+    fn get_business_connection<'a>(
+        &'a self,
+        _connection_id: &'a str,
+    ) -> BoxFuture<'a, Result<AuthoritativeBusinessConnection, TelegramError>> {
+        Box::pin(async move {
+            self.response.lock().unwrap().clone().ok_or_else(|| {
+                TelegramError::InvalidRequest("test authoritative state is missing".to_owned())
+            })
+        })
+    }
+}
+
 async fn capture_telegram_request(
     State(state): State<TelegramStubState>,
     OriginalUri(uri): OriginalUri,
@@ -189,6 +246,7 @@ pub struct E2eHarness {
     pub router: Router,
     pub clock: TestClock,
     pub telegram: TelegramStub,
+    authoritative_api: TestBusinessConnectionApi,
     dispatcher: OutboxDispatcher<TelegramClient>,
 }
 
@@ -198,6 +256,18 @@ impl E2eHarness {
         let pool = connect(&database_url).await.expect("connect E2E database");
         migrate(&pool).await.expect("migrate E2E database");
         let clock = TestClock::new(at("2026-07-14T12:00:00Z"));
+        initialize_or_load_owner_identity(&pool, clock.now())
+            .await
+            .expect("initialize E2E owner");
+        let mut owner = UnitOfWork::begin_immediate(&pool)
+            .await
+            .expect("begin E2E owner claim");
+        claim_owner(&mut owner, 42, 4200, 1, clock.now())
+            .await
+            .expect("claim E2E owner");
+        owner.commit().await.expect("commit E2E owner claim");
+        let telegram = TelegramStub::start().await;
+        let authoritative_api = TestBusinessConnectionApi::default();
         let detector = RuleDetector::from_defaults().expect("load embedded rules");
         let verifier = ArithmeticVerifier::new(
             StdRng::seed_from_u64(7),
@@ -209,7 +279,8 @@ impl E2eHarness {
             verifier,
             clock.clone(),
             destructive_mode,
-        );
+        )
+        .with_business_connection_api(authoritative_api.clone());
         let inbox = Arc::new(spawn_processing_worker(engine, 128));
         let settings = Settings {
             bot_token: SecretString::from("123456:test-token".to_owned()),
@@ -220,7 +291,6 @@ impl E2eHarness {
             destructive_mode,
         };
         let router = build_router_with_inbox(&settings, inbox);
-        let telegram = TelegramStub::start().await;
         let dispatcher = OutboxDispatcher::new(telegram.client());
         Self {
             _directory: directory,
@@ -228,12 +298,41 @@ impl E2eHarness {
             router,
             clock,
             telegram,
+            authoritative_api,
             dispatcher,
         }
     }
 
     pub async fn connect(&self, update_id: i64) {
         self.post(connection_update(update_id, true, true)).await;
+        let state: Option<(String, bool, Option<i64>, String)> = sqlx::query_as(
+            "SELECT connection_id, enabled, connection_established_at, reconciliation_state
+             FROM business_connection",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .expect("read authoritative connection state");
+        let candidate_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM business_connection_candidate")
+                .fetch_one(&self.pool)
+                .await
+                .expect("count connection candidates");
+        let owner_state: String =
+            sqlx::query_scalar("SELECT state FROM owner_identity WHERE singleton = 1")
+                .fetch_one(&self.pool)
+                .await
+                .expect("read owner state");
+        assert_eq!(
+            state,
+            Some((
+                "business-1".to_owned(),
+                true,
+                Some(1_783_987_200_i64 + update_id),
+                "CONFIRMED".to_owned(),
+            )),
+            "candidate_count={candidate_count}, owner_state={owner_state}, requests={:?}",
+            self.telegram.requests(),
+        );
     }
 
     pub async fn post(&self, update: Value) -> StatusCode {
@@ -246,11 +345,17 @@ impl E2eHarness {
                 .fetch_one(&self.pool)
                 .await
                 .expect("read processed update");
-        assert_eq!(status, "APPLIED");
+        assert_eq!(
+            status,
+            "APPLIED",
+            "telegram_requests={:?}",
+            self.telegram.requests()
+        );
         response_status
     }
 
     pub async fn post_status(&self, update: Value) -> StatusCode {
+        self.authoritative_api.stage_from_update(&update);
         let request = Request::builder()
             .method("POST")
             .uri("/telegram/webhook")

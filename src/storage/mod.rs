@@ -7,9 +7,10 @@ mod repositories;
 mod uow;
 
 pub use connection_candidate::{
-    BusinessConnectionCandidate, CandidateGuard, CandidateWrite, GlobalReconciliationState,
-    TelegramReconciliationState, TrustedConnectionWrite, apply_authoritative_candidate,
-    candidates_for_user, clear_connection_candidates, delete_connection_candidate,
+    BusinessConnectionCandidate, CandidateGuard, CandidateWrite, ConnectionReconciliationSnapshot,
+    GlobalReconciliationState, TelegramReconciliationState, TrustedConnectionWrite,
+    apply_authoritative_candidate, candidates_for_user, clear_connection_candidates,
+    connection_reconciliation_snapshot, delete_connection_candidate,
     delete_connection_candidates_for_other_users, gate_matching_trusted_for_reconciliation,
     load_candidate_guard, load_telegram_reconciliation_state, normalize_startup_reconciliation,
     owner_generation_floor, prune_connection_candidates,

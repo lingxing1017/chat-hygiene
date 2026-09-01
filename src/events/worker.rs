@@ -94,8 +94,8 @@ pub async fn recover_recorded_events<A: EventApplier>(
     pool: &SqlitePool,
     applier: &A,
 ) -> Result<usize, EventError> {
-    let update_ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT update_id FROM processed_update
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT update_id, event_type, event_json FROM processed_update
          WHERE status = 'RECORDED' ORDER BY update_id",
     )
     .fetch_all(pool)
@@ -103,12 +103,29 @@ pub async fn recover_recorded_events<A: EventApplier>(
     .map_err(StorageError::from)?;
 
     let mut recovered_count = 0;
-    for update_id in update_ids {
+    for (update_id, event_type, event_json) in rows {
+        if is_authoritative_connection_trigger(&event_type, &event_json)? {
+            continue;
+        }
         if apply_recorded_event(pool, update_id, applier).await? == ApplyReceipt::Applied {
             recovered_count += 1;
         }
     }
     Ok(recovered_count)
+}
+
+fn is_authoritative_connection_trigger(
+    event_type: &str,
+    event_json: &str,
+) -> Result<bool, EventError> {
+    if event_type != "business_connection_changed" {
+        return Ok(false);
+    }
+    let event: serde_json::Value = serde_json::from_str(event_json)?;
+    Ok(event
+        .pointer("/facts/action/kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("IGNORE"))
 }
 
 /// Starts the single polling worker that drains due Telegram outbox actions.

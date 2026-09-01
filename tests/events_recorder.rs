@@ -121,3 +121,70 @@ async fn event_facts_reject_message_bodies_but_allow_hashes() {
         .expect("count events");
     assert_eq!(count, 1);
 }
+
+#[tokio::test]
+async fn connection_trigger_recording_atomically_gates_only_matching_trust() {
+    let (_directory, url) = common::temporary_database();
+    let pool = connect(&url).await.unwrap();
+    migrate(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO business_connection
+         (connection_id, owner_user_id, rights_json, enabled,
+          connection_established_at, state_revision, reconciliation_state, updated_at)
+         VALUES ('business-1', 42, '{}', 1, 100, 7, 'CONFIRMED', ?)",
+    )
+    .bind(at("2026-07-14T00:00:00Z").to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let trigger = |update_id, connection_id: &str| {
+        PreparedEvent::new(
+            update_id,
+            "business_connection_changed",
+            at("2026-07-14T00:00:01Z"),
+            json!({
+                "connection_id": connection_id,
+                "chat_id": null,
+                "user_id": null,
+                "message_id": null,
+                "media_group_id": null,
+                "occurred_at": "2026-07-14T00:00:01Z",
+                "action": {"kind": "IGNORE"}
+            }),
+        )
+    };
+
+    assert_eq!(
+        record_prepared_event(&pool, &trigger(10, "other"))
+            .await
+            .unwrap(),
+        RecordReceipt::Recorded
+    );
+    let unchanged: (String, i64) =
+        sqlx::query_as("SELECT reconciliation_state, state_revision FROM business_connection")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(unchanged, ("CONFIRMED".to_owned(), 7));
+
+    let matching = trigger(11, "business-1");
+    assert_eq!(
+        record_prepared_event(&pool, &matching).await.unwrap(),
+        RecordReceipt::Recorded
+    );
+    let gated: (String, i64) =
+        sqlx::query_as("SELECT reconciliation_state, state_revision FROM business_connection")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(gated, ("PENDING".to_owned(), 8));
+    assert_eq!(
+        record_prepared_event(&pool, &matching).await.unwrap(),
+        RecordReceipt::DuplicateRecorded
+    );
+    let revision: i64 = sqlx::query_scalar("SELECT state_revision FROM business_connection")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(revision, 8);
+}

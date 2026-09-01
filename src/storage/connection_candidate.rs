@@ -28,6 +28,14 @@ pub struct CandidateGuard {
     pub state_revision: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionReconciliationSnapshot {
+    pub candidate_revision: Option<i64>,
+    pub trusted_connection_id: Option<String>,
+    pub trusted_revision: Option<i64>,
+    pub guard_revision: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateWrite {
     Inserted,
@@ -568,6 +576,36 @@ pub async fn load_candidate_guard(
     Ok(CandidateGuard {
         overflow_established_at: overflow,
         state_revision: revision,
+    })
+}
+
+/// Captures the strict revisions needed around one external authoritative lookup.
+///
+/// # Errors
+///
+/// Returns a value-free storage error for corrupt candidate, trusted, or guard
+/// state, or for a database failure.
+pub async fn connection_reconciliation_snapshot(
+    uow: &mut UnitOfWork<'_>,
+    connection_id: &str,
+) -> Result<ConnectionReconciliationSnapshot, StorageError> {
+    if connection_id.trim().is_empty() {
+        return Err(StorageError::InvalidConnectionCandidate(
+            "connection id must not be empty",
+        ));
+    }
+    let candidate_revision = load_candidate(uow, connection_id)
+        .await?
+        .map(|candidate| candidate.state_revision);
+    let trusted = load_single_trusted_connection(uow).await?;
+    let guard_revision = load_candidate_guard(uow).await?.state_revision;
+    Ok(ConnectionReconciliationSnapshot {
+        candidate_revision,
+        trusted_connection_id: trusted
+            .as_ref()
+            .map(|connection| connection.connection_id.clone()),
+        trusted_revision: trusted.map(|connection| connection.state_revision),
+        guard_revision,
     })
 }
 

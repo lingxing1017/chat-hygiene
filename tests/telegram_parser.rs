@@ -6,56 +6,58 @@ fn parse(fixture: &str) -> chathygiene::telegram::ParsedUpdate {
 }
 
 #[test]
-fn parses_connection_rights_and_ignores_unknown_fields() {
+fn parses_connection_as_id_only_reconciliation_trigger() {
     let parsed = parse(include_str!("fixtures/telegram/business_connection.json"));
     assert_eq!(parsed.update_id, 100);
     assert_eq!(parsed.event.kind, RawEventKind::BusinessConnectionChanged);
-    let connection = parsed.event.connection.expect("connection snapshot");
-    assert_eq!(connection.connection_id, "business-1");
-    assert_eq!(connection.owner_user_id, 42);
-    assert_eq!(connection.owner_chat_id, Some(4200));
-    assert!(connection.enabled);
-    assert!(connection.rights.can_reply);
-    assert!(connection.rights.can_read_messages);
-    assert!(connection.rights.can_delete_sent_messages);
-    assert!(connection.rights.can_delete_all_messages);
+    assert_eq!(parsed.event.connection_id.as_deref(), Some("business-1"));
+    assert!(parsed.event.connection.is_none());
+    assert!(parsed.event.content.is_none());
 }
 
 #[test]
-fn rejects_missing_or_invalid_business_owner_chat_ids() {
-    for invalid in [
-        None,
-        Some(serde_json::Value::from(0)),
-        Some(serde_json::Value::from(-1)),
-        Some(serde_json::Value::from("chat")),
+fn ignores_mutable_connection_payload_but_rejects_invalid_ids() {
+    for (field, value) in [
+        ("user", serde_json::json!({"id": "not-an-integer"})),
+        ("user_chat_id", serde_json::json!("not-an-integer")),
+        ("date", serde_json::json!("not-an-integer")),
+        ("rights", serde_json::json!("not-an-object")),
+        ("is_enabled", serde_json::json!("not-a-boolean")),
     ] {
         let mut update: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/telegram/business_connection.json"))
                 .unwrap();
-        match invalid {
-            Some(value) => update["business_connection"]["user_chat_id"] = value,
-            None => {
-                update["business_connection"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("user_chat_id");
-            }
-        }
+        update["business_connection"][field] = value;
+        let parsed = parse_update(&serde_json::to_vec(&update).unwrap(), 42).unwrap();
+        assert_eq!(parsed.event.kind, RawEventKind::BusinessConnectionChanged);
+        assert_eq!(parsed.event.connection_id.as_deref(), Some("business-1"));
+        assert!(parsed.event.connection.is_none());
+    }
+
+    for invalid_id in [
+        serde_json::json!(""),
+        serde_json::json!(" "),
+        serde_json::json!(7),
+    ] {
+        let mut update: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/telegram/business_connection.json"))
+                .unwrap();
+        update["business_connection"]["id"] = invalid_id;
         assert!(parse_update(&serde_json::to_vec(&update).unwrap(), 42).is_err());
     }
 }
 
 #[test]
-fn ignores_business_connections_owned_by_another_account() {
+fn foreign_owner_payload_still_becomes_an_untrusted_trigger() {
     let mut update: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/telegram/business_connection.json")).unwrap();
     update["business_connection"]["user"]["id"] = serde_json::Value::from(99);
 
     let parsed = parse_update(&serde_json::to_vec(&update).unwrap(), 42).unwrap();
 
-    assert_eq!(parsed.event.kind, RawEventKind::Ignored);
+    assert_eq!(parsed.event.kind, RawEventKind::BusinessConnectionChanged);
     assert!(parsed.event.connection.is_none());
-    assert!(parsed.event.connection_id.is_none());
+    assert_eq!(parsed.event.connection_id.as_deref(), Some("business-1"));
 }
 
 #[test]
