@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::{OriginalUri, State};
 use axum::http::StatusCode;
@@ -7,7 +8,7 @@ use axum::routing::any;
 use axum::{Json, Router};
 use chathygiene::telegram::{
     BotIdentityApi, BusinessApi, BusinessConnectionApi, DeleteAction, EditAction, ReadAction,
-    SendAction, TelegramClient, TelegramError, delete_message_batches,
+    SendAction, TelegramClient, TelegramError, WebhookApi, delete_message_batches,
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -18,6 +19,7 @@ use url::Url;
 struct StubState {
     requests: Arc<Mutex<Vec<(String, Value)>>>,
     responses: Arc<Mutex<VecDeque<(StatusCode, Value)>>>,
+    response_delay: Option<Duration>,
 }
 
 async fn capture(
@@ -25,6 +27,9 @@ async fn capture(
     OriginalUri(uri): OriginalUri,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    if let Some(delay) = state.response_delay {
+        tokio::time::sleep(delay).await;
+    }
     state
         .requests
         .lock()
@@ -35,9 +40,17 @@ async fn capture(
 }
 
 async fn stub(responses: Vec<(StatusCode, Value)>) -> (Url, Arc<Mutex<Vec<(String, Value)>>>) {
+    stub_with_delay(responses, None).await
+}
+
+async fn stub_with_delay(
+    responses: Vec<(StatusCode, Value)>,
+    response_delay: Option<Duration>,
+) -> (Url, Arc<Mutex<Vec<(String, Value)>>>) {
     let state = StubState {
         requests: Arc::new(Mutex::new(Vec::new())),
         responses: Arc::new(Mutex::new(responses.into())),
+        response_delay,
     };
     let requests = Arc::clone(&state.requests);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -47,6 +60,80 @@ async fn stub(responses: Vec<(StatusCode, Value)>) -> (Url, Arc<Mutex<Vec<(Strin
         axum::serve(listener, app).await.unwrap();
     });
     (Url::parse(&format!("http://{address}/")).unwrap(), requests)
+}
+
+#[tokio::test]
+async fn client_sets_the_complete_webhook_declaration() {
+    let (base_url, requests) = stub(vec![
+        (StatusCode::OK, json!({"ok": true, "result": true})),
+        (StatusCode::OK, json!({"ok": true, "result": false})),
+    ])
+    .await;
+    let token = "123456:test-token";
+    let secret_text = "a".repeat(64);
+    let secret = SecretString::from(secret_text.clone());
+    let public_url = Url::parse("https://chat.example.net/telegram/webhook").unwrap();
+    let client = TelegramClient::with_base_url(
+        reqwest::Client::new(),
+        SecretString::from(token.to_owned()),
+        base_url,
+    );
+
+    client.set_webhook(&public_url, &secret).await.unwrap();
+    let error = client.set_webhook(&public_url, &secret).await.unwrap_err();
+
+    assert_eq!(
+        error,
+        TelegramError::Protocol("setWebhook returned false".to_owned())
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for (path, body) in requests.iter() {
+        assert_eq!(path, "/bot123456:test-token/setWebhook");
+        assert_eq!(
+            body,
+            &json!({
+                "url": "https://chat.example.net/telegram/webhook",
+                "secret_token": secret_text,
+                "allowed_updates": [
+                    "business_connection",
+                    "business_message",
+                    "edited_business_message",
+                    "deleted_business_messages",
+                    "message"
+                ],
+                "drop_pending_updates": false
+            })
+        );
+    }
+    let rendered = format!("{client:?} {error:?} {error}");
+    assert!(!rendered.contains(token));
+    assert!(!rendered.contains(&secret_text));
+}
+
+#[tokio::test]
+async fn set_webhook_honors_its_request_timeout() {
+    let (base_url, _) = stub_with_delay(
+        vec![(StatusCode::OK, json!({"ok": true, "result": true}))],
+        Some(Duration::from_millis(100)),
+    )
+    .await;
+    let client = TelegramClient::with_base_url_and_webhook_timeout(
+        reqwest::Client::new(),
+        SecretString::from("timeout-token".to_owned()),
+        base_url,
+        Duration::from_millis(20),
+    );
+
+    let error = client
+        .set_webhook(
+            &Url::parse("https://chat.example.net/telegram/webhook").unwrap(),
+            &SecretString::from("b".repeat(64)),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, TelegramError::Timeout);
 }
 
 #[tokio::test]

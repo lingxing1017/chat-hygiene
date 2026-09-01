@@ -5,10 +5,11 @@ mod models;
 mod outbox;
 mod parser;
 mod webhook;
+mod webhook_registration;
 
 pub use client::{
     BusinessApi, DeleteAction, EditAction, ReadAction, SendAction, SentMessage, TelegramClient,
-    TelegramError, delete_message_batches,
+    TelegramError, WebhookApi, delete_message_batches,
 };
 pub use connection_state::{
     AuthenticatedBot, AuthoritativeBusinessConnection, AuthoritativeLookupError, BotIdentityApi,
@@ -24,3 +25,6 @@ pub use models::{
 pub use outbox::{DispatchError, DispatchOutcome, OutboxDispatcher};
 pub use parser::{ParseError, parse_update, parse_update_with_owner_identity};
 pub use webhook::{IngressError, WebhookInbox, webhook_router, webhook_router_with_owner_identity};
+pub use webhook_registration::{
+    WebhookFailureKind, WebhookFailureSummary, WebhookRegistrationError, reconcile_webhook,
+};

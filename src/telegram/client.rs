@@ -18,6 +18,7 @@ use super::models::BusinessRights;
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org/";
 const AUTHORITATIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const WEBHOOK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const RECOGNIZED_CONNECTION_NOT_FOUND: &str = "Bad Request: business connection not found";
 const SAFE_CONNECTION_NOT_FOUND: &str = "recognized business connection not found";
 
@@ -79,6 +80,14 @@ pub enum TelegramError {
     InvalidRequest(String),
 }
 
+pub trait WebhookApi: Send + Sync {
+    fn set_webhook<'a>(
+        &'a self,
+        public_url: &'a Url,
+        secret: &'a SecretString,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TelegramError>> + Send + 'a>>;
+}
+
 pub trait BusinessApi: Send + Sync {
     fn send_business_message<'a>(
         &'a self,
@@ -106,6 +115,7 @@ pub struct TelegramClient {
     http: reqwest::Client,
     token: SecretString,
     base_url: Url,
+    webhook_timeout: Duration,
 }
 
 impl fmt::Debug for TelegramClient {
@@ -135,10 +145,21 @@ impl TelegramClient {
 
     #[must_use]
     pub fn with_base_url(http: reqwest::Client, token: SecretString, base_url: Url) -> Self {
+        Self::with_base_url_and_webhook_timeout(http, token, base_url, WEBHOOK_REQUEST_TIMEOUT)
+    }
+
+    #[must_use]
+    pub fn with_base_url_and_webhook_timeout(
+        http: reqwest::Client,
+        token: SecretString,
+        base_url: Url,
+        webhook_timeout: Duration,
+    ) -> Self {
         Self {
             http,
             token,
             base_url,
+            webhook_timeout,
         }
     }
 
@@ -198,6 +219,41 @@ impl TelegramClient {
                 .description
                 .unwrap_or_else(|| "Telegram rejected the request".to_owned()),
             retry_after: envelope.parameters.and_then(|value| value.retry_after),
+        })
+    }
+}
+
+impl WebhookApi for TelegramClient {
+    fn set_webhook<'a>(
+        &'a self,
+        public_url: &'a Url,
+        secret: &'a SecretString,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TelegramError>> + Send + 'a>> {
+        Box::pin(async move {
+            let result = self
+                .call_with_timeout::<_, bool>(
+                    "setWebhook",
+                    &SetWebhookRequest {
+                        url: public_url.as_str(),
+                        secret_token: secret.expose_secret(),
+                        allowed_updates: [
+                            "business_connection",
+                            "business_message",
+                            "edited_business_message",
+                            "deleted_business_messages",
+                            "message",
+                        ],
+                        drop_pending_updates: false,
+                    },
+                    Some(self.webhook_timeout),
+                )
+                .await?;
+            if !result {
+                return Err(TelegramError::Protocol(
+                    "setWebhook returned false".to_owned(),
+                ));
+            }
+            Ok(())
         })
     }
 }
@@ -334,6 +390,14 @@ struct ResponseParameters {
 
 #[derive(Serialize)]
 struct EmptyRequest {}
+
+#[derive(Serialize)]
+struct SetWebhookRequest<'a> {
+    url: &'a str,
+    secret_token: &'a str,
+    allowed_updates: [&'static str; 5],
+    drop_pending_updates: bool,
+}
 
 #[derive(Deserialize)]
 struct RawAuthenticatedBot {
