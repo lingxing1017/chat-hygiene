@@ -182,6 +182,7 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "reqwest",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",

@@ -18,6 +18,7 @@ pub use connection_candidate::{
     retire_trusted_connection_not_found, set_telegram_auth_failed,
     transition_telegram_reconciliation_ready,
 };
+pub(crate) use database::ServiceDatabaseDescriptor;
 pub use database::{StorageError, connect, migrate};
 pub use key_material::{MasterSeed, load_or_initialize_master_seed, pin_or_verify_telegram_bot_id};
 pub use models::{

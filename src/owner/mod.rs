@@ -1,4 +1,5 @@
 mod claim;
+mod claim_file;
 mod commands;
 mod identity;
 
@@ -15,6 +16,7 @@ use crate::storage::{
 };
 
 pub use claim::{OwnerClaimContext, ParsedOwnerClaim, parse_owner_claim};
+pub use claim_file::{ClaimFileError, ClaimFileManager};
 pub use commands::{OwnerCommand, OwnerCommandParseError, parse_owner_command};
 pub use identity::OwnerIdentityHandle;
 

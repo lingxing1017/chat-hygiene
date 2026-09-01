@@ -15,8 +15,9 @@ use crate::clock::Clock;
 use crate::detection::SpamDetector;
 use crate::events::{EventError, RecordReceipt, apply_recorded_event, record_prepared_event};
 use crate::owner::{
-    LabeledMessageBody, OwnerCommandError, OwnerCommandService, OwnerCommandSource,
-    OwnerIdentityHandle, OwnerTelegramAction, ParsedOwnerClaim, parse_owner_command,
+    ClaimFileManager, LabeledMessageBody, OwnerCommandError, OwnerCommandService,
+    OwnerCommandSource, OwnerIdentityHandle, OwnerTelegramAction, ParsedOwnerClaim,
+    parse_owner_command,
 };
 use crate::retention::RetentionService;
 use crate::storage::{
@@ -63,6 +64,14 @@ pub enum FatalRuntimeEvent {
 
 pub trait FatalRuntimeNotifier: Send + Sync {
     fn notify(&self, event: FatalRuntimeEvent);
+}
+
+#[cfg(test)]
+trait ClaimRetirementTestSeam: Send + Sync {
+    fn retire<'a>(
+        &'a self,
+        token: &'a SecretSlice<u8>,
+    ) -> BoxFuture<'a, Result<(), crate::owner::ClaimFileError>>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -142,6 +151,9 @@ pub struct ProcessingEngine<D, V, C> {
     connection_retries: HashMap<i64, ConnectionRetry>,
     owner_claim_token: Option<SecretSlice<u8>>,
     owner_identity: Option<OwnerIdentityHandle>,
+    claim_file_manager: Option<ClaimFileManager>,
+    #[cfg(test)]
+    claim_retirement_test_seam: Option<Arc<dyn ClaimRetirementTestSeam>>,
 }
 
 struct WorkItem {
@@ -180,6 +192,9 @@ where
             connection_retries: HashMap::new(),
             owner_claim_token: None,
             owner_identity: None,
+            claim_file_manager: None,
+            #[cfg(test)]
+            claim_retirement_test_seam: None,
         }
     }
 
@@ -218,6 +233,18 @@ where
     ) -> Self {
         self.owner_claim_token = token;
         self.owner_identity = Some(owner_identity);
+        self
+    }
+
+    #[must_use]
+    pub fn with_claim_file_manager(mut self, manager: ClaimFileManager) -> Self {
+        self.claim_file_manager = Some(manager);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_claim_retirement_test_seam(mut self, seam: Arc<dyn ClaimRetirementTestSeam>) -> Self {
+        self.claim_retirement_test_seam = Some(seam);
         self
     }
 
@@ -493,13 +520,59 @@ where
         uow.commit().await?;
         *identity_gate = claimed;
         drop(identity_gate);
+        #[cfg(test)]
+        self.finish_owner_claim(lookup.authentication_failed).await;
+        #[cfg(not(test))]
+        self.finish_owner_claim(lookup.authentication_failed);
+        Ok(RecordReceipt::Recorded)
+    }
+
+    #[cfg(not(test))]
+    fn finish_owner_claim(&mut self, authentication_failed: bool) {
+        let retirement_error = self
+            .claim_file_manager
+            .as_ref()
+            .zip(self.owner_claim_token.as_ref())
+            .and_then(|(manager, token)| manager.retire_after_claim(token).err());
         drop(self.owner_claim_token.take());
-        if lookup.authentication_failed && !self.fatal_notified {
+        if retirement_error.is_some() {
+            tracing::error!(
+                error_code = "claim_file_retirement_failed",
+                "claim-code retirement failed after Owner claim"
+            );
+        }
+        if authentication_failed && !self.fatal_notified {
             self.fatal_notified = true;
             self.fatal_runtime_notifier
                 .notify(FatalRuntimeEvent::TelegramAuthentication);
         }
-        Ok(RecordReceipt::Recorded)
+    }
+
+    #[cfg(test)]
+    async fn finish_owner_claim(&mut self, authentication_failed: bool) {
+        let retirement_error = if let Some(token) = self.owner_claim_token.as_ref() {
+            if let Some(seam) = self.claim_retirement_test_seam.as_ref() {
+                seam.retire(token).await.err()
+            } else {
+                self.claim_file_manager
+                    .as_ref()
+                    .and_then(|manager| manager.retire_after_claim(token).err())
+            }
+        } else {
+            None
+        };
+        drop(self.owner_claim_token.take());
+        if retirement_error.is_some() {
+            tracing::error!(
+                error_code = "claim_file_retirement_failed",
+                "claim-code retirement failed after Owner claim"
+            );
+        }
+        if authentication_failed && !self.fatal_notified {
+            self.fatal_notified = true;
+            self.fatal_runtime_notifier
+                .notify(FatalRuntimeEvent::TelegramAuthentication);
+        }
     }
 
     async fn reconcile_connection_trigger(
@@ -1498,5 +1571,216 @@ impl WebhookInbox for ProcessingHandle {
                 })?
                 .map_err(|error| IngressError::RecordingFailed(error.to_string()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use secrecy::SecretSlice;
+
+    use super::*;
+    use crate::clock::SystemClock;
+    use crate::detection::RuleDetector;
+    use crate::owner::ClaimFileError;
+    use crate::storage::{
+        connect, initialize_or_load_owner_identity, load_owner_identity, migrate,
+    };
+    use crate::verification::ArithmeticVerifier;
+
+    type TestEngine =
+        ProcessingEngine<RuleDetector, ArithmeticVerifier<rand::rngs::StdRng>, SystemClock>;
+
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct RetirementObservation {
+        calls: usize,
+        owner_was_claimed: bool,
+        confirmation_was_committed: bool,
+        token_was_available: bool,
+    }
+
+    struct RecordingRetirement {
+        pool: SqlitePool,
+        owner: OwnerIdentityHandle,
+        fail: bool,
+        observation: Mutex<RetirementObservation>,
+    }
+
+    impl RecordingRetirement {
+        fn observation(&self) -> RetirementObservation {
+            *self.observation.lock().unwrap()
+        }
+    }
+
+    impl ClaimRetirementTestSeam for RecordingRetirement {
+        fn retire<'a>(
+            &'a self,
+            token: &'a SecretSlice<u8>,
+        ) -> BoxFuture<'a, Result<(), ClaimFileError>> {
+            Box::pin(async move {
+                let owner_was_claimed = matches!(
+                    self.owner.snapshot().await,
+                    OwnerIdentity::Claimed {
+                        owner_user_id: 100,
+                        owner_chat_id: 500,
+                        ..
+                    }
+                );
+                let confirmations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox_action")
+                    .fetch_one(&self.pool)
+                    .await
+                    .unwrap();
+                let mut observation = self.observation.lock().unwrap();
+                observation.calls += 1;
+                observation.owner_was_claimed = owner_was_claimed;
+                observation.confirmation_was_committed = confirmations == 1;
+                observation.token_was_available = token.expose_secret().len() == 32;
+                if self.fail {
+                    Err(ClaimFileError::Filesystem("injected retirement failure"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    async fn retirement_engine(
+        fail: bool,
+    ) -> (
+        tempfile::TempDir,
+        SqlitePool,
+        OwnerIdentityHandle,
+        TestEngine,
+        Arc<RecordingRetirement>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("service.db").display()
+        ))
+        .await
+        .unwrap();
+        migrate(&pool).await.unwrap();
+        let owner = initialize_or_load_owner_identity(&pool, chrono::Utc::now())
+            .await
+            .unwrap();
+        let token = SecretSlice::from(vec![0x11; 32]);
+        let owner_handle = OwnerIdentityHandle::new(owner);
+        let retirement = Arc::new(RecordingRetirement {
+            pool: pool.clone(),
+            owner: owner_handle.clone(),
+            fail,
+            observation: Mutex::new(RetirementObservation::default()),
+        });
+        let engine = ProcessingEngine::new(
+            pool.clone(),
+            RuleDetector::from_defaults().unwrap(),
+            ArithmeticVerifier::from_os_rng_with_key_version(SecretSlice::from(vec![0x33; 32]), 1),
+            SystemClock,
+            false,
+        )
+        .with_owner_claim(Some(token), owner_handle.clone())
+        .with_claim_retirement_test_seam(retirement.clone());
+        (directory, pool, owner_handle, engine, retirement)
+    }
+
+    fn claim_event(token_byte: u8) -> RawBusinessEvent {
+        RawBusinessEvent {
+            kind: RawEventKind::OwnerClaim,
+            connection_id: None,
+            chat_id: Some(500),
+            message_id: Some(1),
+            media_group_id: None,
+            content: None,
+            deleted_message_ids: Vec::new(),
+            connection: None,
+            owner_claim: Some(ParsedOwnerClaim::Candidate {
+                from_user_id: 100,
+                owner_chat_id: 500,
+                message_id: 1,
+                message_date: chrono::Utc::now().timestamp(),
+                token: SecretSlice::from(vec![token_byte; 32]),
+            }),
+            owner_command: None,
+            contact_display_name: None,
+            contact_username: None,
+            occurred_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_commit_and_publication_precede_file_retirement() {
+        let (_directory, _pool, _owner, mut engine, retirement) = retirement_engine(false).await;
+        engine.process(1, claim_event(0x11)).await.unwrap();
+        assert_eq!(
+            retirement.observation(),
+            RetirementObservation {
+                calls: 1,
+                owner_was_claimed: true,
+                confirmation_was_committed: true,
+                token_was_available: true,
+            }
+        );
+        assert!(engine.owner_claim_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn retirement_failure_cannot_roll_back_committed_claim() {
+        let (_directory, pool, owner, mut engine, retirement) = retirement_engine(true).await;
+        engine.process(2, claim_event(0x11)).await.unwrap();
+        assert!(matches!(
+            owner.snapshot().await,
+            OwnerIdentity::Claimed { .. }
+        ));
+        let confirmations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM outbox_action WHERE source_update_id = 2")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(confirmations, 1);
+        assert_eq!(retirement.observation().calls, 1);
+        assert!(engine.owner_claim_token.is_none());
+
+        engine.process(2, claim_event(0x11)).await.unwrap();
+        assert_eq!(retirement.observation().calls, 1);
+    }
+
+    #[tokio::test]
+    async fn wrong_token_never_retires_claim_file_or_consumes_expected_token() {
+        let (_directory, _pool, owner, mut engine, retirement) = retirement_engine(false).await;
+        engine.process(3, claim_event(0x22)).await.unwrap();
+        assert_eq!(owner.snapshot().await, OwnerIdentity::Unclaimed);
+        assert_eq!(retirement.observation().calls, 0);
+        assert!(engine.owner_claim_token.is_some());
+    }
+
+    #[tokio::test]
+    async fn rolled_back_claim_never_retires_or_publishes_owner() {
+        let (_directory, pool, owner, mut engine, retirement) = retirement_engine(false).await;
+        sqlx::query(
+            "CREATE TRIGGER fail_claim_outbox BEFORE INSERT ON outbox_action \
+             WHEN NEW.source_update_id = 4 BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(engine.process(4, claim_event(0x11)).await.is_err());
+        assert_eq!(retirement.observation().calls, 0);
+        assert!(engine.owner_claim_token.is_some());
+        assert_eq!(owner.snapshot().await, OwnerIdentity::Unclaimed);
+        let mut read = UnitOfWork::begin(&pool).await.unwrap();
+        assert_eq!(
+            load_owner_identity(&mut read).await.unwrap(),
+            OwnerIdentity::Unclaimed
+        );
+        read.rollback().await.unwrap();
+        let confirmations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM outbox_action WHERE source_update_id = 4")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(confirmations, 0);
     }
 }
