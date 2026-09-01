@@ -141,6 +141,7 @@ fn trigger(connection_id: &str, now: DateTime<Utc>) -> RawBusinessEvent {
         content: None,
         deleted_message_ids: Vec::new(),
         connection: None,
+        owner_claim: None,
         owner_command: None,
         contact_display_name: None,
         contact_username: None,

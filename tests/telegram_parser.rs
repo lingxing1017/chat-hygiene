@@ -1,8 +1,35 @@
 use chathygiene::detection::{MediaKind, MessageEntityKind};
+use chathygiene::owner::ParsedOwnerClaim;
 use chathygiene::telegram::{RawEventKind, parse_update};
 
 fn parse(fixture: &str) -> chathygiene::telegram::ParsedUpdate {
     parse_update(fixture.as_bytes(), 42).expect("parse fixture")
+}
+
+#[test]
+fn parses_owner_claim_without_retaining_command_text() {
+    let update = br#"{
+      "update_id": 99,
+      "message": {
+        "message_id": 7,
+        "from": {"id": 42},
+        "chat": {"id": 4200, "type": "private"},
+        "date": 1783987270,
+        "text": "/claim 1111111111111111111111111111111111111111111111111111111111111111"
+      }
+    }"#;
+    let parsed = parse_update(update, 42).unwrap();
+    assert_eq!(parsed.event.kind, RawEventKind::OwnerClaim);
+    assert!(matches!(
+        parsed.event.owner_claim,
+        Some(ParsedOwnerClaim::Candidate {
+            from_user_id: 42,
+            owner_chat_id: 4200,
+            ..
+        })
+    ));
+    assert!(parsed.event.owner_command.is_none());
+    assert!(!format!("{:?}", parsed.event).contains("1111111111111111"));
 }
 
 #[test]

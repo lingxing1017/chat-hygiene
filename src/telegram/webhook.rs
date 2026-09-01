@@ -13,9 +13,10 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::events::RecordReceipt;
+use crate::owner::OwnerIdentityHandle;
 
 use super::models::RawBusinessEvent;
-use super::parser::parse_update;
+use super::parser::{parse_update, parse_update_with_owner_identity};
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 256 * 1024;
 const SECRET_HEADER: &str = "X-Telegram-Bot-Api-Secret-Token";
@@ -45,11 +46,27 @@ struct WebhookState<I> {
     inbox: Arc<I>,
 }
 
+struct IdentityWebhookState<I> {
+    secret: SecretString,
+    owner_identity: OwnerIdentityHandle,
+    inbox: Arc<I>,
+}
+
 impl<I> Clone for WebhookState<I> {
     fn clone(&self) -> Self {
         Self {
             secret: self.secret.clone(),
             owner_user_id: self.owner_user_id,
+            inbox: Arc::clone(&self.inbox),
+        }
+    }
+}
+
+impl<I> Clone for IdentityWebhookState<I> {
+    fn clone(&self) -> Self {
+        Self {
+            secret: self.secret.clone(),
+            owner_identity: self.owner_identity.clone(),
             inbox: Arc::clone(&self.inbox),
         }
     }
@@ -70,6 +87,21 @@ pub fn webhook_router<I: WebhookInbox + 'static>(
         })
 }
 
+pub fn webhook_router_with_owner_identity<I: WebhookInbox + 'static>(
+    secret: SecretString,
+    owner_identity: OwnerIdentityHandle,
+    inbox: Arc<I>,
+) -> Router {
+    Router::new()
+        .route("/telegram/webhook", post(handle_identity_webhook::<I>))
+        .layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES))
+        .with_state(IdentityWebhookState {
+            secret,
+            owner_identity,
+            inbox,
+        })
+}
+
 async fn handle_webhook<I: WebhookInbox>(
     State(state): State<WebhookState<I>>,
     headers: HeaderMap,
@@ -79,6 +111,24 @@ async fn handle_webhook<I: WebhookInbox>(
         return StatusCode::FORBIDDEN;
     }
     let Ok(update) = parse_update(&body, state.owner_user_id) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    match state.inbox.submit(update.update_id, update.event).await {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+async fn handle_identity_webhook<I: WebhookInbox>(
+    State(state): State<IdentityWebhookState<I>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    if !secret_is_valid(&headers, &state.secret) {
+        return StatusCode::FORBIDDEN;
+    }
+    let owner = state.owner_identity.snapshot().await;
+    let Ok(update) = parse_update_with_owner_identity(&body, &owner) else {
         return StatusCode::BAD_REQUEST;
     };
     match state.inbox.submit(update.update_id, update.event).await {

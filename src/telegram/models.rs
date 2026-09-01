@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::detection::MessageContent;
+use crate::owner::ParsedOwnerClaim;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawEventKind {
@@ -11,6 +12,7 @@ pub enum RawEventKind {
     BotBusinessMessage,
     ImplicitOwnerMessage,
     MessagesDeleted,
+    OwnerClaim,
     OwnerCommand,
     Ignored,
 }
@@ -49,7 +51,7 @@ pub struct OwnerCommandSnapshot {
     pub replied_sample: Option<OwnerReplySnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct RawBusinessEvent {
     pub kind: RawEventKind,
     pub connection_id: Option<String>,
@@ -59,13 +61,38 @@ pub struct RawBusinessEvent {
     pub content: Option<MessageContent>,
     pub deleted_message_ids: Vec<i64>,
     pub connection: Option<BusinessConnectionSnapshot>,
+    pub owner_claim: Option<ParsedOwnerClaim>,
     pub owner_command: Option<OwnerCommandSnapshot>,
     pub contact_display_name: Option<String>,
     pub contact_username: Option<String>,
     pub occurred_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Clone for RawBusinessEvent {
+    fn clone(&self) -> Self {
+        assert!(
+            self.owner_claim.is_none(),
+            "Owner claim events cannot be cloned"
+        );
+        Self {
+            kind: self.kind,
+            connection_id: self.connection_id.clone(),
+            chat_id: self.chat_id,
+            message_id: self.message_id,
+            media_group_id: self.media_group_id.clone(),
+            content: self.content.clone(),
+            deleted_message_ids: self.deleted_message_ids.clone(),
+            connection: self.connection.clone(),
+            owner_claim: None,
+            owner_command: self.owner_command.clone(),
+            contact_display_name: self.contact_display_name.clone(),
+            contact_username: self.contact_username.clone(),
+            occurred_at: self.occurred_at,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ParsedUpdate {
     pub update_id: i64,
     pub event: RawBusinessEvent,

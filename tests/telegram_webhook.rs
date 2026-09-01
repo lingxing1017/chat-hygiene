@@ -8,7 +8,12 @@ use axum::http::{Request, StatusCode};
 use chathygiene::app::build_router_with_inbox;
 use chathygiene::config::Settings;
 use chathygiene::events::RecordReceipt;
-use chathygiene::telegram::{IngressError, RawBusinessEvent, WebhookInbox};
+use chathygiene::owner::OwnerIdentityHandle;
+use chathygiene::storage::{OwnerChatSource, OwnerIdentity};
+use chathygiene::telegram::{
+    IngressError, RawBusinessEvent, RawEventKind, WebhookInbox, webhook_router_with_owner_identity,
+};
+use chrono::Utc;
 use secrecy::SecretString;
 use tower::ServiceExt;
 
@@ -141,4 +146,75 @@ async fn oversized_body_is_rejected() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn identity_router_accepts_redacted_claims_and_reclassifies_after_publication() {
+    let owner = OwnerIdentityHandle::new(OwnerIdentity::Unclaimed);
+    let inbox = FakeInbox::returning(RecordReceipt::Recorded);
+    let submitted = Arc::clone(&inbox.submitted);
+    let claim = serde_json::json!({
+        "update_id": 500,
+        "message": {
+            "message_id": 5,
+            "from": {"id": 100},
+            "chat": {"id": 500, "type": "private"},
+            "date": 1_783_987_270_i64,
+            "text": "/claim 1111111111111111111111111111111111111111111111111111111111111111"
+        }
+    });
+    let response = webhook_router_with_owner_identity(
+        SecretString::from("correct-secret"),
+        owner.clone(),
+        Arc::new(inbox),
+    )
+    .oneshot(request(
+        Some("correct-secret"),
+        serde_json::to_vec(&claim).unwrap(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    {
+        let submitted = submitted.lock().unwrap();
+        assert_eq!(submitted[0].1.kind, RawEventKind::OwnerClaim);
+        assert!(submitted[0].1.owner_command.is_none());
+        assert!(!format!("{:?}", submitted[0].1).contains("1111111111111111"));
+    }
+
+    let claimed = OwnerIdentityHandle::new(OwnerIdentity::Claimed {
+        owner_user_id: 100,
+        owner_chat_id: 500,
+        owner_chat_source: OwnerChatSource::Claim,
+        connection_floor_established_at: Some(1),
+        bound_at: Utc::now(),
+    });
+    let inbox = FakeInbox::returning(RecordReceipt::Recorded);
+    let submitted = Arc::clone(&inbox.submitted);
+    let command = serde_json::json!({
+        "update_id": 501,
+        "message": {
+            "message_id": 6,
+            "from": {"id": 100},
+            "chat": {"id": 500, "type": "private"},
+            "date": 1_783_987_271_i64,
+            "text": "/health"
+        }
+    });
+    let response = webhook_router_with_owner_identity(
+        SecretString::from("correct-secret"),
+        claimed,
+        Arc::new(inbox),
+    )
+    .oneshot(request(
+        Some("correct-secret"),
+        serde_json::to_vec(&command).unwrap(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        submitted.lock().unwrap()[0].1.kind,
+        RawEventKind::OwnerCommand
+    );
 }

@@ -4,7 +4,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use secrecy::{ExposeSecret, SecretSlice};
 use sqlx::SqlitePool;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval};
@@ -14,16 +16,19 @@ use crate::detection::SpamDetector;
 use crate::events::{EventError, RecordReceipt, apply_recorded_event, record_prepared_event};
 use crate::owner::{
     LabeledMessageBody, OwnerCommandError, OwnerCommandService, OwnerCommandSource,
-    OwnerTelegramAction, parse_owner_command,
+    OwnerIdentityHandle, OwnerTelegramAction, ParsedOwnerClaim, parse_owner_command,
 };
 use crate::retention::RetentionService;
 use crate::storage::{
-    BusinessConnectionCandidate, CandidateWrite, ConnectionReconciliationSnapshot, ConversationKey,
-    NewAuditEvent, NewOutboxAction, OutboxActionKind, OwnerChatSource, OwnerIdentity, StorageError,
-    TrustedConnectionWrite, UnitOfWork, apply_authoritative_candidate,
-    connection_reconciliation_snapshot, enqueue_outbox_action, find_business_connection,
-    find_conversation, insert_audit_event, list_outbox_actions_for_update, promote_owner_chat,
-    prune_connection_candidates, reconcile_authoritative_trusted_connection,
+    BusinessConnectionCandidate, CandidateGuard, CandidateWrite, ConnectionReconciliationSnapshot,
+    ConversationKey, GlobalReconciliationState, NewAuditEvent, NewOutboxAction, OutboxActionKind,
+    OwnerChatSource, OwnerIdentity, StorageError, TelegramReconciliationState,
+    TrustedConnectionWrite, UnitOfWork, apply_authoritative_candidate, candidates_for_user,
+    claim_owner, clear_connection_candidates, connection_reconciliation_snapshot,
+    delete_connection_candidates_for_other_users, enqueue_outbox_action, find_business_connection,
+    find_conversation, insert_audit_event, list_outbox_actions_for_update, load_candidate_guard,
+    load_owner_identity, load_telegram_reconciliation_state, promote_claim_candidate,
+    promote_owner_chat, prune_connection_candidates, reconcile_authoritative_trusted_connection,
     retire_trusted_connection_not_found, set_telegram_auth_failed,
 };
 use crate::telegram::{
@@ -101,6 +106,28 @@ struct ClaimedOwner {
     chat_source: OwnerChatSource,
 }
 
+#[derive(Debug, Clone)]
+struct OwnerClaimSnapshot {
+    owner: OwnerIdentity,
+    global: TelegramReconciliationState,
+    guard: CandidateGuard,
+    candidates: Vec<BusinessConnectionCandidate>,
+}
+
+#[derive(Debug)]
+struct OwnerClaimLookup {
+    authoritative: Option<AuthoritativeBusinessConnection>,
+    authentication_failed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValidOwnerClaim {
+    from_user_id: i64,
+    owner_chat_id: i64,
+    message_date: i64,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+}
+
 pub struct ProcessingEngine<D, V, C> {
     pool: SqlitePool,
     clock: C,
@@ -113,6 +140,8 @@ pub struct ProcessingEngine<D, V, C> {
     fatal_runtime_notifier: Arc<dyn FatalRuntimeNotifier>,
     fatal_notified: bool,
     connection_retries: HashMap<i64, ConnectionRetry>,
+    owner_claim_token: Option<SecretSlice<u8>>,
+    owner_identity: Option<OwnerIdentityHandle>,
 }
 
 struct WorkItem {
@@ -149,6 +178,8 @@ where
             fatal_runtime_notifier: Arc::new(NoopFatalRuntimeNotifier),
             fatal_notified: false,
             connection_retries: HashMap::new(),
+            owner_claim_token: None,
+            owner_identity: None,
         }
     }
 
@@ -179,6 +210,17 @@ where
         self
     }
 
+    #[must_use]
+    pub fn with_owner_claim(
+        mut self,
+        token: Option<SecretSlice<u8>>,
+        owner_identity: OwnerIdentityHandle,
+    ) -> Self {
+        self.owner_claim_token = token;
+        self.owner_identity = Some(owner_identity);
+        self
+    }
+
     /// Serially prepares, records, and atomically applies one raw update.
     ///
     /// # Errors
@@ -190,6 +232,9 @@ where
         update_id: i64,
         mut raw: RawBusinessEvent,
     ) -> Result<RecordReceipt, ProcessingError> {
+        if raw.kind == RawEventKind::OwnerClaim {
+            return self.process_owner_claim(update_id, raw).await;
+        }
         if raw.kind == RawEventKind::OwnerCommand {
             return self.process_owner_command(update_id, raw).await;
         }
@@ -225,6 +270,236 @@ where
             }
         }
         Ok(receipt)
+    }
+
+    async fn process_owner_claim(
+        &mut self,
+        update_id: i64,
+        mut raw: RawBusinessEvent,
+    ) -> Result<RecordReceipt, ProcessingError> {
+        if let Some(receipt) = existing_update_receipt(&self.pool, update_id).await? {
+            return Ok(receipt);
+        }
+        let claim = raw.owner_claim.take().ok_or_else(|| {
+            ProcessingError::InvalidEvent("owner claim context is missing".to_owned())
+        })?;
+        match claim {
+            ParsedOwnerClaim::NotClaim => Err(ProcessingError::InvalidEvent(
+                "owner claim event is not a claim".to_owned(),
+            )),
+            ParsedOwnerClaim::Ignore => {
+                record_owner_claim_rejection(&self.pool, update_id, None, raw.occurred_at).await
+            }
+            ParsedOwnerClaim::Reject { reply_chat_id } => {
+                record_owner_claim_rejection(
+                    &self.pool,
+                    update_id,
+                    Some(reply_chat_id),
+                    raw.occurred_at,
+                )
+                .await
+            }
+            ParsedOwnerClaim::Candidate {
+                from_user_id,
+                owner_chat_id,
+                message_id: _,
+                message_date,
+                token,
+            } => {
+                let Some(owner_identity) = self.owner_identity.clone() else {
+                    return record_owner_claim_rejection(
+                        &self.pool,
+                        update_id,
+                        Some(owner_chat_id),
+                        raw.occurred_at,
+                    )
+                    .await;
+                };
+                let snapshot = self
+                    .snapshot_owner_claim(from_user_id, self.clock.now())
+                    .await?;
+                if !matches!(snapshot.owner, OwnerIdentity::Unclaimed)
+                    || !claim_token_matches(self.owner_claim_token.as_ref(), &token)
+                {
+                    return record_owner_claim_rejection(
+                        &self.pool,
+                        update_id,
+                        Some(owner_chat_id),
+                        raw.occurred_at,
+                    )
+                    .await;
+                }
+                drop(token);
+                let lookup = self.lookup_claim_candidate(&snapshot).await;
+                self.commit_owner_claim(
+                    update_id,
+                    ValidOwnerClaim {
+                        from_user_id,
+                        owner_chat_id,
+                        message_date,
+                        occurred_at: raw.occurred_at,
+                    },
+                    snapshot,
+                    lookup,
+                    owner_identity,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn snapshot_owner_claim(
+        &mut self,
+        claimant_user_id: i64,
+        service_now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<OwnerClaimSnapshot, ProcessingError> {
+        let mut uow = UnitOfWork::begin(&self.pool).await?;
+        let owner = load_owner_identity(&mut uow).await?;
+        let global = load_telegram_reconciliation_state(&mut uow).await?;
+        let guard = load_candidate_guard(&mut uow).await?;
+        let mut candidates = candidates_for_user(&mut uow, claimant_user_id).await?;
+        uow.rollback().await?;
+        let cutoff = service_now - chrono::Duration::days(7);
+        candidates.retain(|candidate| candidate.observed_at >= cutoff);
+        Ok(OwnerClaimSnapshot {
+            owner,
+            global,
+            guard,
+            candidates,
+        })
+    }
+
+    async fn lookup_claim_candidate(&mut self, snapshot: &OwnerClaimSnapshot) -> OwnerClaimLookup {
+        if snapshot.global.state != GlobalReconciliationState::Ready
+            || snapshot.guard.overflow_established_at.is_some()
+            || snapshot.candidates.len() != 1
+        {
+            return OwnerClaimLookup {
+                authoritative: None,
+                authentication_failed: false,
+            };
+        }
+        match lookup_business_connection(
+            self.business_connection_api.as_ref(),
+            &snapshot.candidates[0].connection_id,
+        )
+        .await
+        {
+            Ok(authoritative) => OwnerClaimLookup {
+                authoritative: Some(authoritative),
+                authentication_failed: false,
+            },
+            Err(AuthoritativeLookupError::BotAuthentication { .. }) => OwnerClaimLookup {
+                authoritative: None,
+                authentication_failed: true,
+            },
+            Err(_) => OwnerClaimLookup {
+                authoritative: None,
+                authentication_failed: false,
+            },
+        }
+    }
+
+    async fn commit_owner_claim(
+        &mut self,
+        update_id: i64,
+        claim: ValidOwnerClaim,
+        snapshot: OwnerClaimSnapshot,
+        lookup: OwnerClaimLookup,
+        owner_identity: OwnerIdentityHandle,
+    ) -> Result<RecordReceipt, ProcessingError> {
+        let service_now = self.clock.now();
+        let mut identity_gate = owner_identity.write_gate().await;
+        let mut uow = UnitOfWork::begin_immediate(&self.pool).await?;
+        if let Some(receipt) = existing_update_receipt_in(&mut uow, update_id).await? {
+            uow.rollback().await?;
+            return Ok(receipt);
+        }
+        if !matches!(
+            load_owner_identity(&mut uow).await?,
+            OwnerIdentity::Unclaimed
+        ) {
+            insert_redacted_owner_update(&mut uow, update_id, claim.occurred_at).await?;
+            insert_owner_claim_audit(&mut uow, update_id, false, claim.occurred_at).await?;
+            enqueue_direct_owner_message(
+                &mut uow,
+                update_id,
+                claim.owner_chat_id,
+                "claim failed",
+                claim.occurred_at,
+                "OWNER_CLAIM_REJECTED",
+            )
+            .await?;
+            uow.commit().await?;
+            return Ok(RecordReceipt::Recorded);
+        }
+
+        let global = load_telegram_reconciliation_state(&mut uow).await?;
+        let guard_before_prune = load_candidate_guard(&mut uow).await?;
+        let candidates_before_prune = candidates_for_user(&mut uow, claim.from_user_id).await?;
+        let floor = claim_generation_floor(
+            claim.message_date,
+            &snapshot,
+            &guard_before_prune,
+            &candidates_before_prune,
+        );
+        prune_connection_candidates(&mut uow, service_now - chrono::Duration::days(7), 256).await?;
+        let guard = load_candidate_guard(&mut uow).await?;
+        let candidates = candidates_for_user(&mut uow, claim.from_user_id).await?;
+        let claimed = claim_owner(
+            &mut uow,
+            claim.from_user_id,
+            claim.owner_chat_id,
+            floor,
+            service_now,
+        )
+        .await?;
+        if lookup.authentication_failed {
+            set_telegram_auth_failed(&mut uow, service_now).await?;
+        }
+        let promoted = try_promote_claim_candidate(
+            &mut uow,
+            &snapshot,
+            &global,
+            &guard,
+            &candidates,
+            lookup.authoritative.as_ref(),
+            service_now,
+        )
+        .await?;
+        let connection_state = if promoted {
+            claim_connection_state(lookup.authoritative.as_ref())
+        } else if guard.overflow_established_at.is_none() && candidates.len() >= 2 {
+            delete_connection_candidates_for_other_users(&mut uow, claim.from_user_id).await?;
+            "ambiguous"
+        } else {
+            clear_connection_candidates(&mut uow).await?;
+            "missing"
+        };
+        if promoted {
+            clear_connection_candidates(&mut uow).await?;
+        }
+        insert_redacted_owner_update(&mut uow, update_id, claim.occurred_at).await?;
+        insert_owner_claim_audit(&mut uow, update_id, true, claim.occurred_at).await?;
+        enqueue_direct_owner_message(
+            &mut uow,
+            update_id,
+            claim.owner_chat_id,
+            &format!("claim succeeded connection={connection_state}"),
+            claim.occurred_at,
+            "OWNER_CLAIM_CONFIRMATION",
+        )
+        .await?;
+        uow.commit().await?;
+        *identity_gate = claimed;
+        drop(identity_gate);
+        drop(self.owner_claim_token.take());
+        if lookup.authentication_failed && !self.fatal_notified {
+            self.fatal_notified = true;
+            self.fatal_runtime_notifier
+                .notify(FatalRuntimeEvent::TelegramAuthentication);
+        }
+        Ok(RecordReceipt::Recorded)
     }
 
     async fn reconcile_connection_trigger(
@@ -469,44 +744,25 @@ where
         update_id: i64,
         raw: RawBusinessEvent,
     ) -> Result<RecordReceipt, ProcessingError> {
+        let mut identity_gate = if let Some(owner_identity) = &self.owner_identity {
+            Some(owner_identity.write_gate().await)
+        } else {
+            None
+        };
         let mut uow = UnitOfWork::begin(&self.pool).await?;
-        if let Some(status) = sqlx::query_scalar::<_, String>(
-            "SELECT status FROM processed_update WHERE update_id = ?",
-        )
-        .bind(update_id)
-        .fetch_optional(uow.connection())
-        .await
-        .map_err(StorageError::from)?
-        {
+        if let Some(receipt) = existing_update_receipt_in(&mut uow, update_id).await? {
             uow.rollback().await?;
-            return match status.as_str() {
-                "APPLIED" => Ok(RecordReceipt::DuplicateApplied),
-                "RECORDED" => Ok(RecordReceipt::DuplicateRecorded),
-                _ => Err(ProcessingError::Event(EventError::InvalidStatus(status))),
-            };
+            return Ok(receipt);
         }
         let trace_enabled = dry_run_enabled(&mut uow, self.default_destructive_mode).await?;
-
-        sqlx::query(
-            "INSERT INTO processed_update
-             (update_id, event_type, event_json, status, received_at, applied_at)
-             VALUES (?, 'owner_command', ?, 'APPLIED', ?, ?)",
-        )
-        .bind(update_id)
-        .bind(format!(
-            "{{\"update_id\":{update_id},\"event_type\":\"owner_command\",\"facts\":{{\"kind\":\"OWNER_COMMAND\"}}}}"
-        ))
-        .bind(raw.occurred_at.to_rfc3339())
-        .bind(raw.occurred_at.to_rfc3339())
-        .execute(uow.connection())
-        .await
-        .map_err(StorageError::from)?;
+        insert_redacted_owner_command_update(&mut uow, update_id, raw.occurred_at).await?;
 
         let snapshot = raw.owner_command.ok_or_else(|| {
             ProcessingError::InvalidEvent("owner command context is missing".to_owned())
         })?;
         let source = OwnerCommandSource {
             from_user_id: snapshot.from_user_id.unwrap_or_default(),
+            chat_id: raw.chat_id.unwrap_or_default(),
             private_chat: snapshot.private_chat,
             replied_sample: snapshot.replied_sample.map(|sample| LabeledMessageBody {
                 body: sample.body,
@@ -517,8 +773,8 @@ where
         };
         let service = OwnerCommandService::at(raw.occurred_at)
             .with_default_destructive_mode(self.default_destructive_mode);
-        let connection = match service.authorize(&source, &mut uow).await {
-            Ok(connection) => connection,
+        let owner = match service.authorize(&source, &mut uow).await {
+            Ok(owner) => owner,
             Err(OwnerCommandError::Unauthorized) => {
                 uow.commit().await?;
                 return Ok(RecordReceipt::Recorded);
@@ -527,7 +783,7 @@ where
         };
         let (response, telegram_actions) = match parse_owner_command(&snapshot.text) {
             Ok(command) => match service
-                .execute_authorized(command, source, &connection, &mut uow)
+                .execute_authorized(command, source, &owner, &mut uow)
                 .await
             {
                 Ok(execution) => (execution.response, execution.telegram_actions),
@@ -540,18 +796,21 @@ where
         };
         enqueue_owner_telegram_actions(&mut uow, update_id, telegram_actions, raw.occurred_at)
             .await?;
-        let owner_chat_id = raw.chat_id.ok_or_else(|| {
-            ProcessingError::InvalidEvent("owner command chat ID is missing".to_owned())
-        })?;
+        let owner_chat_id = owner.owner_chat_id;
         let owner_message_id = raw.message_id;
-        let owner_key = ConversationKey::new(connection.connection_id, owner_chat_id);
-        enqueue_owner_command_reply(&mut uow, update_id, &owner_key, &response, raw.occurred_at)
-            .await?;
+        enqueue_direct_owner_message(
+            &mut uow,
+            update_id,
+            owner_chat_id,
+            &response,
+            raw.occurred_at,
+            "OWNER_COMMAND_REPLY",
+        )
+        .await?;
         if trace_enabled {
             enqueue_owner_command_trace(
                 &mut uow,
                 update_id,
-                owner_key,
                 owner_chat_id,
                 owner_message_id,
                 raw.occurred_at,
@@ -559,7 +818,270 @@ where
             .await?;
         }
         uow.commit().await?;
+        if let Some(gate) = identity_gate.as_mut() {
+            **gate = owner.identity;
+        }
         Ok(RecordReceipt::Recorded)
+    }
+}
+
+fn claim_token_matches(expected: Option<&SecretSlice<u8>>, provided: &SecretSlice<u8>) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    expected.expose_secret().len() == provided.expose_secret().len()
+        && bool::from(expected.expose_secret().ct_eq(provided.expose_secret()))
+}
+
+async fn existing_update_receipt(
+    pool: &SqlitePool,
+    update_id: i64,
+) -> Result<Option<RecordReceipt>, ProcessingError> {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM processed_update WHERE update_id = ?")
+            .bind(update_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(StorageError::from)?;
+    status.map(|status| receipt_for_status(&status)).transpose()
+}
+
+async fn existing_update_receipt_in(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+) -> Result<Option<RecordReceipt>, ProcessingError> {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM processed_update WHERE update_id = ?")
+            .bind(update_id)
+            .fetch_optional(uow.connection())
+            .await
+            .map_err(StorageError::from)?;
+    status.map(|status| receipt_for_status(&status)).transpose()
+}
+
+fn receipt_for_status(status: &str) -> Result<RecordReceipt, ProcessingError> {
+    match status {
+        "RECORDED" => Ok(RecordReceipt::DuplicateRecorded),
+        "APPLIED" => Ok(RecordReceipt::DuplicateApplied),
+        _ => Err(ProcessingError::Event(EventError::InvalidStatus(
+            status.to_owned(),
+        ))),
+    }
+}
+
+async fn record_owner_claim_rejection(
+    pool: &SqlitePool,
+    update_id: i64,
+    reply_chat_id: Option<i64>,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<RecordReceipt, ProcessingError> {
+    let mut uow = UnitOfWork::begin_immediate(pool).await?;
+    if let Some(receipt) = existing_update_receipt_in(&mut uow, update_id).await? {
+        uow.rollback().await?;
+        return Ok(receipt);
+    }
+    insert_redacted_owner_update(&mut uow, update_id, occurred_at).await?;
+    insert_owner_claim_audit(&mut uow, update_id, false, occurred_at).await?;
+    if let Some(owner_chat_id) = reply_chat_id {
+        enqueue_direct_owner_message(
+            &mut uow,
+            update_id,
+            owner_chat_id,
+            "claim failed",
+            occurred_at,
+            "OWNER_CLAIM_REJECTED",
+        )
+        .await?;
+    }
+    uow.commit().await?;
+    Ok(RecordReceipt::Recorded)
+}
+
+async fn insert_redacted_owner_update(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ProcessingError> {
+    let result = sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES (?, 'owner_claim', ?, 'APPLIED', ?, ?)",
+    )
+    .bind(update_id)
+    .bind(format!(
+        "{{\"update_id\":{update_id},\"event_type\":\"owner_claim\",\"facts\":{{\"kind\":\"OWNER_CLAIM\"}}}}"
+    ))
+    .bind(occurred_at.to_rfc3339())
+    .bind(occurred_at.to_rfc3339())
+    .execute(uow.connection())
+    .await
+    .map_err(StorageError::from)?;
+    if result.rows_affected() != 1 {
+        return Err(ProcessingError::Event(EventError::InvalidStatus(
+            "owner claim update was not inserted".to_owned(),
+        )));
+    }
+    Ok(())
+}
+
+async fn insert_redacted_owner_command_update(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ProcessingError> {
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES (?, 'owner_command', ?, 'APPLIED', ?, ?)",
+    )
+    .bind(update_id)
+    .bind(format!(
+        "{{\"update_id\":{update_id},\"event_type\":\"owner_command\",\"facts\":{{\"kind\":\"OWNER_COMMAND\"}}}}"
+    ))
+    .bind(occurred_at.to_rfc3339())
+    .bind(occurred_at.to_rfc3339())
+    .execute(uow.connection())
+    .await
+    .map_err(StorageError::from)?;
+    Ok(())
+}
+
+async fn insert_owner_claim_audit(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    success: bool,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ProcessingError> {
+    insert_audit_event(
+        uow,
+        &NewAuditEvent {
+            source_update_id: update_id,
+            key: None,
+            event_kind: if success {
+                "OWNER_CLAIMED".to_owned()
+            } else {
+                "SECURITY".to_owned()
+            },
+            state_before: None,
+            state_after: None,
+            score: None,
+            reasons_json: None,
+            rule_ids_json: None,
+            normalized_hash: None,
+            rule_version: None,
+            error_code: (!success).then(|| "OWNER_CLAIM_REJECTED".to_owned()),
+            error_message: (!success).then(|| "owner claim rejected".to_owned()),
+            occurred_at,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn enqueue_direct_owner_message(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    owner_chat_id: i64,
+    message: &str,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    suffix: &str,
+) -> Result<(), ProcessingError> {
+    enqueue_outbox_action(
+        uow,
+        &NewOutboxAction {
+            source_update_id: update_id,
+            key: None,
+            kind: OutboxActionKind::SendOwnerMessage,
+            payload_json: serde_json::json!({
+                "message": message,
+                "owner_chat_id": owner_chat_id,
+            })
+            .to_string(),
+            idempotency_key: format!("{update_id}:{suffix}"),
+            created_at: occurred_at,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn claim_generation_floor(
+    message_date: i64,
+    snapshot: &OwnerClaimSnapshot,
+    current_guard: &CandidateGuard,
+    current_candidates: &[BusinessConnectionCandidate],
+) -> i64 {
+    snapshot
+        .candidates
+        .iter()
+        .chain(current_candidates)
+        .map(|candidate| candidate.connection_established_at)
+        .chain(snapshot.guard.overflow_established_at)
+        .chain(current_guard.overflow_established_at)
+        .fold(message_date, i64::max)
+}
+
+async fn try_promote_claim_candidate(
+    uow: &mut UnitOfWork<'_>,
+    snapshot: &OwnerClaimSnapshot,
+    current_global: &TelegramReconciliationState,
+    current_guard: &CandidateGuard,
+    current_candidates: &[BusinessConnectionCandidate],
+    authoritative: Option<&AuthoritativeBusinessConnection>,
+    service_now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, ProcessingError> {
+    if snapshot.global.state != GlobalReconciliationState::Ready
+        || current_global.state != GlobalReconciliationState::Ready
+        || snapshot.global.state_revision != current_global.state_revision
+        || snapshot.guard != *current_guard
+        || current_guard.overflow_established_at.is_some()
+        || snapshot.candidates.len() != 1
+        || current_candidates.len() != 1
+    {
+        return Ok(false);
+    }
+    let snapshot_candidate = &snapshot.candidates[0];
+    let current_candidate = &current_candidates[0];
+    if snapshot_candidate.connection_id != current_candidate.connection_id
+        || snapshot_candidate.state_revision != current_candidate.state_revision
+    {
+        return Ok(false);
+    }
+    let Some(authoritative) = authoritative else {
+        return Ok(false);
+    };
+    if !authoritative.enabled
+        || authoritative.connection_id != current_candidate.connection_id
+        || authoritative.business_user_id != current_candidate.business_user_id
+        || authoritative.connection_established_at != current_candidate.connection_established_at
+    {
+        return Ok(false);
+    }
+    let candidate = authoritative_candidate(authoritative, service_now)?;
+    Ok(matches!(
+        promote_claim_candidate(
+            uow,
+            &candidate,
+            current_candidate.state_revision,
+            current_guard.state_revision,
+        )
+        .await?,
+        TrustedConnectionWrite::Installed
+    ))
+}
+
+fn claim_connection_state(authoritative: Option<&AuthoritativeBusinessConnection>) -> &'static str {
+    let Some(authoritative) = authoritative else {
+        return "missing";
+    };
+    if authoritative.rights.can_reply
+        && authoritative.rights.can_read_messages
+        && authoritative.rights.can_delete_sent_messages
+        && authoritative.rights.can_delete_all_messages
+    {
+        "enabled"
+    } else {
+        "rights_incomplete"
     }
 }
 
@@ -785,28 +1307,6 @@ async fn make_preclaim_business_event_inert(
     Ok(())
 }
 
-async fn enqueue_owner_command_reply(
-    uow: &mut UnitOfWork<'_>,
-    update_id: i64,
-    owner_key: &ConversationKey,
-    response: &str,
-    occurred_at: chrono::DateTime<chrono::Utc>,
-) -> Result<(), ProcessingError> {
-    enqueue_outbox_action(
-        uow,
-        &NewOutboxAction {
-            source_update_id: update_id,
-            key: Some(owner_key.clone()),
-            kind: OutboxActionKind::SendOwnerMessage,
-            payload_json: serde_json::json!({"message": response}).to_string(),
-            idempotency_key: format!("{update_id}:OWNER_COMMAND_REPLY"),
-            created_at: occurred_at,
-        },
-    )
-    .await?;
-    Ok(())
-}
-
 async fn enqueue_owner_telegram_actions(
     uow: &mut UnitOfWork<'_>,
     update_id: i64,
@@ -844,7 +1344,6 @@ async fn enqueue_owner_telegram_actions(
 async fn enqueue_owner_command_trace(
     uow: &mut UnitOfWork<'_>,
     update_id: i64,
-    owner_key: ConversationKey,
     owner_chat_id: i64,
     owner_message_id: Option<i64>,
     occurred_at: chrono::DateTime<chrono::Utc>,
@@ -856,7 +1355,7 @@ async fn enqueue_owner_command_trace(
         uow,
         &NewOutboxAction {
             source_update_id: update_id,
-            key: Some(owner_key),
+            key: None,
             kind: OutboxActionKind::SendOwnerMessage,
             payload_json: serde_json::json!({
                 "message": trace.render(),

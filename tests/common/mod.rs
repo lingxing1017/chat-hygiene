@@ -74,6 +74,9 @@ pub async fn processing_database() -> (TempDir, SqlitePool) {
     .execute(&pool)
     .await
     .expect("seed connection");
+    initialize_or_load_owner_identity(&pool, at("2026-07-14T00:00:00Z"))
+        .await
+        .expect("initialize processing Owner");
     (directory, pool)
 }
 
@@ -682,6 +685,7 @@ pub fn inbound(
         }),
         deleted_message_ids: Vec::new(),
         connection: None,
+        owner_claim: None,
         owner_command: None,
         contact_display_name: None,
         contact_username: None,
@@ -714,6 +718,7 @@ pub fn deleted(chat_id: i64, message_ids: Vec<i64>, now: DateTime<Utc>) -> RawBu
         content: None,
         deleted_message_ids: message_ids,
         connection: None,
+        owner_claim: None,
         owner_command: None,
         contact_display_name: None,
         contact_username: None,

@@ -1,4 +1,6 @@
+mod claim;
 mod commands;
+mod identity;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -7,11 +9,14 @@ use thiserror::Error;
 
 use crate::detection::normalized_text_hash;
 use crate::storage::{
-    BusinessConnectionRecord, ConversationKey, StorageError, UnitOfWork, eligible_deletion_ids,
-    find_conversation, find_single_business_connection,
+    BusinessConnectionRecord, ConversationKey, OwnerChatSource, OwnerIdentity, StorageError,
+    UnitOfWork, eligible_deletion_ids, find_conversation, find_single_business_connection,
+    load_owner_identity, promote_owner_chat,
 };
 
+pub use claim::{OwnerClaimContext, ParsedOwnerClaim, parse_owner_claim};
 pub use commands::{OwnerCommand, OwnerCommandParseError, parse_owner_command};
+pub use identity::OwnerIdentityHandle;
 
 const HELP_MESSAGE: &str = "owner commands:\n\
 /help - list owner commands\n\
@@ -35,8 +40,17 @@ pub struct LabeledMessageBody {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerCommandSource {
     pub from_user_id: i64,
+    pub chat_id: i64,
     pub private_chat: bool,
     pub replied_sample: Option<LabeledMessageBody>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthorizedOwner {
+    pub identity: OwnerIdentity,
+    pub owner_user_id: i64,
+    pub owner_chat_id: i64,
+    pub connection: Option<BusinessConnectionRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,51 +139,94 @@ impl OwnerCommandService {
         source: OwnerCommandSource,
         uow: &mut UnitOfWork<'_>,
     ) -> Result<OwnerCommandExecution, OwnerCommandError> {
-        let connection = self.authorize(&source, uow).await?;
-        self.execute_authorized(command, source, &connection, uow)
-            .await
+        let owner = self.authorize(&source, uow).await?;
+        self.execute_authorized(command, source, &owner, uow).await
     }
 
     pub(crate) async fn authorize(
         &self,
         source: &OwnerCommandSource,
         uow: &mut UnitOfWork<'_>,
-    ) -> Result<BusinessConnectionRecord, OwnerCommandError> {
-        let connection = find_single_business_connection(uow).await?;
-        let authorized = source.private_chat
-            && connection
-                .as_ref()
-                .is_some_and(|connection| connection.owner_user_id == source.from_user_id);
-        if !authorized {
+    ) -> Result<AuthorizedOwner, OwnerCommandError> {
+        let identity = load_owner_identity(uow).await?;
+        let OwnerIdentity::Claimed {
+            owner_user_id,
+            owner_chat_id,
+            owner_chat_source,
+            ..
+        } = identity
+        else {
+            insert_security_audit(uow, self.now).await?;
+            return Err(OwnerCommandError::Unauthorized);
+        };
+        if !source.private_chat
+            || source.from_user_id != owner_user_id
+            || source.chat_id <= 0
+            || (owner_chat_source != OwnerChatSource::LegacyFallback
+                && source.chat_id != owner_chat_id)
+        {
             insert_security_audit(uow, self.now).await?;
             return Err(OwnerCommandError::Unauthorized);
         }
-        connection.ok_or(OwnerCommandError::Unauthorized)
+        let identity = if owner_chat_source == OwnerChatSource::LegacyFallback {
+            promote_owner_chat(
+                uow,
+                owner_user_id,
+                source.chat_id,
+                OwnerChatSource::PrivateMessage,
+            )
+            .await?
+        } else {
+            identity
+        };
+        let connection = find_single_business_connection(uow).await?;
+        if connection
+            .as_ref()
+            .is_some_and(|connection| connection.owner_user_id != owner_user_id)
+        {
+            return Err(OwnerCommandError::Storage(
+                "Business connection belongs to another Owner".to_owned(),
+            ));
+        }
+        let OwnerIdentity::Claimed { owner_chat_id, .. } = identity else {
+            unreachable!("authorized identity remains claimed");
+        };
+        Ok(AuthorizedOwner {
+            identity,
+            owner_user_id,
+            owner_chat_id,
+            connection,
+        })
     }
 
     pub(crate) async fn execute_authorized(
         &self,
         command: OwnerCommand,
         source: OwnerCommandSource,
-        connection: &BusinessConnectionRecord,
+        owner: &AuthorizedOwner,
         uow: &mut UnitOfWork<'_>,
     ) -> Result<OwnerCommandExecution, OwnerCommandError> {
         match command {
             OwnerCommand::Help => Ok(OwnerCommandExecution::plain(HELP_MESSAGE.to_owned())),
             OwnerCommand::Health => Ok(OwnerCommandExecution::plain(
-                health(connection, self.default_destructive_mode, uow).await?,
+                health(
+                    owner.connection.as_ref(),
+                    self.default_destructive_mode,
+                    uow,
+                )
+                .await?,
             )),
             OwnerCommand::Inspect { chat_id } => Ok(OwnerCommandExecution::plain(
-                inspect(connection, chat_id, uow).await?,
+                inspect(required_connection(owner)?, chat_id, uow).await?,
             )),
             OwnerCommand::Reset { chat_id } => {
-                reset_conversation(connection, chat_id, self.now, uow).await
+                reset_conversation(required_connection(owner)?, chat_id, self.now, uow).await
             }
             OwnerCommand::Unblock { chat_id } => Ok(OwnerCommandExecution::plain(
-                unblock_conversation(connection, chat_id, self.now, uow).await?,
+                unblock_conversation(required_connection(owner)?, chat_id, self.now, uow).await?,
             )),
             OwnerCommand::DryRun { enabled } => Ok(OwnerCommandExecution::plain(
-                set_dry_run(connection, enabled, self.now, uow).await?,
+                set_dry_run(owner.connection.as_ref(), enabled, self.now, uow).await?,
             )),
             OwnerCommand::Errors { limit } => Ok(OwnerCommandExecution::plain(
                 recent_errors(limit, uow).await?,
@@ -184,8 +241,17 @@ impl OwnerCommandService {
     }
 }
 
+fn required_connection(
+    owner: &AuthorizedOwner,
+) -> Result<&BusinessConnectionRecord, OwnerCommandError> {
+    owner
+        .connection
+        .as_ref()
+        .ok_or(OwnerCommandError::BusinessRightsUnavailable)
+}
+
 async fn health(
-    connection: &BusinessConnectionRecord,
+    connection: Option<&BusinessConnectionRecord>,
     default_destructive_mode: bool,
     uow: &mut UnitOfWork<'_>,
 ) -> Result<String, OwnerCommandError> {
@@ -197,12 +263,12 @@ async fn health(
         .as_deref()
         .map_or(default_destructive_mode, |value| value == "true");
     Ok(format!(
-        "status=ok connection={} dry_run={}",
-        if connection.enabled {
+        "status=ok owner=claimed connection={} dry_run={}",
+        connection.map_or("missing", |connection| if connection.enabled {
             "enabled"
         } else {
             "disabled"
-        },
+        }),
         if destructive_mode { "off" } else { "on" }
     ))
 }
@@ -354,12 +420,13 @@ struct StoredRights {
 }
 
 async fn set_dry_run(
-    connection: &BusinessConnectionRecord,
+    connection: Option<&BusinessConnectionRecord>,
     enabled: bool,
     now: DateTime<Utc>,
     uow: &mut UnitOfWork<'_>,
 ) -> Result<String, OwnerCommandError> {
     if !enabled {
+        let connection = connection.ok_or(OwnerCommandError::BusinessRightsUnavailable)?;
         let rights = serde_json::from_str::<StoredRights>(&connection.rights_json)
             .map_err(|_| OwnerCommandError::BusinessRightsUnavailable)?;
         if !connection.enabled

@@ -12,6 +12,7 @@ use chathygiene::telegram::{RawEventKind, parse_update};
 fn source(from_user_id: i64, private_chat: bool) -> OwnerCommandSource {
     OwnerCommandSource {
         from_user_id,
+        chat_id: from_user_id,
         private_chat,
         replied_sample: None,
     }
@@ -20,6 +21,9 @@ fn source(from_user_id: i64, private_chat: bool) -> OwnerCommandSource {
 #[tokio::test]
 async fn authorizes_only_numeric_owner_identity_in_private_bot_chat() {
     let (_directory, pool) = common::processing_database().await;
+    initialize_or_load_owner_identity(&pool, common::at("2026-07-14T00:00:00Z"))
+        .await
+        .unwrap();
     let service = OwnerCommandService::at(common::at("2026-07-14T00:00:00Z"));
 
     for untrusted in [source(99, true), source(42, false)] {
@@ -94,10 +98,8 @@ fn parser_accepts_normal_private_bot_commands_but_not_business_messages() {
       }
     }"#;
     let parsed = parse_update(channel, 42).unwrap();
-    assert_eq!(parsed.event.kind, RawEventKind::OwnerCommand);
-    let command = parsed.event.owner_command.unwrap();
-    assert_eq!(command.from_user_id, None);
-    assert!(!command.private_chat);
+    assert_eq!(parsed.event.kind, RawEventKind::Ignored);
+    assert!(parsed.event.owner_command.is_none());
 }
 
 #[test]

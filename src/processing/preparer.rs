@@ -102,6 +102,7 @@ where
                     message_ids: raw.deleted_message_ids.clone(),
                 },
                 RawEventKind::BusinessConnectionChanged
+                | RawEventKind::OwnerClaim
                 | RawEventKind::OwnerCommand
                 | RawEventKind::Ignored => PreparedAction::Ignore,
             }
@@ -121,7 +122,8 @@ where
             owner_user_id,
             owner_chat_id,
             event_kind: raw_event_name(raw.kind).to_owned(),
-            dry_run: !destructive_mode,
+            dry_run: !destructive_mode
+                && !matches!(raw.kind, RawEventKind::OwnerClaim | RawEventKind::Ignored),
             state_before,
             occurred_at: raw.occurred_at,
             action,
@@ -354,6 +356,7 @@ const fn raw_event_name(kind: RawEventKind) -> &'static str {
         RawEventKind::BotBusinessMessage => "BOT_BUSINESS_MESSAGE",
         RawEventKind::ImplicitOwnerMessage => "IMPLICIT_OWNER_MESSAGE",
         RawEventKind::MessagesDeleted => "MESSAGES_DELETED",
+        RawEventKind::OwnerClaim => "OWNER_CLAIM",
         RawEventKind::OwnerCommand => "OWNER_COMMAND",
         RawEventKind::Ignored => "IGNORED",
     }

@@ -1,9 +1,12 @@
 use chrono::{DateTime, TimeZone, Utc};
+use secrecy::zeroize::Zeroizing;
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::detection::{MediaKind, MessageContent, MessageEntity, MessageEntityKind};
+use crate::owner::{OwnerClaimContext, ParsedOwnerClaim, parse_owner_claim};
+use crate::storage::{OwnerChatSource, OwnerIdentity};
 
 use super::models::{
     OwnerCommandSnapshot, OwnerReplySnapshot, ParsedUpdate, RawBusinessEvent, RawEventKind,
@@ -124,17 +127,44 @@ struct DeletedBusinessMessages {
 /// Returns [`ParseError`] when JSON, required fields, or Telegram timestamps
 /// are invalid. Unusable entity ranges are ignored with the entity itself.
 pub fn parse_update(body: &[u8], owner_user_id: i64) -> Result<ParsedUpdate, ParseError> {
+    let owner = if owner_user_id > 0 {
+        OwnerIdentity::Claimed {
+            owner_user_id,
+            owner_chat_id: owner_user_id,
+            owner_chat_source: OwnerChatSource::LegacyFallback,
+            connection_floor_established_at: None,
+            bound_at: Utc::now(),
+        }
+    } else {
+        OwnerIdentity::Unclaimed
+    };
+    parse_update_with_owner_identity(body, &owner)
+}
+
+/// Parses a Telegram update against the complete persisted Owner identity.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when JSON, required fields, or Telegram timestamps
+/// are invalid. Claim-like messages with unusable source metadata are instead
+/// normalized to a redacted ignored claim event.
+pub fn parse_update_with_owner_identity(
+    body: &[u8],
+    owner: &OwnerIdentity,
+) -> Result<ParsedUpdate, ParseError> {
     let update: Envelope = serde_json::from_slice(body)?;
     let event = if let Some(connection) = update.business_connection {
         connection_event(connection)?
     } else if let Some(message) = update.business_message {
-        message_event(message, owner_user_id, false)?
+        message_event(message, owner_user_id(owner), false)?
     } else if let Some(message) = update.edited_business_message {
-        message_event(message, owner_user_id, true)?
+        message_event(message, owner_user_id(owner), true)?
     } else if let Some(deleted) = update.deleted_business_messages {
         deletion_event(deleted)
-    } else if let Some(message) = update.message.or(update.channel_post) {
-        bot_message_event(message)?
+    } else if let Some(message) = update.message {
+        bot_message_event(message, true, owner)?
+    } else if let Some(message) = update.channel_post {
+        bot_message_event(message, false, owner)?
     } else {
         ignored_event(Utc::now())
     };
@@ -142,6 +172,13 @@ pub fn parse_update(body: &[u8], owner_user_id: i64) -> Result<ParsedUpdate, Par
         update_id: update.update_id,
         event,
     })
+}
+
+const fn owner_user_id(owner: &OwnerIdentity) -> i64 {
+    match owner {
+        OwnerIdentity::Unclaimed => 0,
+        OwnerIdentity::Claimed { owner_user_id, .. } => *owner_user_id,
+    }
 }
 
 fn connection_event(connection: BusinessConnection) -> Result<RawBusinessEvent, ParseError> {
@@ -157,6 +194,7 @@ fn connection_event(connection: BusinessConnection) -> Result<RawBusinessEvent, 
         content: None,
         deleted_message_ids: Vec::new(),
         connection: None,
+        owner_claim: None,
         owner_command: None,
         contact_display_name: None,
         contact_username: None,
@@ -174,6 +212,7 @@ fn ignored_event(occurred_at: DateTime<Utc>) -> RawBusinessEvent {
         content: None,
         deleted_message_ids: Vec::new(),
         connection: None,
+        owner_claim: None,
         owner_command: None,
         contact_display_name: None,
         contact_username: None,
@@ -199,6 +238,7 @@ fn message_event(
         content: Some(content),
         deleted_message_ids: Vec::new(),
         connection: None,
+        owner_claim: None,
         owner_command: None,
         contact_display_name,
         contact_username,
@@ -223,14 +263,54 @@ fn classify_message(message: &BusinessMessage, owner_user_id: i64, edited: bool)
     }
 }
 
-fn bot_message_event(message: BotMessage) -> Result<RawBusinessEvent, ParseError> {
-    let occurred_at = timestamp(message.date)?;
-    let command_text = message.text.clone().unwrap_or_default();
-    let is_command = command_text.trim_start().starts_with('/');
+fn bot_message_event(
+    mut message: BotMessage,
+    ordinary_message: bool,
+    owner: &OwnerIdentity,
+) -> Result<RawBusinessEvent, ParseError> {
+    let mut command_text = Zeroizing::new(message.text.take().unwrap_or_default());
+    let claim = parse_owner_claim(OwnerClaimContext {
+        ordinary_message,
+        private_chat: message.chat.kind == "private",
+        from_user_id: message.from.as_ref().map(|user| user.id),
+        chat_id: message.chat.id,
+        message_id: message.message_id,
+        message_date: message.date,
+        text: Some(command_text.as_str()),
+    });
+    let occurred_at = if matches!(claim, ParsedOwnerClaim::NotClaim) {
+        timestamp(message.date)?
+    } else {
+        timestamp(message.date).unwrap_or_else(|_| Utc::now())
+    };
     let replied_sample = message
         .reply_to_message
         .as_deref()
         .and_then(owner_reply_snapshot);
+    if !matches!(claim, ParsedOwnerClaim::NotClaim) {
+        return Ok(RawBusinessEvent {
+            kind: RawEventKind::OwnerClaim,
+            connection_id: None,
+            chat_id: Some(message.chat.id),
+            message_id: Some(message.message_id),
+            media_group_id: None,
+            content: None,
+            deleted_message_ids: Vec::new(),
+            connection: None,
+            owner_claim: Some(claim),
+            owner_command: None,
+            contact_display_name: None,
+            contact_username: None,
+            occurred_at,
+        });
+    }
+    let looks_like_command = command_text.trim_start().starts_with('/');
+    let is_command =
+        looks_like_command && owner_command_source_is_authorized(&message, ordinary_message, owner);
+    if !is_command {
+        return Ok(ignored_event(occurred_at));
+    }
+    let command_text = std::mem::take(&mut *command_text);
     Ok(RawBusinessEvent {
         kind: if is_command {
             RawEventKind::OwnerCommand
@@ -244,6 +324,7 @@ fn bot_message_event(message: BotMessage) -> Result<RawBusinessEvent, ParseError
         content: None,
         deleted_message_ids: Vec::new(),
         connection: None,
+        owner_claim: None,
         owner_command: is_command.then(|| OwnerCommandSnapshot {
             from_user_id: message.from.map(|user| user.id),
             private_chat: message.chat.kind == "private",
@@ -254,6 +335,30 @@ fn bot_message_event(message: BotMessage) -> Result<RawBusinessEvent, ParseError
         contact_username: None,
         occurred_at,
     })
+}
+
+fn owner_command_source_is_authorized(
+    message: &BotMessage,
+    ordinary_message: bool,
+    owner: &OwnerIdentity,
+) -> bool {
+    let OwnerIdentity::Claimed {
+        owner_user_id,
+        owner_chat_id,
+        owner_chat_source,
+        ..
+    } = owner
+    else {
+        return false;
+    };
+    ordinary_message
+        && message.chat.kind == "private"
+        && message.chat.id > 0
+        && message.from.as_ref().is_some_and(|user| {
+            user.id == *owner_user_id
+                && (*owner_chat_source == OwnerChatSource::LegacyFallback
+                    || message.chat.id == *owner_chat_id)
+        })
 }
 
 fn owner_reply_snapshot(message: &BotMessage) -> Option<OwnerReplySnapshot> {
@@ -398,6 +503,7 @@ fn deletion_event(deleted: DeletedBusinessMessages) -> RawBusinessEvent {
         content: None,
         deleted_message_ids: deleted.message_ids,
         connection: None,
+        owner_claim: None,
         owner_command: None,
         contact_display_name,
         contact_username,

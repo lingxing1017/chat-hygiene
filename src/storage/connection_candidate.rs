@@ -289,6 +289,57 @@ pub async fn reconcile_authoritative_trusted_connection(
     Ok(TrustedConnectionWrite::Replaced)
 }
 
+/// Promotes one exact, freshly refreshed pre-claim candidate for the newly
+/// bound Owner without treating the claim-time generation floor as a later
+/// reconnect floor.
+///
+/// # Errors
+///
+/// Returns a value-free storage error for corrupt state or database failure.
+pub async fn promote_claim_candidate(
+    uow: &mut UnitOfWork<'_>,
+    authoritative: &BusinessConnectionCandidate,
+    expected_candidate_revision: i64,
+    expected_guard_revision: i64,
+) -> Result<TrustedConnectionWrite, StorageError> {
+    validate_candidate(authoritative)?;
+    let canonical_rights = canonical_rights(&authoritative.rights_json)?;
+    let guard = load_candidate_guard(uow).await?;
+    if guard.state_revision != expected_guard_revision || guard.overflow_established_at.is_some() {
+        return Ok(TrustedConnectionWrite::RevisionConflict);
+    }
+    let OwnerIdentity::Claimed { owner_user_id, .. } = load_owner_identity(uow).await? else {
+        return Ok(TrustedConnectionWrite::UserConflict);
+    };
+    if owner_user_id != authoritative.business_user_id {
+        return Ok(TrustedConnectionWrite::UserConflict);
+    }
+    if load_single_trusted_connection(uow).await?.is_some() {
+        return Ok(TrustedConnectionWrite::RevisionConflict);
+    }
+    let Some(candidate) = load_candidate(uow, &authoritative.connection_id).await? else {
+        return Ok(TrustedConnectionWrite::RevisionConflict);
+    };
+    if candidate.state_revision != expected_candidate_revision {
+        return Ok(TrustedConnectionWrite::RevisionConflict);
+    }
+    if candidate.business_user_id != authoritative.business_user_id {
+        return Ok(TrustedConnectionWrite::UserConflict);
+    }
+    if candidate.connection_established_at != authoritative.connection_established_at {
+        return Ok(TrustedConnectionWrite::GenerationConflict);
+    }
+    install_trusted(
+        uow,
+        authoritative,
+        canonical_rights,
+        expected_candidate_revision.saturating_add(1),
+    )
+    .await?;
+    delete_connection_candidate(uow, &authoritative.connection_id).await?;
+    Ok(TrustedConnectionWrite::Installed)
+}
+
 /// Retires an exact trusted connection after an authoritative not-found result.
 ///
 /// # Errors

@@ -245,13 +245,14 @@ async fn dry_run_traces_supported_events_but_not_reconciliation_triggers() {
     engine.process(107, ignored).await.unwrap();
 
     assert!(trace_messages(&pool, 100).await.is_empty());
-    for update_id in 101..=107 {
+    for update_id in 101..=106 {
         assert_eq!(
             trace_messages(&pool, update_id).await.len(),
             1,
             "missing trace for update {update_id}"
         );
     }
+    assert!(trace_messages(&pool, 107).await.is_empty());
 }
 
 #[tokio::test]

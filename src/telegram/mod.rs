@@ -22,5 +22,5 @@ pub use models::{
     ParsedUpdate, RawBusinessEvent, RawEventKind,
 };
 pub use outbox::{DispatchError, DispatchOutcome, OutboxDispatcher};
-pub use parser::{ParseError, parse_update};
-pub use webhook::{IngressError, WebhookInbox, webhook_router};
+pub use parser::{ParseError, parse_update, parse_update_with_owner_identity};
+pub use webhook::{IngressError, WebhookInbox, webhook_router, webhook_router_with_owner_identity};

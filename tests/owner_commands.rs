@@ -11,6 +11,7 @@ use chathygiene::telegram::parse_update;
 fn owner(sample: Option<LabeledMessageBody>) -> OwnerCommandSource {
     OwnerCommandSource {
         from_user_id: 42,
+        chat_id: 42,
         private_chat: true,
         replied_sample: sample,
     }
