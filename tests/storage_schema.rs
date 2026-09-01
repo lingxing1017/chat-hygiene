@@ -33,6 +33,7 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         "key_material",
         "message_ledger",
         "outbox_action",
+        "owner_identity",
         "processed_update",
         "rule_set",
         "runtime_setting",
@@ -45,7 +46,7 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         .fetch_one(&pool)
         .await
         .expect("count migrations");
-    assert_eq!(applied, 5);
+    assert_eq!(applied, 6);
     let key_material = sqlx::query(
         "SELECT singleton, key_version, state, master_seed, seed_checksum,
                 initialized_at, telegram_bot_id
@@ -93,12 +94,39 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         .map(|row| row.get::<String, _>("name"))
         .collect::<BTreeSet<_>>();
     assert!(challenge_columns.contains("hmac_key_version"));
+    assert_owner_sentinel(&pool).await;
     let runtime_override: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM runtime_setting WHERE key = 'destructive_mode'")
             .fetch_one(&pool)
             .await
             .expect("inspect runtime override");
     assert_eq!(runtime_override, 0);
+}
+
+async fn assert_owner_sentinel(pool: &sqlx::SqlitePool) {
+    let owner = sqlx::query(
+        "SELECT singleton, state, owner_user_id, owner_chat_id, owner_chat_source,
+                connection_floor_established_at, bound_at
+         FROM owner_identity",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read owner identity sentinel");
+    assert_eq!(owner.get::<i64, _>("singleton"), 1);
+    assert_eq!(owner.get::<String, _>("state"), "PENDING");
+    assert!(owner.get::<Option<i64>, _>("owner_user_id").is_none());
+    assert!(owner.get::<Option<i64>, _>("owner_chat_id").is_none());
+    assert!(
+        owner
+            .get::<Option<String>, _>("owner_chat_source")
+            .is_none()
+    );
+    assert!(
+        owner
+            .get::<Option<i64>, _>("connection_floor_established_at")
+            .is_none()
+    );
+    assert!(owner.get::<Option<String>, _>("bound_at").is_none());
 }
 
 #[tokio::test]

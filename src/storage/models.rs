@@ -132,6 +132,26 @@ pub struct BusinessConnectionRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerChatSource {
+    LegacyFallback,
+    Claim,
+    BusinessConnection,
+    PrivateMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerIdentity {
+    Unclaimed,
+    Claimed {
+        owner_user_id: i64,
+        owner_chat_id: i64,
+        owner_chat_source: OwnerChatSource,
+        connection_floor_established_at: Option<i64>,
+        bound_at: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboxActionKind {
     SendChallenge,
     EditChallenge,

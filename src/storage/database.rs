@@ -25,6 +25,14 @@ pub enum StorageError {
     UnsupportedKeyVersion(i64),
     #[error("authenticated Telegram bot does not match this installation")]
     TelegramBotIdentityMismatch,
+    #[error("owner identity is missing")]
+    OwnerIdentityMissing,
+    #[error("invalid owner identity: {0}")]
+    InvalidOwnerIdentity(&'static str),
+    #[error("owner identity is already claimed")]
+    OwnerAlreadyClaimed,
+    #[error("owner chat does not match the claimed owner")]
+    OwnerChatMismatch,
 }
 
 /// Opens the single-connection `SQLite` pool used by the MVP worker.

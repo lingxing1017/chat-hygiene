@@ -6,7 +6,10 @@ use std::fs;
 use chathygiene::events::recover_recorded_events;
 use chathygiene::installation::{CURRENT_KEY_VERSION, derive_bot_independent_keys};
 use chathygiene::processing::LifecycleHandler;
-use chathygiene::storage::{connect, load_or_initialize_master_seed, migrate};
+use chathygiene::storage::{
+    OwnerChatSource, OwnerIdentity, connect, initialize_or_load_owner_identity,
+    load_or_initialize_master_seed, migrate,
+};
 use chathygiene::verification::{ArithmeticVerifier, upgrade_active_challenge_hmacs};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -75,6 +78,19 @@ async fn version_three_backup_upgrades_and_remains_the_only_rollback_path() {
             .unwrap(),
         1
     );
+    let owner = initialize_or_load_owner_identity(&upgraded, common::at("2026-08-30T00:00:01Z"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        owner,
+        OwnerIdentity::Claimed {
+            owner_user_id: 42,
+            owner_chat_id: 42,
+            owner_chat_source: OwnerChatSource::LegacyFallback,
+            connection_floor_established_at: None,
+            ..
+        }
+    ));
     let keys = derive_bot_independent_keys(seed.key_version, &seed.bytes).unwrap();
     let verifier = ArithmeticVerifier::new_with_key_version(
         StdRng::seed_from_u64(1),
@@ -110,6 +126,48 @@ async fn version_three_backup_upgrades_and_remains_the_only_rollback_path() {
         &outbox_before,
     )
     .await;
+}
+
+#[tokio::test]
+async fn recorded_connection_is_recovered_before_owner_import() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("recorded.db");
+    let database_url = format!("sqlite://{}", database_path.display());
+    let pool = connect(&database_url).await.unwrap();
+    three_migration_migrator().run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at)
+         VALUES (
+           20, 'lifecycle',
+           '{\"update_id\":20,\"event_type\":\"lifecycle\",\"occurred_at\":\"2026-08-30T00:00:00Z\",\"facts\":{\"connection_id\":\"business-recovered\",\"occurred_at\":\"2026-08-30T00:00:00Z\",\"action\":{\"kind\":\"CONNECTION_CHANGED\",\"owner_user_id\":84,\"enabled\":true,\"rights_json\":\"{}\"}}}',
+           'RECORDED', '2026-08-30T00:00:00Z'
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    migrate(&pool).await.unwrap();
+
+    assert_eq!(
+        recover_recorded_events(&pool, &LifecycleHandler)
+            .await
+            .unwrap(),
+        1
+    );
+    let owner = initialize_or_load_owner_identity(&pool, common::at("2026-08-30T00:00:01Z"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        owner,
+        OwnerIdentity::Claimed {
+            owner_user_id: 84,
+            owner_chat_id: 84,
+            owner_chat_source: OwnerChatSource::LegacyFallback,
+            connection_floor_established_at: None,
+            ..
+        }
+    ));
 }
 
 async fn assert_upgraded_state(

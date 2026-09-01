@@ -1,6 +1,7 @@
 mod database;
 mod key_material;
 mod models;
+mod owner_identity;
 mod repositories;
 mod uow;
 
@@ -9,7 +10,11 @@ pub use key_material::{MasterSeed, load_or_initialize_master_seed, pin_or_verify
 pub use models::{
     BusinessConnectionRecord, ChallengeHmacUpgradeRecord, ChallengeRecord, Conversation,
     ConversationKey, LedgerMessage, MessageDirection, NewAuditEvent, NewOutboxAction,
-    OutboxActionKind, OutboxActionRecord, SenderKind,
+    OutboxActionKind, OutboxActionRecord, OwnerChatSource, OwnerIdentity, SenderKind,
+};
+pub use owner_identity::{
+    advance_owner_connection_floor, claim_owner, initialize_or_load_owner_identity,
+    load_owner_identity, promote_owner_chat,
 };
 pub use repositories::{
     active_challenge, active_challenges_not_on_version, active_owner_reply_ids,
