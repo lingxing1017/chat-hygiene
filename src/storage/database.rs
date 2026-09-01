@@ -33,6 +33,16 @@ pub enum StorageError {
     OwnerAlreadyClaimed,
     #[error("owner chat does not match the claimed owner")]
     OwnerChatMismatch,
+    #[error("business connection candidate state is missing")]
+    ConnectionCandidateStateMissing,
+    #[error("invalid business connection candidate state: {0}")]
+    InvalidConnectionCandidate(&'static str),
+    #[error("invalid candidate guard state: {0}")]
+    InvalidCandidateGuard(&'static str),
+    #[error("Telegram reconciliation state is missing")]
+    TelegramReconciliationStateMissing,
+    #[error("invalid Telegram reconciliation state: {0}")]
+    InvalidTelegramReconciliationState(&'static str),
 }
 
 /// Opens the single-connection `SQLite` pool used by the MVP worker.

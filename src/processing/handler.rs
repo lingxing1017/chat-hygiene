@@ -6,11 +6,12 @@ use crate::events::{EventApplier, EventError, PreparedEvent};
 use crate::storage::{
     BusinessConnectionRecord, ChallengeRecord, Conversation, ConversationKey, LedgerMessage,
     MessageDirection, NewAuditEvent, NewOutboxAction, OutboxActionKind, OwnerChatSource,
-    OwnerIdentity, SenderKind, UnitOfWork, active_owner_reply_ids, close_active_challenge,
-    close_challenge, create_challenge, eligible_deletion_ids, enqueue_outbox_action,
-    find_conversation, get_or_create_conversation, increment_challenge_attempts,
-    insert_audit_event, list_outbox_actions_for_update, mark_message_deleted, promote_owner_chat,
-    record_message, save_conversation, upsert_business_connection,
+    OwnerIdentity, ReconciliationState, SenderKind, UnitOfWork, active_owner_reply_ids,
+    close_active_challenge, close_challenge, create_challenge, eligible_deletion_ids,
+    enqueue_outbox_action, find_conversation, get_or_create_conversation,
+    increment_challenge_attempts, insert_audit_event, list_outbox_actions_for_update,
+    mark_message_deleted, promote_owner_chat, record_message, save_conversation,
+    upsert_business_connection,
 };
 use crate::telegram::delete_message_batches;
 
@@ -187,6 +188,9 @@ impl LifecycleHandler {
                 owner_user_id,
                 rights_json: rights_json.to_owned(),
                 enabled,
+                connection_established_at: None,
+                state_revision: 0,
+                reconciliation_state: ReconciliationState::Confirmed,
                 updated_at: occurred_at,
             },
         )

@@ -128,7 +128,35 @@ pub struct BusinessConnectionRecord {
     pub owner_user_id: i64,
     pub rights_json: String,
     pub enabled: bool,
+    pub connection_established_at: Option<i64>,
+    pub state_revision: i64,
+    pub reconciliation_state: ReconciliationState,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconciliationState {
+    Pending,
+    Confirmed,
+}
+
+impl ReconciliationState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Confirmed => "CONFIRMED",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, super::StorageError> {
+        match value {
+            "PENDING" => Ok(Self::Pending),
+            "CONFIRMED" => Ok(Self::Confirmed),
+            _ => Err(super::StorageError::InvalidData(
+                "unknown business connection reconciliation state".to_owned(),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

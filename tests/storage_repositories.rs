@@ -3,11 +3,12 @@ mod common;
 use chathygiene::domain::ConversationState;
 use chathygiene::storage::{
     BusinessConnectionRecord, ChallengeRecord, ConversationKey, LedgerMessage, MessageDirection,
-    OwnerChatSource, OwnerIdentity, SenderKind, StorageError, UnitOfWork, active_challenge,
-    active_owner_reply_ids, close_challenge, connect, create_challenge, eligible_deletion_ids,
-    find_business_connection, get_or_create_conversation, initialize_or_load_owner_identity,
-    load_owner_identity, mark_message_deleted, migrate, promote_owner_chat, record_message,
-    save_conversation, upsert_business_connection,
+    OwnerChatSource, OwnerIdentity, ReconciliationState, SenderKind, StorageError, UnitOfWork,
+    active_challenge, active_owner_reply_ids, close_challenge, connect, create_challenge,
+    disable_business_connection, eligible_deletion_ids, find_business_connection,
+    gate_matching_trusted_for_reconciliation, get_or_create_conversation,
+    initialize_or_load_owner_identity, load_owner_identity, mark_message_deleted, migrate,
+    promote_owner_chat, record_message, save_conversation, upsert_business_connection,
 };
 use chrono::{DateTime, Duration, Utc};
 use sqlx::SqlitePool;
@@ -58,6 +59,34 @@ async fn connection_owner_user_remains_distinct_from_owner_chat() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn local_disable_increments_revision_without_reopening_pending_gate() {
+    let (_directory, pool) = database().await;
+    let now = at("2026-07-14T00:00:00Z");
+    let mut gate = UnitOfWork::begin_immediate(&pool).await.unwrap();
+    assert_eq!(
+        gate_matching_trusted_for_reconciliation(&mut gate, "business-1", now)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    gate.commit().await.unwrap();
+    let mut disable = UnitOfWork::begin_immediate(&pool).await.unwrap();
+    disable_business_connection(&mut disable, "business-1", now + Duration::seconds(1))
+        .await
+        .unwrap();
+    disable.commit().await.unwrap();
+
+    let state: (bool, i64, String) = sqlx::query_as(
+        "SELECT enabled, state_revision, reconciliation_state
+         FROM business_connection WHERE connection_id = 'business-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, (false, 2, "PENDING".to_owned()));
 }
 
 #[tokio::test]
@@ -317,6 +346,9 @@ async fn replace_connection(pool: &SqlitePool, replaced_at: DateTime<Utc>) {
             owner_user_id: 42,
             rights_json: r#"{"can_reply":true}"#.to_owned(),
             enabled: true,
+            connection_established_at: None,
+            state_revision: 0,
+            reconciliation_state: ReconciliationState::Confirmed,
             updated_at: replaced_at,
         },
     )
@@ -429,6 +461,9 @@ async fn refreshing_same_connection_preserves_state_and_runtime_mode() {
             owner_user_id: 42,
             rights_json: r#"{"can_reply":false}"#.to_owned(),
             enabled: false,
+            connection_established_at: None,
+            state_revision: 0,
+            reconciliation_state: ReconciliationState::Confirmed,
             updated_at: now + Duration::seconds(1),
         },
     )

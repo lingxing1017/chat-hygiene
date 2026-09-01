@@ -27,6 +27,8 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         "_sqlx_migrations",
         "audit_event",
         "business_connection",
+        "business_connection_candidate",
+        "business_connection_candidate_guard",
         "challenge",
         "conversation",
         "ham_sample",
@@ -38,6 +40,7 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         "rule_set",
         "runtime_setting",
         "spam_sample",
+        "telegram_reconciliation_state",
     ] {
         assert!(table_names.contains(expected), "missing table {expected}");
     }
@@ -46,7 +49,7 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         .fetch_one(&pool)
         .await
         .expect("count migrations");
-    assert_eq!(applied, 6);
+    assert_eq!(applied, 7);
     let key_material = sqlx::query(
         "SELECT singleton, key_version, state, master_seed, seed_checksum,
                 initialized_at, telegram_bot_id
@@ -78,29 +81,119 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
             .get::<Option<i64>, _>("telegram_bot_id")
             .is_none()
     );
-    let outbox_columns = sqlx::query("PRAGMA table_info(outbox_action)")
-        .fetch_all(&pool)
-        .await
-        .expect("list outbox columns")
-        .into_iter()
-        .map(|row| row.get::<String, _>("name"))
-        .collect::<BTreeSet<_>>();
-    assert!(outbox_columns.contains("claimed_at"));
-    let challenge_columns = sqlx::query("PRAGMA table_info(challenge)")
-        .fetch_all(&pool)
-        .await
-        .expect("list challenge columns")
-        .into_iter()
-        .map(|row| row.get::<String, _>("name"))
-        .collect::<BTreeSet<_>>();
-    assert!(challenge_columns.contains("hmac_key_version"));
+    assert_evolved_columns(&pool).await;
     assert_owner_sentinel(&pool).await;
+    assert_connection_state_sentinels(&pool).await;
     let runtime_override: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM runtime_setting WHERE key = 'destructive_mode'")
             .fetch_one(&pool)
             .await
             .expect("inspect runtime override");
     assert_eq!(runtime_override, 0);
+}
+
+async fn assert_evolved_columns(pool: &sqlx::SqlitePool) {
+    assert!(
+        table_columns(pool, "outbox_action")
+            .await
+            .contains("claimed_at")
+    );
+    assert!(
+        table_columns(pool, "challenge")
+            .await
+            .contains("hmac_key_version")
+    );
+    let business_columns = table_columns(pool, "business_connection").await;
+    for expected in [
+        "connection_established_at",
+        "state_revision",
+        "reconciliation_state",
+    ] {
+        assert!(business_columns.contains(expected));
+    }
+}
+
+async fn table_columns(pool: &sqlx::SqlitePool, table: &str) -> BTreeSet<String> {
+    sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await
+        .expect("list table columns")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect()
+}
+
+async fn assert_connection_state_sentinels(pool: &sqlx::SqlitePool) {
+    let guard: (i64, Option<i64>, i64, String) = sqlx::query_as(
+        "SELECT singleton, overflow_established_at, state_revision, updated_at
+         FROM business_connection_candidate_guard",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read candidate guard");
+    assert_eq!(guard.0, 1);
+    assert_eq!(guard.1, None);
+    assert_eq!(guard.2, 0);
+    assert!(!guard.3.is_empty());
+    let global: (i64, String, i64, String) = sqlx::query_as(
+        "SELECT singleton, state, state_revision, updated_at
+         FROM telegram_reconciliation_state",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read global reconciliation state");
+    assert_eq!(global.0, 1);
+    assert_eq!(global.1, "READY");
+    assert_eq!(global.2, 0);
+    assert!(!global.3.is_empty());
+}
+
+#[tokio::test]
+async fn candidate_schema_enforces_strict_identifiers_and_state() {
+    let (_directory, url) = common::temporary_database();
+    let pool = connect(&url).await.expect("connect database");
+    migrate(&pool).await.expect("migrate database");
+    let rights = r#"{"can_reply":true,"can_read_messages":true,"can_delete_sent_messages":true,"can_delete_all_messages":true}"#;
+
+    sqlx::query(
+        "INSERT INTO business_connection_candidate
+         (connection_id, business_user_id, user_chat_id, rights_json, enabled,
+          connection_established_at, state_revision, observed_at)
+         VALUES ('candidate-1', 42, 4200, ?, 1, 100, 0, '2026-07-14T00:00:00Z')",
+    )
+    .bind(rights)
+    .execute(&pool)
+    .await
+    .expect("insert valid candidate");
+
+    for statement in [
+        "INSERT INTO business_connection_candidate VALUES ('', 42, 4200, '{}', 1, 100, 0, '2026-07-14T00:00:00Z')",
+        "INSERT INTO business_connection_candidate VALUES ('bad-user', 0, 4200, '{}', 1, 100, 0, '2026-07-14T00:00:00Z')",
+        "INSERT INTO business_connection_candidate VALUES ('bad-chat', 42, 0, '{}', 1, 100, 0, '2026-07-14T00:00:00Z')",
+        "INSERT INTO business_connection_candidate VALUES ('bad-enabled', 42, 4200, '{}', 2, 100, 0, '2026-07-14T00:00:00Z')",
+        "INSERT INTO business_connection_candidate VALUES ('bad-date', 42, 4200, '{}', 1, 0, 0, '2026-07-14T00:00:00Z')",
+        "INSERT INTO business_connection_candidate VALUES ('bad-revision', 42, 4200, '{}', 1, 100, -1, '2026-07-14T00:00:00Z')",
+    ] {
+        assert!(sqlx::query(statement).execute(&pool).await.is_err());
+    }
+    assert!(
+        sqlx::query(
+            "INSERT INTO business_connection_candidate_guard
+             (singleton, overflow_established_at, state_revision, updated_at)
+             VALUES (2, NULL, 0, '2026-07-14T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE telegram_reconciliation_state SET state = 'UNKNOWN' WHERE singleton = 1",
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
 }
 
 async fn assert_owner_sentinel(pool: &sqlx::SqlitePool) {

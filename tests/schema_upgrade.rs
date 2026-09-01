@@ -192,6 +192,14 @@ async fn assert_upgraded_state(
         .unwrap(),
         *business_before
     );
+    let connection_state: (Option<i64>, i64, String) = sqlx::query_as(
+        "SELECT connection_established_at, state_revision, reconciliation_state
+         FROM business_connection WHERE connection_id = 'business-1'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(connection_state, (None, 0, "CONFIRMED".to_owned()));
     let challenge_after: (String, i64, Option<i64>, String, i64) = sqlx::query_as(
         "SELECT expression, attempts_used, prompt_message_id, delivery_status, hmac_key_version
          FROM challenge WHERE chat_id = 100",

@@ -1,14 +1,15 @@
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
-use sqlx::FromRow;
+use sqlx::{FromRow, Row};
 
 use crate::domain::ConversationState;
 
+use super::connection_candidate::{GlobalReconciliationState, load_telegram_reconciliation_state};
 use super::models::{
     BusinessConnectionRecord, ChallengeHmacUpgradeRecord, ChallengeRecord, Conversation,
     ConversationKey, LedgerMessage, NewAuditEvent, NewOutboxAction, OutboxActionKind,
-    OutboxActionRecord,
+    OutboxActionRecord, ReconciliationState,
 };
 use super::{StorageError, UnitOfWork};
 
@@ -40,15 +41,6 @@ struct ChallengeRow {
     max_attempts: i64,
     prompt_message_id: Option<i64>,
     delivery_status: String,
-}
-
-#[derive(FromRow)]
-struct BusinessConnectionRow {
-    connection_id: String,
-    owner_user_id: i64,
-    rights_json: String,
-    enabled: bool,
-    updated_at: String,
 }
 
 #[derive(FromRow)]
@@ -176,18 +168,25 @@ pub async fn upsert_business_connection(
 
     sqlx::query(
         "INSERT INTO business_connection
-         (connection_id, owner_user_id, rights_json, enabled, updated_at)
-         VALUES (?, ?, ?, ?, ?)
+         (connection_id, owner_user_id, rights_json, enabled,
+          connection_established_at, state_revision, reconciliation_state, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(connection_id) DO UPDATE SET
            owner_user_id = excluded.owner_user_id,
            rights_json = excluded.rights_json,
            enabled = excluded.enabled,
+           connection_established_at = excluded.connection_established_at,
+           state_revision = excluded.state_revision,
+           reconciliation_state = excluded.reconciliation_state,
            updated_at = excluded.updated_at",
     )
     .bind(&connection.connection_id)
     .bind(connection.owner_user_id)
     .bind(&connection.rights_json)
     .bind(connection.enabled)
+    .bind(connection.connection_established_at)
+    .bind(connection.state_revision)
+    .bind(connection.reconciliation_state.as_str())
     .bind(connection.updated_at.to_rfc3339())
     .execute(uow.connection())
     .await?;
@@ -792,14 +791,28 @@ pub async fn find_business_connection(
     uow: &mut UnitOfWork<'_>,
     connection_id: &str,
 ) -> Result<Option<BusinessConnectionRecord>, StorageError> {
-    let row = sqlx::query_as::<_, BusinessConnectionRow>(
-        "SELECT connection_id, owner_user_id, rights_json, enabled, updated_at
-         FROM business_connection WHERE connection_id = ?",
+    if load_telegram_reconciliation_state(uow).await?.state != GlobalReconciliationState::Ready {
+        return Ok(None);
+    }
+    let row = sqlx::query(
+        "SELECT connection_id, typeof(connection_id) AS connection_id_type,
+                owner_user_id, typeof(owner_user_id) AS owner_user_id_type,
+                rights_json, typeof(rights_json) AS rights_json_type,
+                enabled, typeof(enabled) AS enabled_type,
+                connection_established_at,
+                typeof(connection_established_at) AS connection_established_at_type,
+                state_revision, typeof(state_revision) AS state_revision_type,
+                reconciliation_state,
+                typeof(reconciliation_state) AS reconciliation_state_type,
+                updated_at, typeof(updated_at) AS updated_at_type
+         FROM business_connection
+         WHERE connection_id = ?
+           AND reconciliation_state = 'CONFIRMED'",
     )
     .bind(connection_id)
     .fetch_optional(uow.connection())
     .await?;
-    row.map(TryInto::try_into).transpose()
+    row.as_ref().map(decode_business_connection).transpose()
 }
 
 /// Loads the only configured Business connection for the single-account MVP.
@@ -811,9 +824,23 @@ pub async fn find_business_connection(
 pub async fn find_single_business_connection(
     uow: &mut UnitOfWork<'_>,
 ) -> Result<Option<BusinessConnectionRecord>, StorageError> {
-    let rows = sqlx::query_as::<_, BusinessConnectionRow>(
-        "SELECT connection_id, owner_user_id, rights_json, enabled, updated_at
-         FROM business_connection ORDER BY connection_id LIMIT 2",
+    if load_telegram_reconciliation_state(uow).await?.state != GlobalReconciliationState::Ready {
+        return Ok(None);
+    }
+    let rows = sqlx::query(
+        "SELECT connection_id, typeof(connection_id) AS connection_id_type,
+                owner_user_id, typeof(owner_user_id) AS owner_user_id_type,
+                rights_json, typeof(rights_json) AS rights_json_type,
+                enabled, typeof(enabled) AS enabled_type,
+                connection_established_at,
+                typeof(connection_established_at) AS connection_established_at_type,
+                state_revision, typeof(state_revision) AS state_revision_type,
+                reconciliation_state,
+                typeof(reconciliation_state) AS reconciliation_state_type,
+                updated_at, typeof(updated_at) AS updated_at_type
+         FROM business_connection
+         WHERE reconciliation_state = 'CONFIRMED'
+         ORDER BY connection_id LIMIT 2",
     )
     .fetch_all(uow.connection())
     .await?;
@@ -822,7 +849,66 @@ pub async fn find_single_business_connection(
             "single-account mode found multiple Business connections".to_owned(),
         ));
     }
-    rows.into_iter().next().map(TryInto::try_into).transpose()
+    rows.first().map(decode_business_connection).transpose()
+}
+
+/// Loads one trusted connection without applying the global/effect gate.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the row is corrupt or the query fails.
+pub async fn load_business_connection_for_reconciliation(
+    uow: &mut UnitOfWork<'_>,
+    connection_id: &str,
+) -> Result<Option<BusinessConnectionRecord>, StorageError> {
+    let row = sqlx::query(
+        "SELECT connection_id, typeof(connection_id) AS connection_id_type,
+                owner_user_id, typeof(owner_user_id) AS owner_user_id_type,
+                rights_json, typeof(rights_json) AS rights_json_type,
+                enabled, typeof(enabled) AS enabled_type,
+                connection_established_at,
+                typeof(connection_established_at) AS connection_established_at_type,
+                state_revision, typeof(state_revision) AS state_revision_type,
+                reconciliation_state,
+                typeof(reconciliation_state) AS reconciliation_state_type,
+                updated_at, typeof(updated_at) AS updated_at_type
+         FROM business_connection WHERE connection_id = ?",
+    )
+    .bind(connection_id)
+    .fetch_optional(uow.connection())
+    .await?;
+    row.as_ref().map(decode_business_connection).transpose()
+}
+
+/// Loads the at-most-one trusted connection without applying the effect gate.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] for multiple/corrupt rows or a query failure.
+pub async fn load_single_trusted_connection(
+    uow: &mut UnitOfWork<'_>,
+) -> Result<Option<BusinessConnectionRecord>, StorageError> {
+    let rows = sqlx::query(
+        "SELECT connection_id, typeof(connection_id) AS connection_id_type,
+                owner_user_id, typeof(owner_user_id) AS owner_user_id_type,
+                rights_json, typeof(rights_json) AS rights_json_type,
+                enabled, typeof(enabled) AS enabled_type,
+                connection_established_at,
+                typeof(connection_established_at) AS connection_established_at_type,
+                state_revision, typeof(state_revision) AS state_revision_type,
+                reconciliation_state,
+                typeof(reconciliation_state) AS reconciliation_state_type,
+                updated_at, typeof(updated_at) AS updated_at_type
+         FROM business_connection ORDER BY connection_id LIMIT 2",
+    )
+    .fetch_all(uow.connection())
+    .await?;
+    if rows.len() > 1 {
+        return Err(StorageError::InvalidData(
+            "single-account mode found multiple trusted Business connections".to_owned(),
+        ));
+    }
+    rows.first().map(decode_business_connection).transpose()
 }
 
 /// Disables Business-side effects until a fresh connection update restores it.
@@ -837,7 +923,8 @@ pub async fn disable_business_connection(
 ) -> Result<(), StorageError> {
     update_one(
         &sqlx::query(
-            "UPDATE business_connection SET enabled = 0, updated_at = ?
+            "UPDATE business_connection
+             SET enabled = 0, state_revision = state_revision + 1, updated_at = ?
              WHERE connection_id = ?",
         )
         .bind(now.to_rfc3339())
@@ -936,18 +1023,65 @@ impl TryFrom<ChallengeRow> for ChallengeRecord {
     }
 }
 
-impl TryFrom<BusinessConnectionRow> for BusinessConnectionRecord {
-    type Error = StorageError;
-
-    fn try_from(row: BusinessConnectionRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            connection_id: row.connection_id,
-            owner_user_id: row.owner_user_id,
-            rights_json: row.rights_json,
-            enabled: row.enabled,
-            updated_at: parse_timestamp(&row.updated_at)?,
-        })
+fn decode_business_connection(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<BusinessConnectionRecord, StorageError> {
+    let invalid_identity =
+        || StorageError::InvalidData("trusted Business connection identity is invalid".to_owned());
+    let invalid_state =
+        || StorageError::InvalidData("trusted Business connection state is invalid".to_owned());
+    if row.try_get::<String, _>("connection_id_type")? != "text"
+        || row.try_get::<String, _>("owner_user_id_type")? != "integer"
+    {
+        return Err(invalid_identity());
     }
+    let connection_id = row.try_get::<String, _>("connection_id")?;
+    let owner_user_id = row.try_get::<i64, _>("owner_user_id")?;
+    if connection_id.trim().is_empty() || owner_user_id <= 0 {
+        return Err(invalid_identity());
+    }
+    if row.try_get::<String, _>("rights_json_type")? != "text"
+        || row.try_get::<String, _>("enabled_type")? != "integer"
+        || row.try_get::<String, _>("state_revision_type")? != "integer"
+        || row.try_get::<String, _>("reconciliation_state_type")? != "text"
+        || row.try_get::<String, _>("updated_at_type")? != "text"
+    {
+        return Err(invalid_state());
+    }
+    let rights_json = row.try_get::<String, _>("rights_json")?;
+    let enabled = match row.try_get::<i64, _>("enabled")? {
+        0 => false,
+        1 => true,
+        _ => return Err(invalid_state()),
+    };
+    let connection_established_at = match row
+        .try_get::<String, _>("connection_established_at_type")?
+        .as_str()
+    {
+        "null" => None,
+        "integer" => Some(row.try_get::<i64, _>("connection_established_at")?),
+        _ => return Err(invalid_state()),
+    };
+    let state_revision = row.try_get::<i64, _>("state_revision")?;
+    if connection_established_at.is_some_and(|established_at| established_at <= 0)
+        || state_revision < 0
+        || serde_json::from_str::<serde_json::Value>(&rights_json).is_err()
+    {
+        return Err(invalid_state());
+    }
+    let reconciliation_state =
+        ReconciliationState::parse(&row.try_get::<String, _>("reconciliation_state")?)?;
+    let updated_at = parse_timestamp(&row.try_get::<String, _>("updated_at")?)?;
+    Ok(BusinessConnectionRecord {
+        connection_id,
+        owner_user_id,
+        rights_json,
+        enabled,
+        connection_established_at,
+        state_revision,
+        reconciliation_state,
+        updated_at,
+    })
 }
 
 impl TryFrom<OutboxActionRow> for OutboxActionRecord {

@@ -484,13 +484,14 @@ async fn already_applied_delete_succeeds_but_missing_right_disables_connection()
         dispatcher.dispatch_next(now, &pool).await.unwrap(),
         DispatchOutcome::PermanentFailure { .. }
     ));
-    let enabled: bool = sqlx::query_scalar(
-        "SELECT enabled FROM business_connection WHERE connection_id = 'business-1'",
+    let connection_state: (bool, i64, String) = sqlx::query_as(
+        "SELECT enabled, state_revision, reconciliation_state
+         FROM business_connection WHERE connection_id = 'business-1'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(!enabled);
+    assert_eq!(connection_state, (false, 1, "CONFIRMED".to_owned()));
     let destructive_mode: String =
         sqlx::query_scalar("SELECT value FROM runtime_setting WHERE key = 'destructive_mode'")
             .fetch_one(&pool)
