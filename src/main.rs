@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use chathygiene::app::build_runtime_router;
+use chathygiene::app::serve_runtime;
 use chathygiene::config::Settings;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -14,12 +14,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let settings = Arc::new(Settings::from_env()?);
-    let app = build_runtime_router(settings).await?;
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    serve_runtime(settings, listener, shutdown_signal()).await?;
     Ok(())
 }
 

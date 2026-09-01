@@ -8,7 +8,7 @@ use secrecy::{ExposeSecret, SecretSlice};
 use sqlx::SqlitePool;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::clock::Clock;
@@ -20,6 +20,7 @@ use crate::owner::{
     parse_owner_command,
 };
 use crate::retention::RetentionService;
+use crate::runtime_workers::WorkerTask;
 use crate::storage::{
     BusinessConnectionCandidate, CandidateGuard, CandidateWrite, ConnectionReconciliationSnapshot,
     ConversationKey, GlobalReconciliationState, NewAuditEvent, NewOutboxAction, OutboxActionKind,
@@ -173,6 +174,34 @@ struct WorkItem {
 #[derive(Clone)]
 pub struct ProcessingHandle {
     sender: mpsc::Sender<WorkItem>,
+}
+
+#[must_use = "the processing worker must remain owned until it is shut down"]
+pub struct ProcessingWorker {
+    handle: ProcessingHandle,
+    task: Option<WorkerTask>,
+}
+
+impl ProcessingWorker {
+    #[must_use]
+    pub fn handle(&self) -> ProcessingHandle {
+        self.handle.clone()
+    }
+
+    pub async fn shutdown(mut self) {
+        if let Some(task) = self.task.take()
+            && task.stop_and_wait().await.is_err()
+        {
+            tracing::warn!(
+                error_kind = "worker_shutdown",
+                "processing worker shutdown failed"
+            );
+        }
+    }
+
+    pub(crate) fn into_task(mut self) -> WorkerTask {
+        self.task.take().expect("processing worker task is owned")
+    }
 }
 
 impl<D, V, C> ProcessingEngine<D, V, C>
@@ -1628,18 +1657,18 @@ async fn first_contact_notice(
 }
 
 /// Starts the single bounded lifecycle worker used by the MVP.
-#[must_use]
 pub fn spawn_processing_worker<D, V, C>(
     mut engine: ProcessingEngine<D, V, C>,
     capacity: usize,
-) -> ProcessingHandle
+) -> ProcessingWorker
 where
     D: SpamDetector + 'static,
     V: ChallengeVerifier + 'static,
     C: Clock + 'static,
 {
     let (sender, mut receiver) = mpsc::channel::<WorkItem>(capacity.max(1));
-    tokio::spawn(async move {
+    let (stop, mut stopped) = watch::channel(false);
+    let task = tokio::spawn(async move {
         let mut connection_retry_tick = interval(Duration::from_millis(250));
         connection_retry_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut expiry_tick = interval(Duration::from_secs(15));
@@ -1649,6 +1678,12 @@ where
 
         loop {
             tokio::select! {
+                biased;
+                result = stopped.changed() => {
+                    if result.is_err() || *stopped.borrow() {
+                        break;
+                    }
+                }
                 item = receiver.recv() => {
                     let Some(item) = item else {
                         break;
@@ -1678,7 +1713,10 @@ where
             }
         }
     });
-    ProcessingHandle { sender }
+    ProcessingWorker {
+        handle: ProcessingHandle { sender },
+        task: Some(WorkerTask::new(stop, task)),
+    }
 }
 
 impl WebhookInbox for ProcessingHandle {

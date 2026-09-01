@@ -17,7 +17,9 @@ pub use connection_state::{
     lookup_authenticated_bot_with_delay, lookup_business_connection,
     lookup_business_connection_with_delay,
 };
-pub use contact_notifier::{NewContactNotifierHandle, spawn_new_contact_notifier};
+pub use contact_notifier::{
+    NewContactNotifierHandle, NewContactNotifierWorker, spawn_new_contact_notifier,
+};
 pub use models::{
     BusinessConnectionSnapshot, BusinessRights, OwnerCommandSnapshot, OwnerReplySnapshot,
     ParsedUpdate, RawBusinessEvent, RawEventKind,

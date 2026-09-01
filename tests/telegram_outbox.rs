@@ -4,7 +4,9 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
 
+use chathygiene::events::spawn_outbox_worker;
 use chathygiene::processing::ProcessingEngine;
 use chathygiene::storage::{
     OwnerChatSource, UnitOfWork, initialize_or_load_owner_identity, promote_owner_chat,
@@ -97,6 +99,53 @@ impl BusinessApi for FakeApi {
             result
         })
     }
+}
+
+#[tokio::test]
+async fn stopped_outbox_worker_cannot_mutate_new_due_rows() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    let api = FakeApi::default();
+    let worker = spawn_outbox_worker(
+        OutboxDispatcher::new(api.clone()),
+        pool.clone(),
+        StdDuration::from_millis(1),
+    );
+    worker.shutdown().await;
+
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES (799, 'ignored', '{}', 'APPLIED', ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox_action
+         (source_update_id, action_type, payload_json, idempotency_key, status,
+          attempts, created_at, updated_at)
+         VALUES (799, 'SEND_PRIVATE_MESSAGE',
+          '{\"chat_id\":4200,\"message_kind\":\"OWNER_CLAIM_REJECTED\"}',
+          '799:STOPPED', 'PENDING', 0, ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    tokio::time::sleep(StdDuration::from_millis(15)).await;
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM outbox_action WHERE source_update_id = 799")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "PENDING");
+    assert!(api.calls.lock().unwrap().is_empty());
 }
 
 async fn start_challenge(pool: &sqlx::SqlitePool, now: DateTime<Utc>) {

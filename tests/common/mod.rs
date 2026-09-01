@@ -20,7 +20,7 @@ use chathygiene::detection::{
     SpamDetector,
 };
 use chathygiene::owner::OwnerIdentityHandle;
-use chathygiene::processing::{ProcessingEngine, spawn_processing_worker};
+use chathygiene::processing::{ProcessingEngine, ProcessingWorker, spawn_processing_worker};
 use chathygiene::storage::{
     UnitOfWork, claim_owner, connect, initialize_or_load_owner_identity, migrate,
 };
@@ -251,6 +251,7 @@ pub struct E2eHarness {
     pub telegram: TelegramStub,
     authoritative_api: TestBusinessConnectionApi,
     dispatcher: OutboxDispatcher<TelegramClient>,
+    _processing_worker: ProcessingWorker,
 }
 
 impl E2eHarness {
@@ -284,7 +285,8 @@ impl E2eHarness {
             destructive_mode,
         )
         .with_business_connection_api(authoritative_api.clone());
-        let inbox = Arc::new(spawn_processing_worker(engine, 128));
+        let processing_worker = spawn_processing_worker(engine, 128);
+        let inbox = Arc::new(processing_worker.handle());
         let router = build_router_with_inbox(
             SecretString::from("e2e-webhook-secret".to_owned()),
             OwnerIdentityHandle::new(claimed_owner),
@@ -299,6 +301,7 @@ impl E2eHarness {
             telegram,
             authoritative_api,
             dispatcher,
+            _processing_worker: processing_worker,
         }
     }
 

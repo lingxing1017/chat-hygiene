@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use chathygiene::app::{build_router, build_runtime_router};
+use chathygiene::app::{build_router, serve_runtime};
 use chathygiene::config::Settings;
 use chathygiene::events::{PreparedEvent, record_prepared_event};
 use chathygiene::storage::{connect, migrate};
@@ -12,6 +12,11 @@ use chrono::Utc;
 use secrecy::SecretString;
 use serde_json::json;
 use tower::ServiceExt;
+
+async fn start_and_stop(settings: Arc<Settings>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    serve_runtime(settings, listener, async {}).await.unwrap();
+}
 
 #[tokio::test]
 async fn liveness_exposes_no_config() {
@@ -74,18 +79,7 @@ async fn runtime_recovers_recorded_events_before_readiness() {
         destructive_mode: false,
     });
 
-    let router = build_runtime_router(settings).await.unwrap();
-    let response = router
-        .oneshot(
-            Request::builder()
-                .uri("/health/ready")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
+    start_and_stop(settings).await;
     let pool = connect(&database_url).await.unwrap();
     let recovered: (String, String) = sqlx::query_as(
         "SELECT p.status, b.connection_id
@@ -127,7 +121,7 @@ async fn runtime_leaves_a_fresh_database_unclaimed_despite_legacy_setting() {
         destructive_mode: false,
     });
 
-    let _router = build_runtime_router(settings).await.unwrap();
+    start_and_stop(settings).await;
 
     let pool = connect(&database_url).await.unwrap();
     let owner: (String, Option<i64>, Option<i64>) = sqlx::query_as(

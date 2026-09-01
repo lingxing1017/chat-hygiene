@@ -1,4 +1,5 @@
 use crate::processing::{NewContactNotice, NewContactNotifier, NewContactNotifyError};
+use crate::runtime_workers::WorkerTask;
 
 use super::client::{BusinessApi, SendAction};
 
@@ -18,27 +19,71 @@ impl NewContactNotifier for NewContactNotifierHandle {
     }
 }
 
-#[must_use]
-pub fn spawn_new_contact_notifier<C>(client: C, capacity: usize) -> NewContactNotifierHandle
+#[must_use = "the notifier worker must remain owned until it is shut down"]
+pub struct NewContactNotifierWorker {
+    handle: NewContactNotifierHandle,
+    task: Option<WorkerTask>,
+}
+
+impl NewContactNotifierWorker {
+    #[must_use]
+    pub fn handle(&self) -> NewContactNotifierHandle {
+        self.handle.clone()
+    }
+
+    pub async fn shutdown(mut self) {
+        if let Some(task) = self.task.take()
+            && task.stop_and_wait().await.is_err()
+        {
+            tracing::warn!(
+                error_kind = "worker_shutdown",
+                "new-contact notifier shutdown failed"
+            );
+        }
+    }
+
+    pub(crate) fn into_task(mut self) -> WorkerTask {
+        self.task.take().expect("notifier worker task is owned")
+    }
+}
+
+pub fn spawn_new_contact_notifier<C>(client: C, capacity: usize) -> NewContactNotifierWorker
 where
     C: BusinessApi + 'static,
 {
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<NewContactNotice>(capacity.max(1));
-    tokio::spawn(async move {
-        while let Some(notice) = receiver.recv().await {
-            let owner_user_id = notice.owner_user_id;
-            let contact_chat_id = notice.contact_chat_id;
-            let action = new_contact_action(&notice);
-            if client.send_business_message(&action).await.is_err() {
-                tracing::warn!(
-                    owner_user_id,
-                    contact_chat_id,
-                    "new-contact notification delivery failed"
-                );
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                result = stopped.changed() => {
+                    if result.is_err() || *stopped.borrow() {
+                        break;
+                    }
+                }
+                notice = receiver.recv() => {
+                    let Some(notice) = notice else {
+                        break;
+                    };
+                    let owner_user_id = notice.owner_user_id;
+                    let contact_chat_id = notice.contact_chat_id;
+                    let action = new_contact_action(&notice);
+                    if client.send_business_message(&action).await.is_err() {
+                        tracing::warn!(
+                            owner_user_id,
+                            contact_chat_id,
+                            "new-contact notification delivery failed"
+                        );
+                    }
+                }
             }
         }
     });
-    NewContactNotifierHandle { sender }
+    NewContactNotifierWorker {
+        handle: NewContactNotifierHandle { sender },
+        task: Some(WorkerTask::new(stop, task)),
+    }
 }
 
 fn new_contact_action(notice: &NewContactNotice) -> SendAction {
@@ -65,9 +110,91 @@ fn new_contact_text(notice: &NewContactNotice) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::processing::NewContactNotice;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{new_contact_action, new_contact_text};
+    use crate::processing::{NewContactNotice, NewContactNotifier, NewContactNotifyError};
+
+    use super::super::client::{
+        BusinessApi, DeleteAction, EditAction, ReadAction, SendAction, SentMessage, TelegramError,
+    };
+    use super::{new_contact_action, new_contact_text, spawn_new_contact_notifier};
+
+    #[derive(Clone, Default)]
+    struct RecordingClient {
+        sends: Arc<AtomicUsize>,
+    }
+
+    impl BusinessApi for RecordingClient {
+        fn send_business_message<'a>(
+            &'a self,
+            _action: &'a SendAction,
+        ) -> Pin<Box<dyn Future<Output = Result<SentMessage, TelegramError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                Ok(SentMessage { message_id: 1 })
+            })
+        }
+
+        fn edit_business_message<'a>(
+            &'a self,
+            _action: &'a EditAction,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TelegramError>> + Send + 'a>> {
+            Box::pin(async { unreachable!("notifier never edits") })
+        }
+
+        fn read_business_message<'a>(
+            &'a self,
+            _action: &'a ReadAction,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TelegramError>> + Send + 'a>> {
+            Box::pin(async { unreachable!("notifier never reads") })
+        }
+
+        fn delete_business_messages<'a>(
+            &'a self,
+            _action: &'a DeleteAction,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TelegramError>> + Send + 'a>> {
+            Box::pin(async { unreachable!("notifier never deletes") })
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_notifier_delivers_then_closes_on_shutdown() {
+        let client = RecordingClient::default();
+        let worker = spawn_new_contact_notifier(client.clone(), 1);
+        let handle = worker.handle();
+        handle
+            .try_notify(NewContactNotice {
+                owner_user_id: 42,
+                owner_chat_id: 4200,
+                contact_chat_id: 1001,
+                username: None,
+            })
+            .unwrap();
+        for _ in 0..20 {
+            if client.sends.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(client.sends.load(Ordering::SeqCst), 1);
+
+        worker.shutdown().await;
+
+        assert_eq!(
+            handle
+                .try_notify(NewContactNotice {
+                    owner_user_id: 42,
+                    owner_chat_id: 4200,
+                    contact_chat_id: 1002,
+                    username: None,
+                })
+                .unwrap_err(),
+            NewContactNotifyError::WorkerStopped
+        );
+    }
 
     #[test]
     fn routes_notification_to_owner_chat_without_business_connection() {

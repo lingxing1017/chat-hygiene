@@ -388,7 +388,8 @@ async fn concurrent_valid_claims_bind_exactly_one_owner() {
         QueueBusinessApi::new(Vec::new()),
         owner.clone(),
     );
-    let handle = spawn_processing_worker(engine, 8);
+    let worker = spawn_processing_worker(engine, 8);
+    let handle = worker.handle();
     let first = parsed_claim_for(&owner, 50, 100, 500, EXPECTED_HEX).await;
     let second = parsed_claim_for(&owner, 51, 200, 600, EXPECTED_HEX).await;
     let (first_result, second_result) =
@@ -409,6 +410,7 @@ async fn concurrent_valid_claims_bind_exactly_one_owner() {
             ..
         }
     ));
+    worker.shutdown().await;
     let successes: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM outbox_action
          WHERE payload_json LIKE '%claim succeeded%'",

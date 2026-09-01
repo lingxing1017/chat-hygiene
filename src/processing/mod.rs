@@ -12,5 +12,5 @@ pub use notifications::{
 pub use preparer::EventPreparer;
 pub use service::{
     ClaimSetupCapability, FatalRuntimeEvent, FatalRuntimeNotifier, NoopFatalRuntimeNotifier,
-    ProcessingEngine, ProcessingError, ProcessingHandle, spawn_processing_worker,
+    ProcessingEngine, ProcessingError, ProcessingHandle, ProcessingWorker, spawn_processing_worker,
 };

@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use axum::Json;
@@ -7,6 +8,7 @@ use chrono::Utc;
 use secrecy::{ExposeSecret, SecretSlice};
 use serde::Serialize;
 use thiserror::Error;
+use tokio::net::TcpListener;
 
 use crate::clock::SystemClock;
 use crate::config::Settings;
@@ -16,6 +18,7 @@ use crate::owner::OwnerIdentityHandle;
 use crate::processing::{
     LifecycleHandler, ProcessingEngine, ProcessingError, spawn_processing_worker,
 };
+use crate::runtime_workers::{RuntimeExitError, WorkerGroup, run_server_with_workers};
 use crate::storage::{StorageError, connect, initialize_or_load_owner_identity, migrate};
 use crate::telegram::{
     OutboxDispatcher, TelegramClient, WebhookInbox, spawn_new_contact_notifier, webhook_router,
@@ -37,6 +40,12 @@ pub enum AppError {
     Event(#[from] EventError),
     #[error(transparent)]
     Processing(#[from] ProcessingError),
+    #[error("HTTP server failed")]
+    Server(#[source] std::io::Error),
+    #[error("runtime worker shutdown failed")]
+    WorkerShutdown,
+    #[error("HTTP server failed and runtime worker shutdown also failed")]
+    ServerAndWorker(#[source] std::io::Error),
 }
 
 pub fn build_router() -> Router {
@@ -53,12 +62,35 @@ pub fn build_router_with_inbox<I: WebhookInbox + 'static>(
         .merge(webhook_router(webhook_secret, owner_identity, inbox))
 }
 
-/// Builds the production router and starts its two single-worker pipelines.
+/// Serves the runtime while retaining and cleaning up every worker task.
 ///
 /// # Errors
 ///
-/// Returns [`AppError`] when storage or the embedded rules cannot initialize.
-pub async fn build_runtime_router(settings: Arc<Settings>) -> Result<Router, AppError> {
+/// Returns [`AppError`] when startup, serving, or bounded worker cleanup fails.
+pub async fn serve_runtime<F>(
+    settings: Arc<Settings>,
+    listener: TcpListener,
+    shutdown: F,
+) -> Result<(), AppError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (app, workers) = prepare_runtime(settings).await?;
+    let server = async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
+    };
+    run_server_with_workers(server, workers)
+        .await
+        .map_err(|error| match error {
+            RuntimeExitError::Server(error) => AppError::Server(error),
+            RuntimeExitError::WorkerShutdown => AppError::WorkerShutdown,
+            RuntimeExitError::ServerAndWorker(error) => AppError::ServerAndWorker(error),
+        })
+}
+
+async fn prepare_runtime(settings: Arc<Settings>) -> Result<(Router, WorkerGroup), AppError> {
     let pool = connect(&settings.database_url).await?;
     migrate(&pool).await?;
     recover_recorded_events(&pool, &LifecycleHandler).await?;
@@ -76,7 +108,6 @@ pub async fn build_runtime_router(settings: Arc<Settings>) -> Result<Router, App
         0,
     );
     let telegram = TelegramClient::new(settings.bot_token.clone());
-    let notifier = spawn_new_contact_notifier(telegram.clone(), 32);
     let mut engine = ProcessingEngine::new(
         pool.clone(),
         detector,
@@ -85,19 +116,25 @@ pub async fn build_runtime_router(settings: Arc<Settings>) -> Result<Router, App
         settings.destructive_mode,
     )
     .with_business_connection_api(telegram.clone())
-    .with_owner_claim(None, owner_identity.clone())
-    .with_new_contact_notifier(notifier);
+    .with_owner_claim(None, owner_identity.clone());
     engine.recover_recorded_connection_triggers().await?;
-    let inbox = Arc::new(spawn_processing_worker(engine, 128));
-    std::mem::drop(spawn_outbox_worker(
+    let notifier = spawn_new_contact_notifier(telegram.clone(), 32);
+    engine = engine.with_new_contact_notifier(notifier.handle());
+    let processing = spawn_processing_worker(engine, 128);
+    let inbox = Arc::new(processing.handle());
+    let outbox = spawn_outbox_worker(
         OutboxDispatcher::new(telegram),
         pool,
         std::time::Duration::from_millis(250),
-    ));
-    Ok(
-        build_router_with_inbox(settings.webhook_secret.clone(), owner_identity, inbox)
-            .route("/health/ready", get(readiness)),
-    )
+    );
+    let app = build_router_with_inbox(settings.webhook_secret.clone(), owner_identity, inbox)
+        .route("/health/ready", get(readiness));
+    let workers = WorkerGroup::new(vec![
+        notifier.into_task(),
+        processing.into_task(),
+        outbox.into_task(),
+    ]);
+    Ok((app, workers))
 }
 
 async fn liveness() -> Json<HealthResponse> {

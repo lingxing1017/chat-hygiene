@@ -5,6 +5,7 @@ use std::time::Duration;
 use chrono::Utc;
 use sqlx::SqlitePool;
 
+use crate::runtime_workers::WorkerTask;
 use crate::storage::{StorageError, UnitOfWork};
 use crate::telegram::{BusinessApi, DispatchOutcome, OutboxDispatcher};
 
@@ -128,18 +129,51 @@ fn is_authoritative_connection_trigger(
         == Some("IGNORE"))
 }
 
+#[must_use = "the outbox worker must remain owned until it is shut down"]
+pub struct OutboxWorker {
+    task: Option<WorkerTask>,
+}
+
+impl OutboxWorker {
+    pub async fn shutdown(mut self) {
+        if let Some(task) = self.task.take()
+            && task.stop_and_wait().await.is_err()
+        {
+            tracing::warn!(
+                error_kind = "worker_shutdown",
+                "outbox worker shutdown failed"
+            );
+        }
+    }
+
+    pub(crate) fn into_task(mut self) -> WorkerTask {
+        self.task.take().expect("outbox worker task is owned")
+    }
+}
+
 /// Starts the single polling worker that drains due Telegram outbox actions.
-#[must_use]
 pub fn spawn_outbox_worker<C: BusinessApi + 'static>(
     dispatcher: OutboxDispatcher<C>,
     pool: SqlitePool,
     poll_interval: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> OutboxWorker {
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(poll_interval);
-        loop {
-            ticker.tick().await;
+        'worker: loop {
+            tokio::select! {
+                biased;
+                result = stopped.changed() => {
+                    if result.is_err() || *stopped.borrow() {
+                        break;
+                    }
+                }
+                _ = ticker.tick() => {}
+            }
             loop {
+                if *stopped.borrow() {
+                    break 'worker;
+                }
                 match dispatcher.dispatch_next(Utc::now(), &pool).await {
                     Ok(DispatchOutcome::Idle) => break,
                     Ok(_) => {}
@@ -154,5 +188,8 @@ pub fn spawn_outbox_worker<C: BusinessApi + 'static>(
                 }
             }
         }
-    })
+    });
+    OutboxWorker {
+        task: Some(WorkerTask::new(stop, task)),
+    }
 }

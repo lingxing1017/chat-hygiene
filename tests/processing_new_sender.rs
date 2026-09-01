@@ -67,7 +67,8 @@ async fn bounded_worker_serializes_fast_messages() {
         common::TestClock::new(now),
         false,
     );
-    let handle = spawn_processing_worker(engine, 8);
+    let worker = spawn_processing_worker(engine, 8);
+    let handle = worker.handle();
 
     let first = handle.submit(10, common::inbound(2001, 100, Some("first"), now));
     let second = handle.submit(11, common::inbound(2001, 101, Some("second"), now));
@@ -81,6 +82,7 @@ async fn bounded_worker_serializes_fast_messages() {
             .await
             .unwrap();
     assert_eq!(challenge_count, 1);
+    worker.shutdown().await;
 }
 
 #[tokio::test]
