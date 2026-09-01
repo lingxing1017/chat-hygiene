@@ -176,6 +176,7 @@ dependencies = [
  "axum",
  "chrono",
  "hex",
+ "hkdf",
  "hmac",
  "idna",
  "rand 0.9.4",

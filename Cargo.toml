@@ -10,6 +10,7 @@ publish = false
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+hkdf = "0.12"
 hmac = "0.12"
 idna = "1"
 rand = "0.9"
