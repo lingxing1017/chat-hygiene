@@ -1,563 +1,412 @@
 # ChatHygiene
 
-**中文 | [English](README_en.md)**
+中文 | [English](README_en.md)
 
 ## 介绍
 
-ChatHygiene 是一个可自行托管的 Rust 服务，通过已连接的 Business 机器人，在账号所有者回复前验证 Telegram Business 私信的新发件人，并在启用后删除高置信度垃圾消息。由于 Telegram 会先送达消息、再将更新发送给机器人，消息可能会在 ChatHygiene 处理或删除前短暂出现在通知或聊天列表中。
+ChatHygiene 是一个自托管 Rust 服务。它通过已连接的 Telegram Business
+机器人验证陌生私信发件人，并在明确启用后删除高置信度垃圾消息。每个部署只服务
+一个 Telegram 账号；普通消息正文不会被有意写入数据库，显式标注的训练样本除外。
 
-首个版本有意将每个部署限制为仅服务一个已配置的 Telegram 账号。它会忽略属于其他账号的 Business 连接，并确认收到未知连接的更新，但不会创建对话状态或保留消息正文。
-
-[介绍](#介绍) · [功能](#功能) · [预览](#预览) · [快速开始](#快速开始) · [要求](#要求) · [安装](#安装) · [使用](#使用) · [配置](#配置) · [项目结构](#项目结构) · [开发](#开发) · [测试](#测试) · [构建与部署](#构建与部署) · [文档](#文档) · [故障排查](#故障排查) · [贡献](#贡献) · [许可证](#许可证)
+Telegram 会先把消息交给用户，再把更新发送给机器人，因此通知或聊天列表可能在
+ChatHygiene 处理前短暂显示消息。检测、权限或 Telegram 调用失败时，服务默认保留
+消息。
 
 ## 功能
 
-- **陌生联系人验证：** 第一条安全私信会触发一道两分钟有效的算术题，答对后消息仍保持可见，等待账号所有者决定是否回复。
-- **本地垃圾检测：** 确定性规则会检查文本、说明文字与 Telegram 实体，不下载附件、不调用外部信誉服务或 LLM。
-- **明确的删除阈值：** 只有分数为 `100` 的 `SPAM` 结果才可能触发清理；`SUSPICIOUS` 消息始终保留给所有者查看。
-- **默认试运行：** 首次部署默认不执行自动标记已读、删除或软屏蔽，并向可信所有者发送不含消息正文的 dry-run 追踪。
-- **所有者回复即信任：** 所有者手动回复后，对话进入 `ACTIVE`，ChatHygiene 不再检查该对话，直到旧回复全部删除或显式执行 `/reset`。
-- **开放放行与持久恢复：** 检测、权限或 Telegram 调用失败时保留消息；SQLite 会恢复已记录事件和待处理发件箱操作。
-- **单账号、自托管：** 每个部署只服务一个 Telegram 账号，普通消息正文不会被有意持久化，显式标注样本除外。
-
-## 预览
-
-典型流程如下：
-
-```text
-陌生私信 -> 本地垃圾检测 -> 安全消息发起算术验证
-                         -> 高置信度垃圾消息进入清理候选
-所有者手动回复 -> ACTIVE，不再检测该对话
-```
-
-首次验收保持 dry-run。所有者先在普通机器人私聊中确认状态：
-
-```text
-/health
-status=ok connection=enabled dry_run=on
-```
-
-高置信度垃圾测试会产生类似下面的追踪节选；真实追踪还包含更新、联系人、消息、事件、状态和规则元数据。`SKIPPED_DRY_RUN` 表示删除和软屏蔽没有执行，测试消息仍然可见。
-
-```text
-[DRY-RUN 追踪]
-检测：
-- 判定：SPAM
-- 分数：100
-验证：
-- 结果：NOT_EVALUATED_SPAM_FIRST
-操作：
-- RECORD_MESSAGE：APPLIED
-- DELETE_MESSAGE：SKIPPED_DRY_RUN
-- SPAM_BLOCK：SKIPPED_DRY_RUN
-```
-
-## 快速开始
-
-下面的最短路径以“约 10 分钟启动本地服务并通过 `/health/ready`”为目标，适用于使用**全新 SQLite 数据库**的部署。它假设[要求](#要求)已经满足，只使用 GitHub Release 的预编译镜像归档，不拉取镜像，也不在 VPS 上编译源码。这个时间目标不包括 Telegram webhook、Business 连接与权限验收；这些仍须继续完成[安装](#安装)中的步骤。
-
-1. 从[最新 Release](https://github.com/lingxing1017/chat-hygiene/releases/latest)下载与 VPS 架构匹配的 Docker 镜像归档，同时取得该 Release 对应源码版本中的 `compose.yml` 和 `.env.example`。将三者放入同一部署目录。
-2. 使用新的部署目录，在其中创建配置和全新数据目录。这里故意使用 `mkdir data` 而不是 `mkdir -p data`：如果 `data/` 已存在，命令会失败；不要删除它，先按[安装](#安装)中的数据策略确认应迁移还是全新初始化。
-
-   ```bash
-   cp .env.example .env
-   chmod 600 .env
-   mkdir data
-   ```
-
-3. 按[配置](#配置)填写四个必填值，并保持 `CHATHYGIENE_DESTRUCTIVE_MODE=false`。
-4. 确认架构，导入匹配的镜像归档并启动：
-
-   ```bash
-   uname -m
-   docker load -i chathygiene-amd64-YYYY.MM.DD.tar
-   docker compose up -d
-   docker compose ps
-   ```
-
-   `x86_64` 使用 `amd64` 归档；`aarch64`/ARM 使用 `arm64` 归档和对应文件名。
-
-5. 验证本机服务：
-
-   ```bash
-   set -a
-   source .env
-   set +a
-   host_port="${CHATHYGIENE_PORT:-8080}"
-
-   curl --fail "http://127.0.0.1:${host_port}/health/live"
-   curl --fail "http://127.0.0.1:${host_port}/health/ready"
-   docker compose logs --since=10m chathygiene
-   ```
-
-`/health/ready` 成功只证明进程、配置、数据库迁移和本地恢复已完成，不证明公开 HTTPS、Telegram webhook、Business 连接或权限可用。不要在完成 dry-run 验收前执行 `/dry_run off`。
-
-## 要求
-
-- Linux VPS，CPU 架构为 `x86_64`/`amd64` 或 `aarch64`/`arm64`；
-- Docker Engine 与 Docker Compose v2 插件；
-- `curl` 与 `openssl`；迁移或高级排障时建议安装 `sha256sum` 和 `sqlite3`；
-- 可从公网访问的 HTTPS 地址，以及负责 TLS 终止的反向代理、隧道或入口网关；
-- 由 BotFather 创建并启用 Business 或 Secretary 支持的 Telegram 机器人；
-- 机器人令牌、账号所有者的 Telegram 数字用户 ID，以及两个独立生成的 32-byte 十六进制密钥；
-- 首次验收所需的账号所有者普通机器人私聊和一个符合 Business 机器人范围的非联系人测试账号。
+- 陌生联系人收到一道人机算术题；所有者手动回复后，该对话进入 `ACTIVE`。
+- 本地确定性规则检查文本、说明和 Telegram 实体，不下载附件，不调用 LLM。
+- 只有分数为 `100` 的 `SPAM` 才可能触发删除；`SUSPICIOUS` 始终保留。
+- 首次启动默认 dry-run，不自动标记已读、删除或软屏蔽。
+- SQLite 恢复已记录事件、挑战、连接协调状态和发件箱操作。
+- 安装主种子、Owner 身份、bot ID pin、候选连接与可信连接均由数据库管理。
+- 应用每次启动都会自动协调 Telegram webhook，不要求运维人员生成应用密钥。
 
 ## 工作原理
 
-账号所有者的手动回复是信任边界，不存在永久白名单。
-
-```mermaid
-stateDiagram-v2
-    [*] --> NEW
-    NEW --> VERIFY_PENDING: 收到安全消息
-    VERIFY_PENDING --> VERIFIED_WAITING_OWNER: 回答正确
-    VERIFY_PENDING --> NEW: 验证过期
-    VERIFY_PENDING --> TEMP_SOFT_BLOCKED: 第三次数字回答错误
-    TEMP_SOFT_BLOCKED --> NEW: 24 小时后过期
-    NEW --> SPAM_SOFT_BLOCKED: 高置信度垃圾消息
-    VERIFY_PENDING --> SPAM_SOFT_BLOCKED: 高置信度垃圾消息
-    VERIFIED_WAITING_OWNER --> SPAM_SOFT_BLOCKED: 高置信度垃圾消息
-    NEW --> ACTIVE: 所有者手动回复
-    VERIFY_PENDING --> ACTIVE: 所有者手动回复
-    VERIFIED_WAITING_OWNER --> ACTIVE: 所有者手动回复
-    TEMP_SOFT_BLOCKED --> ACTIVE: 所有者发送消息
-    SPAM_SOFT_BLOCKED --> ACTIVE: 所有者发送消息
-    ACTIVE --> NEW: 所有已观察到的所有者回复均被删除
+```text
+陌生私信 -> 本地检测 -> 安全消息发起算术验证
+                    -> 高置信度垃圾消息进入清理候选
+所有者手动回复 -> ACTIVE，不再检测该对话
 ```
 
-当对话处于 `NEW`、`VERIFY_PENDING` 或 `VERIFIED_WAITING_OWNER` 状态时，每条收到的消息及其编辑都会接受垃圾检测。无论验证是否成功，普通消息都会保留可见。只有高置信度的垃圾检测结果才会触发清理。
+算术题有效期为两分钟，允许三次数字答案；非数字消息不消耗次数。答案正确后对话
+进入 `VERIFIED_WAITING_OWNER`。所有者回复后进入 `ACTIVE`，直到已观察到的所有者
+回复都被删除，或所有者执行 `/reset <chat_id>`。
 
-`ACTIVE` 状态有意采用严格规则：ChatHygiene 不会在该对话中执行垃圾检测、验证、入站消息台账记录或清理。它只记录所有者手动回复的消息 ID 和 Telegram 删除更新。当 Telegram 报告所有已观察到的所有者手动回复均被删除后，对话会重新变为 `NEW`。如果清空或删除对话没有产生完整的删除更新，所有者可使用 `/reset <chat_id>` 明确开始新的 `NEW` 周期。
-
-### 验证
-
-第一条安全消息会在当前对话中发起一道算术验证题：
-
-- 三个操作数和两个运算符，运算符从 `+`、`-` 和 `×` 中选择；
-- 每个中间结果和最终答案都在 0 到 99 之间；
-- 有效期为两分钟；
-- 允许三次数字答案尝试；
-- 非数字消息不会消耗尝试次数；以及
-- 只发送一条机器人提示，并通过编辑该提示来显示答案错误、验证成功、已过期或次数耗尽，而不是重复发送提示。
-
-回答正确会使对话进入 `VERIFIED_WAITING_OWNER`，在所有者回复前仍会继续检测消息。验证过期会使对话回到 `NEW`。开启破坏性模式时，连续三次数字答案错误会触发 24 小时的本地软屏蔽。已有消息仍保持可见；之后收到的消息会被标记为已读并删除。在试运行模式下，同一事件会记录为待执行建议，对话则回到 `NEW`。
-
-### 垃圾检测
-
-内置检测器完全在本地运行且结果确定。它会规范化 Unicode 和链接，然后根据文本、说明文字和 Telegram 实体中的以下信号进行评分：
-
-- Telegram 邀请链接和多个不同链接；
-- 推广、投资、任务、返利和空投用语；
-- 钱包地址或付款目标；
-- 与招揽用语同时出现的联系方式；
-- 零宽字符、拆分单词或混合文字体系等规避方式；以及
-- 过多的提及或表情符号。
-
-判定边界如下：
+判定边界：
 
 | 分数 | 判定 | 行为 |
 | --- | --- | --- |
-| 0-49 | `ALLOW` | 保留消息并继续当前生命周期。 |
-| 50-99 | `SUSPICIOUS` | 保留消息，供所有者检查。 |
-| 100 | `SPAM` | 记录证据，并在启用时执行清理和软屏蔽。 |
+| 0–49 | `ALLOW` | 保留消息并继续生命周期。 |
+| 50–99 | `SUSPICIOUS` | 保留消息供所有者检查。 |
+| 100 | `SPAM` | 记录证据；仅在 dry-run 关闭时执行清理。 |
 
-系统不会检查图片、视频、语音、贴纸和文档的内容。它会检查这些媒体的文字说明，但不带文字的媒体视为中性。MVP 不包含 OCR、文件下载、外部信誉查询或 LLM 调用。检测器出错或 Telegram 权限不足时采用开放放行策略：消息会被保留。检测器故障和 Telegram 返回的权限错误也会记录给所有者查看。
+## 部署
 
-确认垃圾消息且可以采取操作时，ChatHygiene 会将对话标记为已读，以每批 100 条的方式删除所有已知且符合条件的消息，进入 `SPAM_SOFT_BLOCKED`，并立即读取和删除之后收到的消息。这是一种本地软屏蔽。Telegram Bot API 不允许已连接的 Business 机器人直接屏蔽发件人、移除聊天列表项，也无法保证删除 ChatHygiene 从未观察到的消息。
+### 前提
 
-## 安装
+- Linux、Docker Engine 和 Docker Compose v2；
+- BotFather 创建并启用 Business/Secretary 支持的机器人；
+- 一个公开 HTTPS URL；
+- 一个负责 TLS 终止并持续转发 `/telegram/webhook` 的反向代理、隧道或网关；
+- 受保护的部署账号、`.env` 和数据目录。
 
-ChatHygiene 的就绪探针只证明进程、配置、数据库迁移和本地恢复已经完成，不证明 Telegram webhook、Business 连接或权限可用。第一次安装和迁移到新 VPS 都应按本节顺序完成，并在验收结束前保持试运行。
+应用在容器内固定监听明文 HTTP `8080`。Telegram 接受的公开 webhook 端口只有
+`443`、`80`、`88` 和 `8443`，ChatHygiene 对这四个端口仍一律要求 HTTPS。推荐公开
+`443` 终止 TLS，再转发到容器 `8080`。`https://host:8080/...` 会在本地配置阶段被
+拒绝；Docker 端口映射本身不提供 TLS。
 
-### 1. 准备 Telegram 与公开端点
+默认公开 URL 为：
 
-1. 使用 [BotFather](https://t.me/BotFather) 创建机器人，并启用当前界面中的 Business 或 Secretary 支持。Telegram 的文档目前同时使用 [Business Mode](https://core.telegram.org/bots) 和 [Secretary Mode](https://core.telegram.org/bots/features) 两种说法。
-2. 为 ChatHygiene 准备公开 HTTPS 地址。服务自身只监听明文 HTTP 8080，因此必须在反向代理、隧道或入口网关处终止 TLS。
-3. 如果使用全新数据库，暂时不要连接 Telegram Business 账号：先配置并启动服务，再设置 webhook。迁移已有数据库时保留现有连接，不要仅因更换 VPS 就提前断开。
+```dotenv
+CHATHYGIENE_PUBLIC_WEBHOOK_URL=https://host/telegram/webhook
+```
 
-Telegram 在[已连接的 Business 机器人](https://core.telegram.org/api/bots/connected-business-bots)中说明了接收者筛选条件，并在 [`businessBotRecipients`](https://core.telegram.org/constructor/businessBotRecipients) 中列出了各个标志。更广泛的 [Telegram Business](https://core.telegram.org/api/business) 界面与订阅要求可能会变化。
+反向代理必须把该公开路径转发到容器相同的 `/telegram/webhook`，并保留
+`X-Telegram-Bot-Api-Secret-Token`。例如：
 
-当前 `compose.yml` 会发布配置的宿主机端口。若反向代理与 ChatHygiene 位于同一台 VPS，请同时使用主机防火墙限制该端口，不要让明文 8080 绕过 HTTPS 入口直接暴露到公网。
+```nginx
+location = /telegram/webhook {
+    proxy_pass http://127.0.0.1:8080/telegram/webhook;
+    proxy_set_header X-Telegram-Bot-Api-Secret-Token $http_x_telegram_bot_api_secret_token;
+}
+```
 
-### 2. 准备部署目录
+也可以配置不同的公开路径或 query，但必须同时配置到内部固定路由的对应重写。
+Telegram 接受 webhook 声明并不证明代理不会返回 `404`/`403`，也不证明密钥 header
+被保留。
 
-从[最新 Release](https://github.com/lingxing1017/chat-hygiene/releases/latest)下载与 VPS 架构匹配的 Docker 镜像归档，并取得同一 Release 对应源码版本中的 `compose.yml` 和 `.env.example`。可以使用 GitHub 自动提供的 Source code 归档，也可以从相同 tag 的仓库内容中单独下载这两个文件。将它们放入同一目录；部署用户不需要拉取容器镜像，也不需要在 VPS 上编译源码。
+### 全新部署
 
-### 3. 创建配置
-
-复制 `.env.example`，按照[配置](#配置)填写所有必填值，并保持首次启动为 dry-run：
+全新安装只需要 bot token、公开 webhook URL、受保护的数据目录和 dry-run 默认值。
+在第一次 `docker compose up` 前显式创建 bind source；不要让 Compose 自动创建通常为
+`0755` 的宿主目录，因为容器入口会拒绝它。
 
 ```bash
+install -d -m 0700 data
 cp .env.example .env
 chmod 600 .env
+stat -c '%a %n' data .env
 ```
 
-### 4. 选择数据策略
+如果部署账号不是当前账号，停止后对这两个精确路径执行所需的 `chown`，不要递归
+修改未知目录。预期 `data` 为 `700`，`.env` 为 `600`，且均属于部署账号。
 
-在第一次启动新 VPS 前，必须明确选择以下一种方式。
+填写 `.env`：
 
-#### 全新初始化
-
-```bash
-mkdir data
+```dotenv
+CHATHYGIENE_BOT_TOKEN=BotFather签发的令牌
+CHATHYGIENE_PUBLIC_WEBHOOK_URL=https://host/telegram/webhook
+CHATHYGIENE_DESTRUCTIVE_MODE=false
+CHATHYGIENE_PORT=8080
+RUST_LOG=info
 ```
 
-请在新的部署目录中执行。若命令提示 `data` 已存在，不要删除目录或其中的数据库；先确认应该迁移还是全新初始化。服务首次在这个空目录中启动时才会创建新的 SQLite 数据库。新数据库不包含旧的 Business 连接、对话状态、待发送操作、运行时 dry-run 设置或已标注样本。Telegram 不会因为 webhook 或 VPS 地址发生变化而自动重放旧的 `business_connection` 更新；设置新 webhook 后，必须断开并重新连接 Business 机器人。
+`CHATHYGIENE_PORT` 只是宿主机到容器固定 `8080` 的映射，不是任意 Telegram 公开端口。
 
-#### 从旧 VPS 迁移
-
-安全迁移原 `.env` 中的配置。继续使用同一个机器人时必须保留其 bot token 和 owner ID；保留原 `CHATHYGIENE_CHALLENGE_HMAC_KEY` 才能继续验证尚未过期的题目。可以轮换 webhook 密钥，但新 `.env` 与稍后调用 `setWebhook` 使用的值必须一致。
-
-先在旧部署上执行 `/dry_run on`，再用 `/health` 确认 `dry_run=on`。持久化运行时设置会随数据库迁移；仅在新 VPS 的 `.env` 中写入 `CHATHYGIENE_DESTRUCTIVE_MODE=false` 不会覆盖旧的 `dry_run=off`。
-
-然后在旧 VPS 的部署目录停止服务，再备份数据库及同名前缀的 WAL/SHM 文件。不要复制仍在写入的 SQLite 文件。
+导入与 VPS 架构匹配的 Release 镜像并启动：
 
 ```bash
-docker compose stop chathygiene
-umask 077
-backup_dir="../chathygiene-backup-$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$backup_dir"
-cp -p data/chathygiene.db* "$backup_dir"/
-sha256sum "$backup_dir"/chathygiene.db*
-```
-
-使用你自己的加密传输方式将整个备份目录复制到新 VPS。恢复前不要启动新服务。如果新 VPS 已经生成了数据库，先停止服务并将现有 `data/chathygiene.db*` 另行备份，不要直接覆盖唯一副本。然后把旧 VPS 的同一组文件恢复到新部署目录的 `./data/`，并再次核对校验和。
-
-当前 Compose 将宿主机的 `./data` 绑定挂载到容器的 `/data`。从使用 `chathygiene-data` 命名卷的旧版本升级时，也必须先停止旧服务，再从该命名卷导出同一组文件；应用不会自动迁移或删除旧卷。若遗漏迁移，启动时会在当前 `./data` 中创建空数据库。
-
-### 5. 启动并验证本地服务
-
-GitHub Release 提供已经编译好的 Linux Docker 镜像归档：`amd64` 对应常见的 `x86_64` VPS，`arm64` 对应 `aarch64`/ARM VPS。先运行 `uname -m` 确认架构，再从[最新 Release](https://github.com/lingxing1017/chat-hygiene/releases/latest)下载匹配的文件：
-
-- `chathygiene-amd64-YYYY.MM.DD.tar`
-- `chathygiene-arm64-YYYY.MM.DD.tar`
-
-将下载的归档放到包含 `compose.yml` 的部署目录，然后运行：
-
-```bash
-set -a
-source .env
-set +a
-host_port="${CHATHYGIENE_PORT:-8080}"
-
+uname -m
 docker load -i chathygiene-amd64-YYYY.MM.DD.tar
 docker compose up -d
 docker compose ps
-curl --fail "http://127.0.0.1:${host_port}/health/live"
-curl --fail "http://127.0.0.1:${host_port}/health/ready"
-docker compose logs --since=10m chathygiene
+curl --fail http://127.0.0.1:8080/health/live
+curl --fail http://127.0.0.1:8080/health/ready
 ```
 
-还应从 VPS 外部访问一次 `https://你的域名/health/ready`，确认 DNS、TLS 和反向代理确实指向新服务。本机的 `/health/ready` 成功不能证明公开入口可达。
+稳定的新机器人顺序是：
 
-应用只公开以下路由：
+1. 在 BotFather 创建并配置机器人。
+2. 用 bot token 和公开 URL 部署并启动 ChatHygiene。
+3. 等待 HTTP readiness 与自动 webhook 协调完成。
+4. 在 Telegram Business 中把机器人绑定一次，并授予回复、已读、删除已发送消息、
+   删除收到/全部消息四项权限。
+5. 在普通机器人私聊中点击 Start。
+6. 读取准备好的完整命令：
 
-| 路由 | 证明的范围 |
-| --- | --- |
-| `GET /health/live` | 进程正在响应。 |
-| `GET /health/ready` | 配置、数据库迁移和本地恢复已完成；不证明 Telegram 可用。 |
-| `POST /telegram/webhook` | 经过密钥验证的 Telegram 更新入口。 |
+   ```bash
+   docker compose exec -T chathygiene cat /data/claim-code
+   ```
 
-### 6. 设置并检查 webhook
+   仅当宿主所有权允许时，也可运行 `cat data/claim-code`。
+7. 在普通私聊中发送该命令，然后检查 Owner、连接和 dry-run 状态。
 
-下面的 `curl` 在宿主机 shell 中运行，因此必须先显式加载 `.env`；仅让 Docker Compose 读取 `.env` 不会给当前 shell 设置这些变量。
+`/claim` 从 Telegram 已认证的 `message.from.id` 读取 Owner 用户 ID，从
+`message.chat.id` 读取投递 chat ID；`CHATHYGIENE_OWNER_USER_ID` 已不是有效配置。
+
+### Owner claim 与 `/start`
+
+未 claim 时，ChatHygiene 在 SQLite 数据库旁自动创建 `claim-code`，权限为 `0600`。
+它包含完整 `/claim <token>` 命令。未 claim 的同一数据库重启后，如果文件丢失，会
+重新创建同一命令；claim 成功后只删除内容、类型、所有权都完全安全匹配的副本。
+不安全、symlink、错误所有者或内容不匹配的条目不会被自动删除，必须由运维人员停机
+修复。
+
+该文件不是应用 CLI，不需要单独备份。删除文件也不是撤销：claim 前数据库备份包含
+可派生同一 token 的主种子。发送成功后，请删除 Telegram 中的 `/claim` 消息；
+Telegram 历史、通知、终端输出和剪贴板不在 ChatHygiene 的数据库/日志脱敏边界内。
+
+`/start` 永远不会发送 claim code，也不会制造 `business_connection` 更新。claim 前
+它只提示读取同级文件；claim 后只向 Owner 显示帮助，非 Owner 不收到响应。
+
+### Business 连接场景
+
+- 新机器人：新服务 ready 后绑定一次。
+- 已绑定的旧机器人迁到全新 VPS/数据库：通常在 ready 后断开并重连一次；如果
+  `/health/ready` 已显示 `connection=candidate`，先不要重连。
+- 恢复已 claim 且含可信连接的数据库：不要重连。
+- claim 返回 `connection=missing` 仍然有效，可以随后建立连接。
+
+Webhook 生命周期 payload 只是触发器；`getBusinessConnection` 才是 enabled、四项
+rights、Business 用户和连接世代的当前权威来源。匹配连接仍在协调时，Business
+副作用会被阻止；keyless 的私聊/Owner 设置消息仍可投递。
+
+可选诊断：
 
 ```bash
 set -a
 source .env
 set +a
-
-webhook_url="https://example.com/telegram/webhook"
-curl --fail --silent --show-error --request POST \
-  "https://api.telegram.org/bot${CHATHYGIENE_BOT_TOKEN}/setWebhook" \
-  --data-urlencode "url=${webhook_url}" \
-  --data-urlencode "secret_token=${CHATHYGIENE_WEBHOOK_SECRET}" \
-  --data-urlencode 'allowed_updates=["business_connection","business_message","edited_business_message","deleted_business_messages","message"]'
-
 curl --fail --silent --show-error \
   "https://api.telegram.org/bot${CHATHYGIENE_BOT_TOKEN}/getWebhookInfo"
 ```
 
-检查 `getWebhookInfo` 返回的 `url`、`allowed_updates`、`pending_update_count` 和 `last_error_message`。正常的 `allowed_updates` 必须包含普通 `message`，否则所有者命令不会送达。重新部署时不要随意设置 `drop_pending_updates=true`，它会丢弃 Telegram 尚未投递的更新。
+`getWebhookInfo` 能检查 Telegram 可见的 URL、pending count 和错误，但不会显示、
+也不能证明当前 webhook secret。
 
-ChatHygiene 会在解析 JSON 前检查 `X-Telegram-Bot-Api-Secret-Token`，拒绝超过 256 KiB 的请求正文。webhook 对错误密钥返回 `403`，对格式错误的 JSON 返回 `400`，对无法持久处理的更新返回 `503`。重复的更新 ID 可幂等处理。
+### 启动与健康状态
 
-### 7. 建立或恢复 Business 连接
+每次启动严格按以下单向顺序执行：
 
-- **全新数据库：** 在 webhook 已指向新 VPS 后，进入 Telegram 的 Business 聊天自动化设置。如果机器人原本已连接，先断开再重新连接，以触发新的 `business_connection` 更新。
-- **已迁移数据库：** 如果保留了原连接且稍后的 `/health` 正常，可以继续使用。不要为了测试而不必要地重连；重连可能产生新的连接 ID。
+1. 数据库描述和 orphan claim 路径预检；
+2. migration；
+3. 提交/加载主种子；
+4. 派生 bot-independent challenge key 与 Owner-claim token；
+5. 用 claim token 只读验证现有 claim target/temp；
+6. 在事务外执行认证 `getMe`；
+7. pin 或验证正数 bot ID；
+8. 派生 bot-bound webhook secret；
+9. 进入全局 `PENDING` gate；
+10. 恢复旧连接事实；
+11. 导入/加载不可变 Owner；
+12. 对至多一个可信连接做当前状态查询；
+13. 恢复本地非连接事件；
+14. 把开放的旧 challenge 重新签名到 version 1；
+15. 协调 `claim-code`；
+16. 绑定内部 `8080`；
+17. 自动提交完整 webhook 声明，且 `drop_pending_updates=false`；
+18. 启动 notifier、processing、outbox worker；
+19. 开始 HTTP serve；
+20. drain 剩余已记录连接触发器；
+21. 全局状态转为 `READY`。
 
-连接的账号必须与 `CHATHYGIENE_OWNER_USER_ID` 完全一致，并授予全部四项权限：
+`GET /health/live` 在 HTTP 已 serve 时总是 `200`，用于 Docker/路由 liveness。
+`GET /health/ready` 是状态和告警信号；只有全局 `READY` 且 Owner/连接组合合法时才
+返回 `200`，响应仅含：
 
-- 回复消息；
-- 将消息标记为已读；
-- 删除已发送的消息；
-- 删除收到的消息或所有消息。
+```json
+{"status":"ok","owner":"claimed","connection":"enabled"}
+```
 
-将机器人范围设置为来自非联系人的新聊天。除非已有聊天和联系人也应进入验证生命周期，否则将其排除。
+`owner` 为 `claimed|unclaimed`；`connection` 为
+`missing|candidate|enabled|disabled|rights_incomplete|ambiguous`。所有
+`PENDING`、`AUTH_FAILED`、可信连接仍 `PENDING` 或损坏/矛盾组合都返回同一个最小
+`503`：
 
-仅配置 `CHATHYGIENE_OWNER_USER_ID` 不会在空数据库中创建可信所有者。可信关系来自 Telegram 的 `business_connection` 更新或迁移后的连接记录。在此之前，dry-run 追踪没有安全的收件人，未知 Business 连接的消息也会被确认接收但安全忽略。
+```json
+{"status":"unavailable"}
+```
 
-### 8. 在试运行中验收，再启用真实操作
+Owner 的 Telegram `/health` 命令使用同一事务分类，并额外显示 dry-run。它与两个
+HTTP probe 不是同一个接口。
 
-1. 保持 `CHATHYGIENE_DESTRUCTIVE_MODE=false`。
-2. 从已配置所有者的**普通机器人私聊**发送 `/health`，不要通过 Business 会话发送。预期收到：
+反向代理或 orchestrator 不得因为 readiness 为 `503` 或 Docker 暂时 unhealthy 就
+停止转发 `/telegram/webhook`。进程 live 时必须保留 ingress，`PENDING` 协调可能正
+需要新的连接触发器才能完成。10 分钟 container start period 覆盖有界的 pre-serve
+控制面调用：`getMe` 最坏 25 秒、至多一次可信 `getBusinessConnection` 最坏 25 秒、
+webhook 协调最坏 430 秒，共 480 秒；另外 120 秒留给 migration、seed/pin、challenge
+重签名、claim 文件、listener/worker 和调度。它不承诺吸收任意历史 backlog。
 
-   ```text
-   status=ok connection=enabled dry_run=on
+修改 `CHATHYGIENE_PUBLIC_WEBHOOK_URL` 或 bot token 后必须重启；下一次启动会先自动
+协调 Telegram，再开放 readiness。
+
+### Bot 身份与失败边界
+
+第一次认证成功的 `getMe` 会把正数 bot ID 存入数据库。这是 trust-on-first-use：有了
+pin 之后，同一 bot 的轮换 token 可被机械接受，另一个 bot 会被拒绝。旧数据库在首
+次升级前没有 bot ID，因此无法判断运维人员是否误填了另一个 bot 的有效 token。
+第一次升级必须使用旧 bot 的当前 token，记录返回的 bot ID 与凭据来源/证明，但绝不
+记录 token；不要把首次升级和更换 bot 合并。
+
+启动 `getMe` 的 `401/403` 会在 bot pin、全局状态和可信连接发生变化前返回脱敏错误，
+HTTP 不会启动。启动期可信连接查询的 `401/403` 会提交全局 `AUTH_FAILED` 并终止
+启动；serve 后恢复遇到相同错误会先让 readiness 变为最小 `503`，再通过受控 worker
+清理退出。只有明确识别的 connection-not-found 是连接级结果；timeout、协议错误或
+未知拒绝都会保留触发器等待重试，而不会信任旧 payload。
+
+### 数据库、备份和权限
+
+数据库现在包含主种子、Owner、Business 状态、挑战与运行时设置。只有 `.env` 不能
+恢复这些状态；只有 SQLite 备份也不能运行服务。完整恢复需要停机后的
+`chathygiene.db`、可能存在的 `-wal`/`-shm`，以及 bot token、公开 URL、部署/TLS 等
+不可派生配置。
+
+权限要求：
+
+- `data/`：部署 owner，`0700`；
+- DB、WAL、SHM、`claim-code` 与数据库备份：`0600`；
+- 活跃 `.env` 和回滚 `.env` 备份：部署 owner，`0600`；
+- 回滚环境备份必须在 Git checkout 和 Docker build context 之外，例如
+  `/var/backups/chathygiene/pre-upgrade.env`。
+
+容器以 `umask 077` 创建新文件，并对默认 `/data` 与现有 DB/sidecar 做 fail-closed
+检查。镜像默认以 root 运行时，bind mount 中的新文件可能是 root-owned；安全读取
+claim code 可使用容器命令，不能承诺每个宿主用户都可直接读取。数据库主种子能派生
+claim code，所以只保护同级文件是不够的。
+
+恢复 `CLAIMED` 数据库会恢复同一个 Owner，不再 claim，并只删除精确安全的陈旧
+claim 文件。恢复 `UNCLAIMED`/claim 前备份会重建同一 code，并可提升保留下来的匹配
+候选连接。绝不能让任何两个数据库同时使用同一个 Telegram bot；它们会争夺单一
+webhook，克隆数据库还共享派生凭据。
+
+### 一次性升级
+
+1. 在旧实例执行 `/dry_run on` 并确认 `/health`。
+2. 停止旧实例；不要 chmod 或复制仍在运行的 SQLite/WAL。
+3. 备份三个精确数据库路径中实际存在的文件，并把旧 `code/.env` 复制到 checkout/
+   build context 之外的受保护路径：
+
+   ```bash
+   docker compose stop chathygiene
+   sudo install -d -m 0700 /var/backups/chathygiene
+   sudo install -m 0600 .env /var/backups/chathygiene/pre-upgrade.env
+   cp -p data/chathygiene.db /var/backups/chathygiene/
+   test ! -e data/chathygiene.db-wal || cp -p data/chathygiene.db-wal /var/backups/chathygiene/
+   test ! -e data/chathygiene.db-shm || cp -p data/chathygiene.db-shm /var/backups/chathygiene/
+   checkout_path="$(realpath .)"
+   rollback_path="$(realpath /var/backups/chathygiene/pre-upgrade.env)"
+   case "$rollback_path" in "$checkout_path"|"$checkout_path"/*) exit 1 ;; esac
    ```
 
-3. 用符合 Business 机器人范围的非联系人测试账号发送一条普通新私信。确认测试账号收到验证题，所有者收到不含消息正文的 `[DRY-RUN 追踪]`。这一步验证 webhook、连接、检测、验证题和追踪链路。
-4. 再次用 `/health` 确认仍为 `dry_run=on`，然后让同一测试账号发送下面这条项目测试夹具中的高置信度垃圾文本：
+4. 用编辑器从活跃 `.env` 删除 `CHATHYGIENE_WEBHOOK_SECRET`、
+   `CHATHYGIENE_CHALLENGE_HMAC_KEY`、`CHATHYGIENE_OWNER_USER_ID`，加入公开 URL；旧值
+   只留在外部回滚备份中。不要打印环境值。
+5. 在服务停止时，对每个实际存在的 DB/WAL/SHM、数据库备份、活跃 `.env`、外部回滚
+   `.env` 分别执行精确 `chmod 600`，并对 `data` 执行 `chmod 700`。需要时用 `sudo
+   chown deployment:deployment <精确路径>` 修正 owner；不要使用递归 glob。
 
-   ```text
-   Contact me for promotion and guaranteed investment returns. Pay 0x1234567890abcdef1234567890abcdef12345678
+   ```bash
+   chmod 700 data
+   chmod 600 .env data/chathygiene.db
+   test ! -e data/chathygiene.db-wal || chmod 600 data/chathygiene.db-wal
+   test ! -e data/chathygiene.db-shm || chmod 600 data/chathygiene.db-shm
+   sudo chmod 600 /var/backups/chathygiene/pre-upgrade.env
+   sudo chmod 600 /var/backups/chathygiene/chathygiene.db
    ```
+6. 使用同一 bot 的当前 token 启动新镜像，不要在首次 pin 时换 bot。
+7. 检查 `/health/live`、`/health/ready`、Owner `/health`、可选 `getWebhookInfo` 和
+   dry-run。旧数据库没有可信连接时才 claim。
 
-   预期追踪显示判定 `SPAM`、分数 `100`，并包含 `DELETE_MESSAGE：SKIPPED_DRY_RUN` 和 `SPAM_BLOCK：SKIPPED_DRY_RUN`；测试消息仍应可见。若 `/health` 不是 `dry_run=on`，不要发送这条测试消息。
-5. 发送 `/errors 10`，确认没有权限或投递错误。检查 `docker compose logs --since=10m chathygiene`。
-6. 只有在上述检查都通过后，才发送 `/dry_run off`。返回 `dry_run=off` 表示运行时设置已持久化，并且存储的连接状态与四项权限标志通过检查。
-7. `/dry_run off` 本身仍会产生最后一条 `[DRY-RUN 追踪]`：该更新按开始处理时的旧模式记录。随后再次发送 `/health`，预期得到 `dry_run=off`，且不再产生 dry-run 追踪。
+升级恢复已记录事件后，恰好一个旧 Business 连接会被导入为 Owner；零个则变为
+`UNCLAIMED`，多个会 fail closed。开放 challenge 会自动重签名，正确答案仍有效。新
+进程自然忽略三个旧变量，但活跃 Compose 环境仍应移除它们；验收只检查变量名是否
+存在，绝不输出值。
 
-关闭 dry-run 后，自动标记已读、删除和本地软屏蔽都会真实生效。存储的权限标志通过检查并不等于一次真实 Telegram 删除已经成功；如果 Telegram 在实际调用时返回权限错误，ChatHygiene 会禁用连接、强制恢复 dry-run 并保留消息。
+### 回滚
 
-### 不使用容器运行
+回滚必须同时恢复旧镜像、升级前完整数据库集和外部保存的旧 `.env`：
 
 ```bash
-mkdir -p data
+docker compose stop chathygiene
+install -m 0600 /var/backups/chathygiene/pre-upgrade.env .env
+# 恢复升级前 chathygiene.db、-wal、-shm 与旧镜像后再启动
 set -a
 source .env
 set +a
-cargo run --locked
+curl --fail --silent --show-error --request POST \
+  "https://api.telegram.org/bot${CHATHYGIENE_BOT_TOKEN}/setWebhook" \
+  --data-urlencode "url=https://host/telegram/webhook" \
+  --data-urlencode "secret_token=${CHATHYGIENE_WEBHOOK_SECRET}" \
+  --data-urlencode "drop_pending_updates=false"
 ```
+
+上面的手动 webhook 命令只用于兼容旧版本回滚。恢复备份会丢弃升级后状态。编辑
+`_sqlx_migrations` 或删除 `key_material` 不是回滚或轮换方法。
+
+Version 1 不支持原地轮换主种子，也没有 Owner reset/rebind 命令。删除或修改任一
+singleton 都是损坏，不是轮换。未来 rebind 设计必须让 Telegram 历史或 claim 前备份
+中保留的旧 token 永远不能重新生效。
 
 ## 使用
 
-命令仅接受来自已配置数字用户 ID 所有者、发送到机器人的普通私聊消息。以 Business 消息发送的命令会被视为所有者手动回复，而不是管理命令。
+Owner 命令必须从普通机器人私聊发送：
 
-| 命令 | 结果 |
+| 命令 | 作用 |
 | --- | --- |
-| `/health` | `status=ok connection=enabled|disabled dry_run=on|off` |
-| `/inspect <chat_id>` | 查看当前状态、屏蔽原因和屏蔽次数。 |
-| `/reset <chat_id>` | 删除机器人已记录的会话消息，清理本地会话数据，并将任意状态重置为 `NEW`。 |
-| `/unblock <chat_id>` | 清除临时或持久的本地软屏蔽。 |
-| `/dry_run on` | 立即禁用自动破坏性操作并持久化覆盖设置；明确执行的 `/reset` 除外。 |
-| `/dry_run off` | 仅当连接已启用且四项权限齐全时启用破坏性操作。 |
-| `/errors [1..20]` | 显示最近带时间戳的错误代码/消息记录；默认为 10 条。 |
-| `/mark_spam` | 将所回复消息的文本或说明文字存为已标注的垃圾样本。 |
-| `/mark_ham` | 将所回复消息的文本或说明文字存为已标注的正常样本。 |
+| `/start` | claim 前指向 `claim-code`；claim 后向 Owner 显示帮助。 |
+| `/health` | 显示共享 Owner/连接分类与 `dry_run=on|off`。 |
+| `/dry_run on` | 随时增加安全性并持久化。 |
+| `/dry_run off` | 仅在 enabled、四项 rights 完整的可信连接下启用真实操作。 |
+| `/errors [1..20]` | 查看脱敏错误。 |
+| `/inspect <chat_id>` | 查看已知对话状态。 |
+| `/reset <chat_id>` | 删除机器人已知消息并重置生命周期。 |
+| `/unblock <chat_id>` | 清除本地软屏蔽。 |
+| `/mark_spam` / `/mark_ham` | 标注回复的文本/说明样本。 |
 
-要标注样本，请先将其转发或复制到普通的私人机器人聊天中，然后回复该消息并发送 `/mark_spam` 或 `/mark_ham`。只有这两个命令会有意持久化消息正文。
-
-Telegram 上报最后一条所有者手动回复被删除时，`ACTIVE` 会自动回到 `NEW`。如果清空记录或删除对话没有产生删除更新，可使用 `/reset <chat_id>`：它接受包括 `ACTIVE` 在内的任意状态，将所有已知且未删除的消息（包括已确认发送的验证题）加入 Telegram 删除队列，清除本地消息台账和验证记录，并开始新的 `NEW` 周期。回复中的 `telegram_delete=queued` 表示删除请求已持久化到发件箱，不表示 Telegram 已经完成删除；最终失败可通过 `/errors` 查看。`/unblock` 仍只清除本地软屏蔽，不删除消息或会话数据。
+先在 dry-run 中用非联系人账号验证普通消息与高置信度垃圾消息。只有当 readiness、
+Owner `/health`、四项 Business rights、追踪和 `/errors` 都正常时才执行
+`/dry_run off`。
 
 ## 配置
 
-复制示例文件并填写所有必填值：
-
-```bash
-cp .env.example .env
-chmod 600 .env
-```
-
 | 变量 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `CHATHYGIENE_BOT_TOKEN` | 是 | - | BotFather 签发的令牌。 |
-| `CHATHYGIENE_WEBHOOK_SECRET` | 是 | - | Telegram 随 webhook 请求发送的密钥；使用 `openssl rand -hex 32` 生成。 |
-| `CHATHYGIENE_CHALLENGE_HMAC_KEY` | 是 | - | 用于验证算术题答案真实性的私钥；再次运行 `openssl rand -hex 32` 独立生成，不得复用 webhook 密钥。 |
-| `CHATHYGIENE_OWNER_USER_ID` | 是 | - | 此服务所服务账号的 Telegram 数字用户 ID；不是机器人 ID、用户名或手机号。 |
-| `CHATHYGIENE_DATABASE_URL` | 否 | `sqlite://data/chathygiene.db` | SQLite 连接 URL。Compose 固定设置为 `sqlite:///data/chathygiene.db`。 |
-| `CHATHYGIENE_DESTRUCTIVE_MODE` | 否 | `false` | 仅在没有持久化运行时设置时使用的启动默认值；`false` 表示试运行。 |
-| `CHATHYGIENE_PORT` | 仅 Compose | `8080` | 映射到应用固定 8080 端口的主机端口。 |
-| `RUST_LOG` | 否 | 取决于运行环境 | `tracing` 过滤器，例如 `info` 或 `chathygiene=debug`。 |
+| `CHATHYGIENE_BOT_TOKEN` | 是 | — | BotFather token；始终脱敏。 |
+| `CHATHYGIENE_PUBLIC_WEBHOOK_URL` | 是 | — | HTTPS 公开 URL；端口限 `443/80/88/8443`。 |
+| `CHATHYGIENE_DATABASE_URL` | 否 | `sqlite://data/chathygiene.db` | Compose 固定为 `/data/chathygiene.db`。 |
+| `CHATHYGIENE_DESTRUCTIVE_MODE` | 否 | `false` | 仅在没有持久化 runtime setting 时作为启动默认。 |
+| `CHATHYGIENE_PORT` | 仅 Compose | `8080` | 宿主映射；应用/容器目标始终是 `8080`。 |
+| `RUST_LOG` | 否 | `info` | 日志过滤器；敏感值仍不会输出。 |
 
-如果是全新机器人且还没有设置 webhook，可先给机器人发送一条普通私聊消息，再调用 `getUpdates`，从 `result[].message.from.id` 读取 owner 数字 ID：
+应用不读取旧的手动 secret 或数字 Owner 配置。普通消息正文、说明、文件名、用户名、
+显示名、bot token、主种子、派生 key、claim token、完整 claim 命令和 HTTP 请求体不
+进入应用日志。显式 `/mark_spam`/`/mark_ham` 样本是例外。
 
-```bash
-set -a
-source .env
-set +a
-curl --fail --silent --show-error \
-  "https://api.telegram.org/bot${CHATHYGIENE_BOT_TOKEN}/getUpdates"
-```
-
-webhook 生效后不能同时使用 `getUpdates`。不要为了查询 ID 删除一个正在工作的 webhook，也不要把 Business 联系人的 `chat.id` 当作 owner ID。
-
-不要提交 `.env`、SQLite 数据库及其 WAL/SHM 文件、日志或机器人令牌。应用自身不会读取 `.env`；Docker Compose 会通过 `env_file` 注入它，直接运行二进制时则必须由 shell 或服务管理器导出。
-
-`CHATHYGIENE_DESTRUCTIVE_MODE` 只是启动默认值。所有者执行 `/dry_run on` 或 `/dry_run off` 后，SQLite 中的运行时设置会在重启后继续优先于 `.env`。试运行会阻止自动破坏性操作，但显式执行的 `/reset <chat_id>` 仍会实际删除机器人已知的消息。
-
-## 隐私与保留期限
-
-普通消息正文和说明文字仅在内存中存在，直到更新完成分类。持久化的生命周期事件会存储 ID、状态、规范化哈希、规则证据和检测器元数据，但不会存储正文。明确标注的垃圾/正常样本会保留正文，直到从 SQLite 中手动删除。
-
-内置保留任务每 15 秒检查一次过期数据，并每小时清理一次历史记录：
-
-| 数据 | 保留期限 |
-| --- | --- |
-| 普通入站消息 ID | 72 小时，待删除操作仍需使用时除外。 |
-| 所有者手动回复 ID | 保留到 Telegram 上报删除或所有者执行 `/reset`。 |
-| 已应用的更新记录 | 当没有发件箱/审计记录仍引用它们时保留 7 天。 |
-| 成功的发件箱操作 | 30 天。 |
-| 失败或结果不确定的发件箱操作 | 90 天。 |
-| 待处理或正在重试的发件箱操作 | 保留至终态。 |
-| 详细审计事件 | 90 天，同时为每个持久垃圾屏蔽保留最新一条审计记录。 |
-| 对话和持久屏蔽 | 不自动清理。 |
-| Business 连接、规则元数据和已标注样本 | 不自动清理。 |
-| 验证记录和出站消息台账 ID | 不自动清理；执行 `/reset` 时清理目标会话。 |
-
-SQLite 可以轻松容纳很大的本地软屏蔽索引，因为其中主要是数字 ID 和时间戳；最需要严格处理的数据是消息正文。
-
-如需一致性备份，请停止服务，并从当前 bind-mounted `./data` 或旧命名卷中复制 `chathygiene.db*` 文件。仅在服务停止时恢复同一组文件，然后启动服务并等待 `/health/ready`。不要只复制正在运行的数据库主文件。
-
-日志采用结构化 JSON。即使系统不会有意记录普通消息正文，也应将日志和 `/errors` 输出视为运维敏感信息。
-
-## 恢复与故障行为
-
-ChatHygiene 采用开放放行策略：机器人、连接、权限、检测器或清理操作发生故障时，不会隐藏尚未分类的私聊消息。
-
-- 启动时会在就绪前重放处于 `RECORDED` 状态的持久生命周期事件。
-- 待处理和已到重试时间的发件箱操作会在重启后恢复。
-- 发送验证题时发生超时会标记为 `UNCERTAIN`，且绝不会自动重发，以避免提示重复。所有者会收到提醒，并可使用 `/reset <chat_id>` 清理受影响的会话。发送结果不确定且 Telegram 没有返回消息 ID 时，机器人无法自动删除那条未知消息。
-- Telegram 限流和可重试的服务器故障会使用有界重试。
-- Telegram 返回权限错误时，会禁用已存储的 Business 连接、强制进入试运行并保留消息。请恢复权限或重新连接机器人，检查 `/health`，然后再明确使用 `/dry_run off`。
-- 如果垃圾清理失败，请检查 `/errors`，必要时手动删除消息，并且仅在确实需要清除本地屏蔽时使用 `/unblock <chat_id>`。已删除的消息无法重建。
-- 如果 Telegram 漏发所有者回复的删除更新，对话可能一直保持 `ACTIVE`；使用 `/reset <chat_id>` 可明确结束旧周期并清理机器人已知的消息。
-
-如果机器人令牌泄露，请在 BotFather 中轮换令牌并重新设置 webhook。在 Telegram 和 `.env` 中同时轮换 webhook 密钥。轮换验证题 HMAC 密钥会使当前有效答案失效；请等待两分钟使其过期，或重置受影响的对话。
-
-## 已知限制
-
-- 无法在 Telegram 中原生屏蔽用户或删除聊天列表项。
-- 无法获取 Telegram 历史记录；清理范围仅包括已观察到的消息 ID。
-- 所有者手动回复并使状态变为 `ACTIVE` 后不再检查。
-- 无法保证 Telegram 会在客户端清空聊天后发送每一条删除更新。
-- 尚不支持 OCR、附件扫描、URL 获取、外部信誉服务或本地机器学习模型。
-- 不支持多账号租户、分布式队列或工作线程水平扩展。
-- 不提供自动清理已标注样本或旧验证记录的命令。
-
-这些限制是单账号 MVP 有意设置的安全边界。
-
-## 未来的本地模型适配器
-
-垃圾分类功能位于与模型无关的 Rust `SpamDetector` trait 之后。未来版本可以添加 ONNX Runtime、Candle 或隔离的本地 HTTP 适配器，而无需改变 Telegram 生命周期或破坏性操作策略。模型输出仍应提供证据并采用开放放行策略；高置信度删除也必须继续满足相同的显式阈值。
-
-架构可以借鉴 [`illright/telegram-antispam`](https://github.com/illright/telegram-antispam) 的预处理、OCR 分阶段处理、审核队列和模型抽象等思路，但本仓库不包含该项目的代码、分类器或权重。未来复用任何内容前，请分别审查源代码和模型许可证；它们的条款与分发限制不能互换。
-
-## 项目结构
-
-| 路径 | 职责 |
-| --- | --- |
-| `src/main.rs` | 启动 HTTP 服务，并在 `0.0.0.0:8080` 监听。 |
-| `src/app.rs` | 组装依赖、恢复流程、后台工作线程、webhook 与健康检查路由。 |
-| `src/domain/` | 对话状态与允许的生命周期转换。 |
-| `src/detection/` | 文本规范化、规则配置与本地垃圾检测。 |
-| `src/verification/` | 由 HMAC 保护的算术验证题生成与判定。 |
-| `src/processing/` | 串行生命周期处理、通知与 dry-run 追踪。 |
-| `src/telegram/` | Telegram 更新解析、webhook、Bot API 客户端与发件箱投递。 |
-| `src/owner/` | 所有者鉴权、命令、检查、reset、unblock 与样本标注。 |
-| `src/storage/`、`migrations/` | SQLite 连接、迁移、仓储与事务工作单元。 |
-| `src/events/`、`src/retention/` | 持久事件恢复、发件箱工作线程与数据保留任务。 |
-| `tests/` | 单元、集成、端到端、容器配置和隐私回归测试。 |
-| `.github/workflows/` | CI 与多架构 Docker 镜像归档发布。 |
-
-## 开发
-
-源码开发固定使用 Rust `1.96.0`。复制配置、创建本地数据目录并导出环境变量后即可直接运行：
-
-```bash
-cp .env.example .env
-mkdir -p data
-set -a
-source .env
-set +a
-cargo run --locked
-```
-
-开发环境仍应从 dry-run 开始。配置要求与运行时覆盖规则见[配置](#配置)。
-
-## 测试
-
-执行与 CI 相同的格式、静态检查和完整测试套件：
+## 开发与测试
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
+docker build -t chathygiene:local .
 ```
 
-测试覆盖真实 Axum 入口、SQLite 迁移与恢复、单工作线程生命周期处理、针对本地 HTTP stub 的 Telegram 发件箱行为、隐私断言、重复更新、编辑、相册、试运行、验证、软屏蔽以及 reset 清理语义。
-
-## 构建与部署
-
-普通部署应使用 GitHub Release 的预编译镜像归档，并按[快速开始](#快速开始)或[安装](#安装)操作。只有自行开发或需要验证本地源码改动时，才应在本机或开发机重新构建镜像：
-
-```bash
-docker build --tag chathygiene:test .
-docker compose up -d --build
-```
-
-生产部署必须保留公开 HTTPS 入口、默认 dry-run、主机端口防火墙限制和持久化 `./data`。迁移旧 VPS 时按[选择数据策略](#4-选择数据策略)停止旧服务并迁移完整的 `chathygiene.db*` 文件集；不要复制仍在写入的 SQLite 主文件。
-
-## 文档
-
-| 主题 | 入口 |
-| --- | --- |
-| 首次启动 | [快速开始](#快速开始) |
-| 完整 Telegram 接入 | [安装](#安装) |
-| 生命周期、验证与检测 | [工作原理](#工作原理) |
-| 所有者命令 | [使用](#使用) |
-| 环境变量与运行时设置 | [配置](#配置) |
-| 数据边界与备份 | [隐私与保留期限](#隐私与保留期限) |
-| 恢复、重试与密钥轮换 | [恢复与故障行为](#恢复与故障行为) |
-| 当前能力边界 | [已知限制](#已知限制) |
-| 部署问题定位 | [故障排查](#故障排查) |
-
-Telegram 接口行为以官方 [Bot API](https://core.telegram.org/bots/api) 与 [Telegram Business](https://core.telegram.org/api/business) 文档为准。
+仓库包含 Rust 源码、SQLx migration、Docker/Compose 配置和集成测试。服务继续使用
+单连接 SQLite pool、一个 processing worker、容量 `32/128` 和 `250ms` outbox poll。
 
 ## 故障排查
 
-先在实际部署目录收集不会泄露密钥的本地证据：
-
-```bash
-pwd
-docker compose ps
-ls -l data/chathygiene.db*
-docker compose logs --since=10m chathygiene
-```
-
-如果宿主机已安装 `sqlite3`，可以只读检查连接和特定更新。不要直接修改数据库，也不要公开粘贴完整 `event_json`；试运行事件可能包含联系人显示名和用户名。
-
-```bash
-sqlite3 -readonly data/chathygiene.db \
-  'SELECT owner_user_id, enabled, updated_at FROM business_connection;'
-
-sqlite3 -readonly data/chathygiene.db \
-  "SELECT update_id,
-          json_extract(event_json, '$.facts.event_kind'),
-          json_extract(event_json, '$.facts.owner_user_id')
-   FROM processed_update
-   ORDER BY update_id DESC
-   LIMIT 10;"
-```
-
-| 现象 | 含义与影响 | 处理方式 |
-| --- | --- | --- |
-| `/health/ready` 正常，但机器人没有反应 | 就绪探针不检查 webhook、Business 连接或 Telegram API。 | 检查 `getWebhookInfo`，再检查是否已有正确的 `business_connection`。 |
-| `dry-run trace has no trusted owner` | 当前更新和数据库都没有可信 Business owner。若它是未知 Business 连接的消息，该消息会被安全忽略。 | 若需要旧状态则恢复旧数据库；若是全新数据库，在 webhook 生效后断开并重新连接 Business 机器人，并核对数字 owner ID。 |
-| `/health` 没有回复 | 命令不是来自已配置 owner 的普通私聊，或数据库中尚无唯一的 Business 连接。 | 核对发送位置、`CHATHYGIENE_OWNER_USER_ID` 和连接记录；先解决连接引导，不要手工插入 owner。 |
-| `/dry_run off` 返回成功后仍收到一条追踪 | 切换命令按更新开始时仍开启的 dry-run 模式留下最后一条追踪。 | 再发 `/health`；应显示 `dry_run=off`，并且不再有追踪。 |
-| `/health` 显示 `connection=disabled` | 存储的连接曾被 Telegram 权限错误禁用。 | 在 Telegram 恢复全部四项权限或重新连接，确认 `/health` 后再明确执行 `/dry_run off`。 |
-| 新 VPS 启动后历史状态全部消失 | 当前 `./data` 是空目录、从错误目录启动 Compose，或旧命名卷/旧 VPS 数据未迁移。 | 停止服务，先备份当前数据库，再从停止状态下取得的旧数据库、WAL 和 SHM 文件恢复。 |
-| webhook 持续返回 `503` | 更新未能持久记录或应用，Telegram 会重试。 | 查看同一时间的结构化日志和 `/errors 10`；不要通过丢弃待处理更新来掩盖问题。 |
-
-## 贡献
-
-1. 从最新代码创建范围明确的分支，避免把功能、重构、部署和文档混在同一变更中。
-2. 为行为变化补充相应测试，并保持 dry-run、隐私与开放放行边界不变，除非变更本身明确修改这些契约。
-3. 提交前运行[测试](#测试)中的全部命令；涉及容器时同时验证 Docker 构建和 Compose 配置。
-4. Pull Request 应说明动机、行为变化、风险与验证证据。不要提交 `.env`、令牌、数据库、WAL/SHM、日志、构建产物或其他本机数据。
+| 症状 | 原因/处理 |
+| --- | --- |
+| 缺失/损坏 `key_material`、未知 key version 或 checksum 不匹配 | fail closed；恢复完整备份，不要删除 singleton。 |
+| Pinned bot mismatch | 使用该数据库原 bot 的 token；不要修改 pin。 |
+| 启动 `getMe` 认证失败 | 脱敏退出且不 serve；修复 token 后重启。 |
+| `AUTH_FAILED` 或可信/trigger 协调长期 pending | 修复 bot 权限/网络并保留 ingress；触发器会重试。 |
+| Owner singleton 无效或旧可信连接多于一个 | fail closed；从一致备份恢复，禁止手工挑选。 |
+| 缺失数据库旁有 orphan claim 文件，或 claim 文件属于另一个数据库 | 停机核对数据库与文件来源；不要让应用覆盖。 |
+| claim target/temp 是 symlink、错误 owner、错误模式或内容不匹配 | 停机后精确修复/移走；应用不会自动删除。 |
+| `data`、DB sidecar、活跃/回滚 `.env` 权限过宽 | 停机后按精确路径修正为 `0700/0600`。 |
+| 旧 challenge 表达式畸形或 HMAC version 不支持 | 启动失败；恢复未损坏备份。 |
+| 公开端口不支持或 URL 不是 HTTPS | 改用 `443/80/88/8443` 和 TLS 终止代理。 |
+| proxy 返回 `404/403` | 核对公开路径重写与 secret header 保留。 |
+| 自动 webhook 永久拒绝或瞬态重试耗尽 | 查看脱敏类别/状态码，修复 URL、bot 或网络后重启。 |
+| candidate 缺失/过期 | 重新连接一次以产生新的触发器。 |
+| `connection=ambiguous` | 不会自动选一条；等待旧候选过期后做一次新的同 Owner 连接。 |
+| readiness 为 `503` 但 live 为 `200` | 保持 webhook 转发；根据 Owner/connection 状态修复。 |
+| `/dry_run off` 被拒绝 | 先恢复 enabled 且四项 rights 完整的唯一可信连接。 |
 
 ## 许可证
 
-本项目采用 [GNU Affero General Public License v3.0 or later](https://www.gnu.org/licenses/agpl-3.0.html)，SPDX 标识为 `AGPL-3.0-or-later`。
+本项目采用 [MIT License](LICENSE)。
