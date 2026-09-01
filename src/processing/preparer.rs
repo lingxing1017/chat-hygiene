@@ -103,6 +103,7 @@ where
                 },
                 RawEventKind::BusinessConnectionChanged
                 | RawEventKind::OwnerClaim
+                | RawEventKind::OwnerStart
                 | RawEventKind::OwnerCommand
                 | RawEventKind::Ignored => PreparedAction::Ignore,
             }
@@ -357,6 +358,7 @@ const fn raw_event_name(kind: RawEventKind) -> &'static str {
         RawEventKind::ImplicitOwnerMessage => "IMPLICIT_OWNER_MESSAGE",
         RawEventKind::MessagesDeleted => "MESSAGES_DELETED",
         RawEventKind::OwnerClaim => "OWNER_CLAIM",
+        RawEventKind::OwnerStart => "OWNER_START",
         RawEventKind::OwnerCommand => "OWNER_COMMAND",
         RawEventKind::Ignored => "IGNORED",
     }

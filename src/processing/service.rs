@@ -137,6 +137,13 @@ struct ValidOwnerClaim {
     occurred_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClaimSetupCapability {
+    #[default]
+    Unavailable,
+    Available,
+}
+
 pub struct ProcessingEngine<D, V, C> {
     pool: SqlitePool,
     clock: C,
@@ -152,6 +159,7 @@ pub struct ProcessingEngine<D, V, C> {
     owner_claim_token: Option<SecretSlice<u8>>,
     owner_identity: Option<OwnerIdentityHandle>,
     claim_file_manager: Option<ClaimFileManager>,
+    claim_setup_capability: ClaimSetupCapability,
     #[cfg(test)]
     claim_retirement_test_seam: Option<Arc<dyn ClaimRetirementTestSeam>>,
 }
@@ -193,6 +201,7 @@ where
             owner_claim_token: None,
             owner_identity: None,
             claim_file_manager: None,
+            claim_setup_capability: ClaimSetupCapability::Unavailable,
             #[cfg(test)]
             claim_retirement_test_seam: None,
         }
@@ -242,6 +251,12 @@ where
         self
     }
 
+    #[must_use]
+    pub fn with_claim_setup_capability(mut self, capability: ClaimSetupCapability) -> Self {
+        self.claim_setup_capability = capability;
+        self
+    }
+
     #[cfg(test)]
     fn with_claim_retirement_test_seam(mut self, seam: Arc<dyn ClaimRetirementTestSeam>) -> Self {
         self.claim_retirement_test_seam = Some(seam);
@@ -261,6 +276,9 @@ where
     ) -> Result<RecordReceipt, ProcessingError> {
         if raw.kind == RawEventKind::OwnerClaim {
             return self.process_owner_claim(update_id, raw).await;
+        }
+        if raw.kind == RawEventKind::OwnerStart {
+            return self.process_owner_start(update_id, raw).await;
         }
         if raw.kind == RawEventKind::OwnerCommand {
             return self.process_owner_command(update_id, raw).await;
@@ -375,6 +393,77 @@ where
         }
     }
 
+    async fn process_owner_start(
+        &mut self,
+        update_id: i64,
+        mut raw: RawBusinessEvent,
+    ) -> Result<RecordReceipt, ProcessingError> {
+        let mut snapshot = raw.owner_command.take().ok_or_else(|| {
+            ProcessingError::InvalidEvent("owner Start context is missing".to_owned())
+        })?;
+        let from_user_id = snapshot
+            .from_user_id
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                ProcessingError::InvalidEvent("owner Start user is invalid".to_owned())
+            })?;
+        let chat_id = raw.chat_id.filter(|value| *value > 0).ok_or_else(|| {
+            ProcessingError::InvalidEvent("owner Start chat is invalid".to_owned())
+        })?;
+        if !snapshot.private_chat || snapshot.text != "/start" {
+            return Err(ProcessingError::InvalidEvent(
+                "owner Start shape is invalid".to_owned(),
+            ));
+        }
+
+        let identity_gate = if let Some(owner_identity) = &self.owner_identity {
+            Some(owner_identity.write_gate().await)
+        } else {
+            None
+        };
+        let mut uow = UnitOfWork::begin_immediate(&self.pool).await?;
+        if let Some(receipt) = existing_update_receipt_in(&mut uow, update_id).await? {
+            uow.rollback().await?;
+            return Ok(receipt);
+        }
+        let owner = load_owner_identity(&mut uow).await?;
+        if matches!(
+            owner,
+            OwnerIdentity::Claimed {
+                owner_user_id,
+                owner_chat_id,
+                owner_chat_source,
+                ..
+            } if owner_user_id == from_user_id
+                && (owner_chat_source == OwnerChatSource::LegacyFallback
+                    || owner_chat_id == chat_id)
+        ) {
+            uow.rollback().await?;
+            drop(identity_gate);
+            raw.kind = RawEventKind::OwnerCommand;
+            "/help".clone_into(&mut snapshot.text);
+            raw.owner_command = Some(snapshot);
+            return self.process_owner_command(update_id, raw).await;
+        }
+
+        insert_redacted_owner_start_update(&mut uow, update_id, raw.occurred_at).await?;
+        if owner == OwnerIdentity::Unclaimed
+            && self.claim_setup_capability == ClaimSetupCapability::Available
+        {
+            enqueue_private_message(
+                &mut uow,
+                update_id,
+                chat_id,
+                "OWNER_SETUP_GUIDE",
+                raw.occurred_at,
+            )
+            .await?;
+        }
+        uow.commit().await?;
+        drop(identity_gate);
+        Ok(RecordReceipt::Recorded)
+    }
+
     async fn snapshot_owner_claim(
         &mut self,
         claimant_user_id: i64,
@@ -448,13 +537,12 @@ where
         ) {
             insert_redacted_owner_update(&mut uow, update_id, claim.occurred_at).await?;
             insert_owner_claim_audit(&mut uow, update_id, false, claim.occurred_at).await?;
-            enqueue_direct_owner_message(
+            enqueue_private_message(
                 &mut uow,
                 update_id,
                 claim.owner_chat_id,
-                "claim failed",
-                claim.occurred_at,
                 "OWNER_CLAIM_REJECTED",
+                claim.occurred_at,
             )
             .await?;
             uow.commit().await?;
@@ -956,18 +1044,39 @@ async fn record_owner_claim_rejection(
     insert_redacted_owner_update(&mut uow, update_id, occurred_at).await?;
     insert_owner_claim_audit(&mut uow, update_id, false, occurred_at).await?;
     if let Some(owner_chat_id) = reply_chat_id {
-        enqueue_direct_owner_message(
+        enqueue_private_message(
             &mut uow,
             update_id,
             owner_chat_id,
-            "claim failed",
-            occurred_at,
             "OWNER_CLAIM_REJECTED",
+            occurred_at,
         )
         .await?;
     }
     uow.commit().await?;
     Ok(RecordReceipt::Recorded)
+}
+
+async fn insert_redacted_owner_start_update(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ProcessingError> {
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES (?, 'owner_start', ?, 'APPLIED', ?, ?)",
+    )
+    .bind(update_id)
+    .bind(format!(
+        "{{\"update_id\":{update_id},\"event_type\":\"owner_start\",\"facts\":{{\"kind\":\"OWNER_START\"}}}}"
+    ))
+    .bind(occurred_at.to_rfc3339())
+    .bind(occurred_at.to_rfc3339())
+    .execute(uow.connection())
+    .await
+    .map_err(StorageError::from)?;
+    Ok(())
 }
 
 async fn insert_redacted_owner_update(
@@ -1071,6 +1180,32 @@ async fn enqueue_direct_owner_message(
             })
             .to_string(),
             idempotency_key: format!("{update_id}:{suffix}"),
+            created_at: occurred_at,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn enqueue_private_message(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    chat_id: i64,
+    message_kind: &'static str,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ProcessingError> {
+    enqueue_outbox_action(
+        uow,
+        &NewOutboxAction {
+            source_update_id: update_id,
+            key: None,
+            kind: OutboxActionKind::SendPrivateMessage,
+            payload_json: serde_json::json!({
+                "chat_id": chat_id,
+                "message_kind": message_kind,
+            })
+            .to_string(),
+            idempotency_key: format!("{update_id}:{message_kind}"),
             created_at: occurred_at,
         },
     )

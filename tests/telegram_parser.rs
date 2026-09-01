@@ -182,6 +182,104 @@ fn recognizes_owner_commands_and_rejects_invalid_required_fields() {
 }
 
 #[test]
+fn parses_only_exact_private_start_commands() {
+    fn update(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": 130,
+            "message": {
+                "message_id": 540,
+                "from": {"id": 42},
+                "chat": {"id": 4200, "type": "private"},
+                "date": 1_783_987_280,
+                "text": text,
+            }
+        })
+    }
+
+    for text in ["/start", "/start@ChatHygieneBot"] {
+        let parsed = parse_update(&serde_json::to_vec(&update(text)).unwrap(), 42).unwrap();
+        assert_eq!(parsed.event.kind, RawEventKind::OwnerStart);
+        assert_eq!(parsed.event.chat_id, Some(4200));
+        let source = parsed.event.owner_command.unwrap();
+        assert_eq!(source.from_user_id, Some(42));
+        assert!(source.private_chat);
+        assert_eq!(source.text, "/start");
+    }
+
+    for text in [
+        "/start now",
+        "/start@bot",
+        "/start@Chat-Hygiene-Bot",
+        "/start@ChatHygieneBot extra",
+        "/starter",
+        " /start",
+        "/START",
+    ] {
+        let parsed = parse_update(&serde_json::to_vec(&update(text)).unwrap(), 42).unwrap();
+        assert_eq!(parsed.event.kind, RawEventKind::Ignored, "accepted {text}");
+    }
+}
+
+#[test]
+fn ignores_start_outside_a_positive_ordinary_private_source() {
+    let cases = [
+        serde_json::json!({
+            "update_id": 131,
+            "message": {
+                "message_id": 541,
+                "from": {"id": 42},
+                "chat": {"id": -4200, "type": "group"},
+                "date": 1_783_987_280,
+                "text": "/start",
+            }
+        }),
+        serde_json::json!({
+            "update_id": 132,
+            "channel_post": {
+                "message_id": 542,
+                "chat": {"id": -4201, "type": "channel"},
+                "date": 1_783_987_280,
+                "text": "/start",
+            }
+        }),
+        serde_json::json!({
+            "update_id": 133,
+            "message": {
+                "message_id": 543,
+                "chat": {"id": 4200, "type": "private"},
+                "date": 1_783_987_280,
+                "text": "/start",
+            }
+        }),
+        serde_json::json!({
+            "update_id": 134,
+            "message": {
+                "message_id": 544,
+                "from": {"id": 0},
+                "chat": {"id": 4200, "type": "private"},
+                "date": 1_783_987_280,
+                "text": "/start",
+            }
+        }),
+        serde_json::json!({
+            "update_id": 135,
+            "message": {
+                "message_id": 545,
+                "from": {"id": 42},
+                "chat": {"id": 0, "type": "private"},
+                "date": 1_783_987_280,
+                "text": "/start",
+            }
+        }),
+    ];
+
+    for update in cases {
+        let parsed = parse_update(&serde_json::to_vec(&update).unwrap(), 42).unwrap();
+        assert_eq!(parsed.event.kind, RawEventKind::Ignored);
+    }
+}
+
+#[test]
 fn parses_chat_identity_before_inbound_sender_identity() {
     let parsed = parse(
         r#"{

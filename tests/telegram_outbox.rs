@@ -222,6 +222,165 @@ async fn explicit_owner_chat_message_uses_new_destination_field() {
 }
 
 #[tokio::test]
+async fn private_setup_guide_is_rendered_only_at_dispatch() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES (710, 'owner_start', '{}', 'APPLIED', ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox_action
+         (source_update_id, action_type, payload_json, idempotency_key, status,
+          attempts, created_at, updated_at)
+         VALUES (710, 'SEND_PRIVATE_MESSAGE',
+          '{\"chat_id\":4200,\"message_kind\":\"OWNER_SETUP_GUIDE\"}',
+          '710:OWNER_SETUP_GUIDE', 'PENDING', 0, ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let api = FakeApi::with(vec![Planned::Send(Ok(SentMessage { message_id: 903 }))]);
+    let dispatcher = OutboxDispatcher::new(api.clone());
+
+    assert!(matches!(
+        dispatcher.dispatch_next(now, &pool).await.unwrap(),
+        DispatchOutcome::Succeeded { .. }
+    ));
+    assert_eq!(
+        api.sends.lock().unwrap().as_slice(),
+        &[SendAction {
+            business_connection_id: None,
+            chat_id: 4200,
+            text: "Owner setup is incomplete. Copy the /claim command from the claim-code file beside the ChatHygiene database. If the file is missing, restart ChatHygiene.".to_owned(),
+        }]
+    );
+    let payload: String =
+        sqlx::query_scalar("SELECT payload_json FROM outbox_action WHERE source_update_id = 710")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!payload.contains("claim-code"));
+    assert!(!payload.contains("/claim"));
+}
+
+#[tokio::test]
+async fn private_claim_rejection_retries_transport_without_business_identity() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES (711, 'owner_claim', '{}', 'APPLIED', ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox_action
+         (source_update_id, action_type, payload_json, idempotency_key, status,
+          attempts, created_at, updated_at)
+         VALUES (711, 'SEND_PRIVATE_MESSAGE',
+          '{\"chat_id\":4201,\"message_kind\":\"OWNER_CLAIM_REJECTED\"}',
+          '711:OWNER_CLAIM_REJECTED', 'PENDING', 0, ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let api = FakeApi::with(vec![
+        Planned::Send(Err(TelegramError::Transport)),
+        Planned::Send(Ok(SentMessage { message_id: 904 })),
+    ]);
+    let dispatcher = OutboxDispatcher::new(api.clone());
+
+    let DispatchOutcome::RetryScheduled {
+        next_attempt_at, ..
+    } = dispatcher.dispatch_next(now, &pool).await.unwrap()
+    else {
+        panic!("transport failure was not retried")
+    };
+    assert_eq!(next_attempt_at, now + Duration::seconds(1));
+    assert!(matches!(
+        dispatcher
+            .dispatch_next(next_attempt_at, &pool)
+            .await
+            .unwrap(),
+        DispatchOutcome::Succeeded { .. }
+    ));
+    assert_eq!(
+        api.sends.lock().unwrap().as_slice(),
+        &[
+            SendAction {
+                business_connection_id: None,
+                chat_id: 4201,
+                text: "claim failed".to_owned(),
+            },
+            SendAction {
+                business_connection_id: None,
+                chat_id: 4201,
+                text: "claim failed".to_owned(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn private_message_payload_is_closed_and_value_free_on_failure() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES (712, 'owner_start', '{}', 'APPLIED', ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox_action
+         (source_update_id, action_type, payload_json, idempotency_key, status,
+          attempts, created_at, updated_at)
+         VALUES (712, 'SEND_PRIVATE_MESSAGE',
+          '{\"chat_id\":4200,\"message_kind\":\"OWNER_SETUP_GUIDE\",\"text\":\"sentinel-secret\"}',
+          '712:INVALID', 'PENDING', 0, ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let api = FakeApi::default();
+    let dispatcher = OutboxDispatcher::new(api.clone());
+
+    assert!(matches!(
+        dispatcher.dispatch_next(now, &pool).await.unwrap(),
+        DispatchOutcome::PermanentFailure { .. }
+    ));
+    assert!(api.sends.lock().unwrap().is_empty());
+    let error: Option<String> =
+        sqlx::query_scalar("SELECT last_error FROM outbox_action WHERE source_update_id = 712")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(error.as_deref(), Some("invalid_action_payload"));
+    assert!(!format!("{error:?}").contains("sentinel-secret"));
+}
+
+#[tokio::test]
 async fn keyed_owner_message_resolves_persisted_owner_chat() {
     let (_directory, pool) = common::processing_database().await;
     let now = common::at("2026-07-14T00:00:00Z");

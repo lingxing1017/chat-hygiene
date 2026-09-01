@@ -13,6 +13,7 @@ pub enum RawEventKind {
     ImplicitOwnerMessage,
     MessagesDeleted,
     OwnerClaim,
+    OwnerStart,
     OwnerCommand,
     Ignored,
 }

@@ -195,8 +195,27 @@ impl<C: BusinessApi> OutboxDispatcher<C> {
                     .await?;
                 Ok(ActionSuccess::Plain)
             }
+            OutboxActionKind::SendPrivateMessage => self.execute_private_message(action).await,
             OutboxActionKind::ProposedDestructiveAction => Ok(ActionSuccess::Plain),
         }
+    }
+
+    async fn execute_private_message(
+        &self,
+        action: &OutboxActionRecord,
+    ) -> Result<ActionSuccess, ActionFailure> {
+        let payload: PrivateMessagePayload = parse_payload(action)?;
+        if payload.chat_id <= 0 {
+            return Err(ActionFailure::Invalid("invalid_private_message_payload"));
+        }
+        self.client
+            .send_business_message(&SendAction {
+                business_connection_id: None,
+                chat_id: payload.chat_id,
+                text: private_message_text(payload.message_kind).to_owned(),
+            })
+            .await?;
+        Ok(ActionSuccess::Plain)
     }
 
     async fn handle_telegram_failure(
@@ -310,6 +329,20 @@ struct OwnerAlertPayload {
     challenge_id: Option<i64>,
     owner_chat_id: Option<i64>,
     owner_user_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateMessagePayload {
+    chat_id: i64,
+    message_kind: PrivateMessageKind,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PrivateMessageKind {
+    OwnerSetupGuide,
+    OwnerClaimRejected,
 }
 
 #[derive(Debug, Deserialize)]
@@ -667,5 +700,14 @@ fn owner_alert_text(payload: &OwnerAlertPayload) -> String {
         }
         "detector_failed" => "ChatHygiene 检测器失败，本次消息已保留。".to_owned(),
         _ => "ChatHygiene 需要人工检查运行状态。".to_owned(),
+    }
+}
+
+const fn private_message_text(kind: PrivateMessageKind) -> &'static str {
+    match kind {
+        PrivateMessageKind::OwnerSetupGuide => {
+            "Owner setup is incomplete. Copy the /claim command from the claim-code file beside the ChatHygiene database. If the file is missing, restart ChatHygiene."
+        }
+        PrivateMessageKind::OwnerClaimRejected => "claim failed",
     }
 }

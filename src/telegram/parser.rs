@@ -304,6 +304,37 @@ fn bot_message_event(
             occurred_at,
         });
     }
+    match private_start_command(command_text.as_str()) {
+        StartCommand::Exact
+            if ordinary_message
+                && message.chat.kind == "private"
+                && message.chat.id > 0
+                && message.from.as_ref().is_some_and(|user| user.id > 0) =>
+        {
+            return Ok(RawBusinessEvent {
+                kind: RawEventKind::OwnerStart,
+                connection_id: None,
+                chat_id: Some(message.chat.id),
+                message_id: Some(message.message_id),
+                media_group_id: None,
+                content: None,
+                deleted_message_ids: Vec::new(),
+                connection: None,
+                owner_claim: None,
+                owner_command: Some(OwnerCommandSnapshot {
+                    from_user_id: message.from.map(|user| user.id),
+                    private_chat: true,
+                    text: "/start".to_owned(),
+                    replied_sample: None,
+                }),
+                contact_display_name: None,
+                contact_username: None,
+                occurred_at,
+            });
+        }
+        StartCommand::Exact | StartCommand::Malformed => return Ok(ignored_event(occurred_at)),
+        StartCommand::NotStart => {}
+    }
     let looks_like_command = command_text.trim_start().starts_with('/');
     let is_command =
         looks_like_command && owner_command_source_is_authorized(&message, ordinary_message, owner);
@@ -335,6 +366,37 @@ fn bot_message_event(
         contact_username: None,
         occurred_at,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartCommand {
+    NotStart,
+    Exact,
+    Malformed,
+}
+
+fn private_start_command(text: &str) -> StartCommand {
+    if text == "/start" {
+        return StartCommand::Exact;
+    }
+    if let Some(username) = text.strip_prefix("/start@")
+        && (5..=32).contains(&username.len())
+        && username
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        && username.to_ascii_lowercase().ends_with("bot")
+    {
+        return StartCommand::Exact;
+    }
+    if text
+        .trim_start()
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/start"))
+    {
+        StartCommand::Malformed
+    } else {
+        StartCommand::NotStart
+    }
 }
 
 fn owner_command_source_is_authorized(

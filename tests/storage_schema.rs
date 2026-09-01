@@ -49,7 +49,7 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         .fetch_one(&pool)
         .await
         .expect("count migrations");
-    assert_eq!(applied, 7);
+    assert_eq!(applied, 8);
     let key_material = sqlx::query(
         "SELECT singleton, key_version, state, master_seed, seed_checksum,
                 initialized_at, telegram_bot_id

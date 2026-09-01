@@ -421,7 +421,8 @@ async fn concurrent_valid_claims_bind_exactly_one_owner() {
     .unwrap();
     let failures: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM outbox_action
-         WHERE payload_json LIKE '%claim failed%'",
+         WHERE action_type = 'SEND_PRIVATE_MESSAGE'
+           AND json_extract(payload_json, '$.message_kind') = 'OWNER_CLAIM_REJECTED'",
     )
     .fetch_one(&pool)
     .await

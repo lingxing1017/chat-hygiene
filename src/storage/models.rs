@@ -186,6 +186,7 @@ pub enum OutboxActionKind {
     ReadBusinessMessage,
     DeleteBusinessMessages,
     SendOwnerMessage,
+    SendPrivateMessage,
     ProposedDestructiveAction,
 }
 
@@ -197,6 +198,7 @@ impl OutboxActionKind {
             Self::ReadBusinessMessage => "READ_BUSINESS_MESSAGE",
             Self::DeleteBusinessMessages => "DELETE_BUSINESS_MESSAGES",
             Self::SendOwnerMessage => "SEND_OWNER_MESSAGE",
+            Self::SendPrivateMessage => "SEND_PRIVATE_MESSAGE",
             Self::ProposedDestructiveAction => "PROPOSED_DESTRUCTIVE_ACTION",
         }
     }
@@ -212,6 +214,7 @@ impl std::str::FromStr for OutboxActionKind {
             "READ_BUSINESS_MESSAGE" => Ok(Self::ReadBusinessMessage),
             "DELETE_BUSINESS_MESSAGES" => Ok(Self::DeleteBusinessMessages),
             "SEND_OWNER_MESSAGE" => Ok(Self::SendOwnerMessage),
+            "SEND_PRIVATE_MESSAGE" => Ok(Self::SendPrivateMessage),
             "PROPOSED_DESTRUCTIVE_ACTION" => Ok(Self::ProposedDestructiveAction),
             _ => Err(format!("unknown outbox action kind {value}")),
         }

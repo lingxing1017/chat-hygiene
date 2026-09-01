@@ -19,12 +19,156 @@ type BusinessSnapshot = (i64, String, i64);
 type ChallengeSnapshot = (String, String, i64, Option<i64>, String);
 type OutboxSnapshot = (String, String, i64);
 
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct OutboxMigrationSnapshot {
+    id: i64,
+    source_update_id: i64,
+    connection_id: Option<String>,
+    chat_id: Option<i64>,
+    action_type: String,
+    payload_json: String,
+    idempotency_key: String,
+    status: String,
+    attempts: i64,
+    next_attempt_at: Option<String>,
+    last_error: Option<String>,
+    created_at: String,
+    updated_at: String,
+    claimed_at: Option<String>,
+}
+
 fn three_migration_migrator() -> Migrator {
     let full = sqlx::migrate!();
     Migrator {
         migrations: Cow::Owned(full.iter().take(3).cloned().collect()),
         ..Migrator::DEFAULT
     }
+}
+
+fn seven_migration_migrator() -> Migrator {
+    let full = sqlx::migrate!();
+    Migrator {
+        migrations: Cow::Owned(full.iter().take(7).cloned().collect()),
+        ..Migrator::DEFAULT
+    }
+}
+
+async fn seed_private_message_migration_fixture(pool: &sqlx::SqlitePool) {
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES
+         (801, 'test', '{}', 'APPLIED', '2026-08-30T00:00:00Z', '2026-08-30T00:00:00Z'),
+         (802, 'test', '{}', 'APPLIED', '2026-08-30T00:00:00Z', '2026-08-30T00:00:00Z'),
+         (803, 'test', '{}', 'APPLIED', '2026-08-30T00:00:00Z', '2026-08-30T00:00:00Z'),
+         (899, 'test', '{}', 'APPLIED', '2026-08-30T00:00:00Z', '2026-08-30T00:00:00Z')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox_action
+         (id, source_update_id, connection_id, chat_id, action_type, payload_json,
+          idempotency_key, status, attempts, next_attempt_at, last_error, created_at,
+          updated_at, claimed_at)
+         VALUES
+         (11, 801, NULL, NULL, 'SEND_OWNER_MESSAGE', '{\"message\":\"pending\"}',
+          'pending', 'PENDING', 0, NULL, NULL, '2026-08-30T00:00:00Z',
+          '2026-08-30T00:00:00Z', NULL),
+         (12, 802, 'business-1', 42, 'READ_BUSINESS_MESSAGE', '{\"message_id\":9}',
+          'succeeded', 'SUCCEEDED', 2, NULL, NULL, '2026-08-30T00:00:01Z',
+          '2026-08-30T00:00:02Z', '2026-08-30T00:00:01Z'),
+         (13, 803, NULL, NULL, 'SEND_OWNER_MESSAGE', '{\"message\":\"uncertain\"}',
+          'uncertain', 'UNCERTAIN', 1, '2026-08-30T00:00:05Z', 'timeout',
+          '2026-08-30T00:00:03Z', '2026-08-30T00:00:04Z',
+          '2026-08-30T00:00:03Z'),
+         (100, 899, NULL, NULL, 'SEND_OWNER_MESSAGE', '{}', 'sequence-only',
+          'PENDING', 0, NULL, NULL, '2026-08-30T00:00:00Z',
+          '2026-08-30T00:00:00Z', NULL)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM outbox_action WHERE id = 100")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn private_message_migration_preserves_rows_and_autoincrement_sequence() {
+    let (_directory, url) = common::temporary_database();
+    let pool = connect(&url).await.unwrap();
+    seven_migration_migrator().run(&pool).await.unwrap();
+    seed_private_message_migration_fixture(&pool).await;
+    let before: Vec<OutboxMigrationSnapshot> = sqlx::query_as(
+        "SELECT id, source_update_id, connection_id, chat_id, action_type,
+                payload_json, idempotency_key, status, attempts, next_attempt_at,
+                last_error, created_at, updated_at, claimed_at
+         FROM outbox_action ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let sequence_before: i64 =
+        sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = 'outbox_action'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(sequence_before, 100);
+
+    migrate(&pool).await.unwrap();
+
+    let after: Vec<OutboxMigrationSnapshot> = sqlx::query_as(
+        "SELECT id, source_update_id, connection_id, chat_id, action_type,
+                payload_json, idempotency_key, status, attempts, next_attempt_at,
+                last_error, created_at, updated_at, claimed_at
+         FROM outbox_action ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    let sequence_after: i64 =
+        sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = 'outbox_action'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(sequence_after, sequence_before);
+    let foreign_table: String = sqlx::query_scalar(
+        "SELECT \"table\" FROM pragma_foreign_key_list('outbox_action')
+         WHERE \"from\" = 'source_update_id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(foreign_table, "processed_update");
+    let due_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'outbox_due_idx' AND tbl_name = 'outbox_action'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(due_index, 1);
+    sqlx::query(
+        "INSERT INTO outbox_action
+         (source_update_id, action_type, payload_json, idempotency_key, status,
+          attempts, created_at, updated_at)
+         VALUES (899, 'SEND_PRIVATE_MESSAGE',
+                 '{\"chat_id\":42,\"message_kind\":\"OWNER_SETUP_GUIDE\"}',
+                 'new-private', 'PENDING', 0,
+                 '2026-08-30T00:00:00Z', '2026-08-30T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let new_id: i64 =
+        sqlx::query_scalar("SELECT id FROM outbox_action WHERE idempotency_key = 'new-private'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(new_id, 101);
 }
 
 #[tokio::test]
