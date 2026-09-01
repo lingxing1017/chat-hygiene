@@ -18,6 +18,17 @@ impl<'a> UnitOfWork<'a> {
         })
     }
 
+    /// Starts an atomic storage operation while taking `SQLite`'s write lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when `SQLite` cannot begin the transaction.
+    pub async fn begin_immediate(pool: &'a SqlitePool) -> Result<Self, StorageError> {
+        Ok(Self {
+            transaction: pool.begin_with("BEGIN IMMEDIATE").await?,
+        })
+    }
+
     /// Commits every write made through this unit of work.
     ///
     /// # Errors

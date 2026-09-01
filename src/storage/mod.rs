@@ -1,9 +1,11 @@
 mod database;
+mod key_material;
 mod models;
 mod repositories;
 mod uow;
 
 pub use database::{StorageError, connect, migrate};
+pub use key_material::{MasterSeed, load_or_initialize_master_seed, pin_or_verify_telegram_bot_id};
 pub use models::{
     BusinessConnectionRecord, ChallengeRecord, Conversation, ConversationKey, LedgerMessage,
     MessageDirection, NewAuditEvent, NewOutboxAction, OutboxActionKind, OutboxActionRecord,

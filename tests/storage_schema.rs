@@ -30,6 +30,7 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         "challenge",
         "conversation",
         "ham_sample",
+        "key_material",
         "message_ledger",
         "outbox_action",
         "processed_update",
@@ -44,7 +45,38 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         .fetch_one(&pool)
         .await
         .expect("count migrations");
-    assert_eq!(applied, 3);
+    assert_eq!(applied, 4);
+    let key_material = sqlx::query(
+        "SELECT singleton, key_version, state, master_seed, seed_checksum,
+                initialized_at, telegram_bot_id
+         FROM key_material",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read key material sentinel");
+    assert_eq!(key_material.get::<i64, _>("singleton"), 1);
+    assert_eq!(key_material.get::<i64, _>("key_version"), 1);
+    assert_eq!(key_material.get::<String, _>("state"), "PENDING");
+    assert!(
+        key_material
+            .get::<Option<Vec<u8>>, _>("master_seed")
+            .is_none()
+    );
+    assert!(
+        key_material
+            .get::<Option<Vec<u8>>, _>("seed_checksum")
+            .is_none()
+    );
+    assert!(
+        key_material
+            .get::<Option<String>, _>("initialized_at")
+            .is_none()
+    );
+    assert!(
+        key_material
+            .get::<Option<i64>, _>("telegram_bot_id")
+            .is_none()
+    );
     let outbox_columns = sqlx::query("PRAGMA table_info(outbox_action)")
         .fetch_all(&pool)
         .await

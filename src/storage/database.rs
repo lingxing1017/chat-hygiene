@@ -15,6 +15,16 @@ pub enum StorageError {
     ConcurrentModification,
     #[error("invalid persisted data: {0}")]
     InvalidData(String),
+    #[error("operating-system entropy is unavailable")]
+    EntropyUnavailable,
+    #[error("installation key material is missing")]
+    KeyMaterialMissing,
+    #[error("invalid installation key material: {0}")]
+    InvalidKeyMaterial(&'static str),
+    #[error("unsupported installation key version {0}")]
+    UnsupportedKeyVersion(i64),
+    #[error("authenticated Telegram bot does not match this installation")]
+    TelegramBotIdentityMismatch,
 }
 
 /// Opens the single-connection `SQLite` pool used by the MVP worker.
