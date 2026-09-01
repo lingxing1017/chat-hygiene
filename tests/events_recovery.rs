@@ -10,7 +10,8 @@ use chathygiene::events::{
 };
 use chathygiene::processing::LifecycleHandler;
 use chathygiene::storage::{
-    ConversationKey, UnitOfWork, connect, get_or_create_conversation, migrate,
+    ConversationKey, OwnerChatSource, OwnerIdentity, UnitOfWork, connect,
+    get_or_create_conversation, initialize_or_load_owner_identity, load_owner_identity, migrate,
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -274,4 +275,59 @@ async fn legacy_start_challenge_event_defaults_to_version_zero() {
     .await
     .unwrap();
     assert_eq!(version, 0);
+}
+
+#[tokio::test]
+async fn legacy_connection_event_without_chat_keeps_imported_fallback() {
+    let (_directory, pool) = database().await;
+    let now = at("2026-07-14T00:00:00Z");
+    initialize_or_load_owner_identity(&pool, now)
+        .await
+        .expect("import legacy owner");
+    record_prepared_event(
+        &pool,
+        &PreparedEvent::new(
+            60,
+            "lifecycle",
+            now,
+            json!({
+                "connection_id": "business-2",
+                "occurred_at": now,
+                "action": {
+                    "kind": "CONNECTION_CHANGED",
+                    "owner_user_id": 42,
+                    "enabled": true,
+                    "rights_json": "{}"
+                }
+            }),
+        ),
+    )
+    .await
+    .expect("record legacy connection event");
+
+    assert_eq!(
+        recover_recorded_events(&pool, &LifecycleHandler)
+            .await
+            .expect("recover legacy connection event"),
+        1
+    );
+    let mut read = UnitOfWork::begin(&pool).await.expect("begin owner read");
+    let owner = load_owner_identity(&mut read).await.expect("load owner");
+    read.rollback().await.expect("rollback owner read");
+    assert!(matches!(
+        owner,
+        OwnerIdentity::Claimed {
+            owner_user_id: 42,
+            owner_chat_id: 42,
+            owner_chat_source: OwnerChatSource::LegacyFallback,
+            ..
+        }
+    ));
+    let connection_owner: i64 = sqlx::query_scalar(
+        "SELECT owner_user_id FROM business_connection WHERE connection_id = 'business-2'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load recovered connection");
+    assert_eq!(connection_owner, 42);
 }

@@ -7,8 +7,9 @@ use crate::detection::{Decision, DetectionContext, DetectionResult, MessageConte
 use crate::domain::ConversationState;
 use crate::events::PreparedEvent;
 use crate::storage::{
-    ConversationKey, UnitOfWork, active_challenge, find_business_connection, find_conversation,
-    find_single_business_connection,
+    ConversationKey, OwnerIdentity, StorageError, UnitOfWork, active_challenge,
+    find_business_connection, find_conversation, find_single_business_connection,
+    load_owner_identity,
 };
 use crate::telegram::{RawBusinessEvent, RawEventKind};
 use crate::verification::{AnswerKind, ChallengeVerifier};
@@ -23,6 +24,23 @@ pub struct EventPreparer<D, V, C> {
     verifier: V,
     clock: C,
     destructive_mode: bool,
+}
+
+pub(crate) enum OwnerLifecycleState {
+    Pending,
+    Ready(OwnerIdentity),
+}
+
+pub(crate) async fn load_owner_lifecycle_state(
+    uow: &mut UnitOfWork<'_>,
+) -> Result<OwnerLifecycleState, StorageError> {
+    match load_owner_identity(uow).await {
+        Ok(identity) => Ok(OwnerLifecycleState::Ready(identity)),
+        Err(StorageError::InvalidOwnerIdentity("owner identity is pending initialization")) => {
+            Ok(OwnerLifecycleState::Pending)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 impl<D, V, C> EventPreparer<D, V, C>
@@ -54,7 +72,7 @@ where
         uow: &mut UnitOfWork<'_>,
     ) -> Result<PreparedEvent, ProcessingError> {
         let destructive_mode = runtime_destructive_mode(uow, self.destructive_mode).await?;
-        let owner_user_id = trace_owner_user_id(&raw, uow).await?;
+        let (owner_user_id, owner_chat_id) = trace_owner_identity(&raw, uow).await?;
         let state_before = trace_state_before(&raw, uow).await?;
         let (contact_display_name, contact_username) = if destructive_mode {
             (None, None)
@@ -82,6 +100,7 @@ where
                     }))?;
                     PreparedAction::ConnectionChanged {
                         owner_user_id: connection.owner_user_id,
+                        owner_chat_id: connection.owner_chat_id,
                         enabled: connection.enabled,
                         rights_json,
                     }
@@ -115,6 +134,7 @@ where
             contact_display_name,
             contact_username,
             owner_user_id,
+            owner_chat_id,
             event_kind: raw_event_name(raw.kind).to_owned(),
             dry_run: !destructive_mode,
             state_before,
@@ -274,21 +294,39 @@ where
     }
 }
 
-async fn trace_owner_user_id(
+async fn trace_owner_identity(
     raw: &RawBusinessEvent,
     uow: &mut UnitOfWork<'_>,
-) -> Result<Option<i64>, ProcessingError> {
+) -> Result<(Option<i64>, Option<i64>), ProcessingError> {
     if let Some(connection) = raw.connection.as_ref() {
-        return Ok(Some(connection.owner_user_id));
+        return Ok((Some(connection.owner_user_id), connection.owner_chat_id));
     }
     if let Some(connection_id) = raw.connection_id.as_deref()
         && let Some(connection) = find_business_connection(uow, connection_id).await?
     {
-        return Ok(Some(connection.owner_user_id));
+        let chat_id = owner_chat_for_user(uow, connection.owner_user_id).await?;
+        return Ok((Some(connection.owner_user_id), chat_id));
     }
-    Ok(find_single_business_connection(uow)
-        .await?
-        .map(|connection| connection.owner_user_id))
+    let Some(connection) = find_single_business_connection(uow).await? else {
+        return Ok((None, None));
+    };
+    let chat_id = owner_chat_for_user(uow, connection.owner_user_id).await?;
+    Ok((Some(connection.owner_user_id), chat_id))
+}
+
+async fn owner_chat_for_user(
+    uow: &mut UnitOfWork<'_>,
+    owner_user_id: i64,
+) -> Result<Option<i64>, ProcessingError> {
+    Ok(match load_owner_lifecycle_state(uow).await? {
+        OwnerLifecycleState::Pending => Some(owner_user_id),
+        OwnerLifecycleState::Ready(OwnerIdentity::Claimed {
+            owner_user_id: stored_user_id,
+            owner_chat_id,
+            ..
+        }) if stored_user_id == owner_user_id => Some(owner_chat_id),
+        OwnerLifecycleState::Ready(_) => None,
+    })
 }
 
 async fn trace_state_before(

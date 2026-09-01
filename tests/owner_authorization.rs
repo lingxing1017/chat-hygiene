@@ -4,7 +4,9 @@ use chathygiene::owner::{
     OwnerCommand, OwnerCommandError, OwnerCommandService, OwnerCommandSource,
 };
 use chathygiene::processing::ProcessingEngine;
-use chathygiene::storage::UnitOfWork;
+use chathygiene::storage::{
+    OwnerChatSource, UnitOfWork, initialize_or_load_owner_identity, promote_owner_chat,
+};
 use chathygiene::telegram::{RawEventKind, parse_update};
 
 fn source(from_user_id: i64, private_chat: bool) -> OwnerCommandSource {
@@ -133,11 +135,22 @@ fn parser_preserves_explicit_replied_sample_only_for_transient_command_handling(
 #[tokio::test]
 async fn processing_persists_body_only_in_sample_table_and_replies_via_outbox() {
     let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    initialize_or_load_owner_identity(&pool, now)
+        .await
+        .expect("import legacy owner");
+    let mut owner = UnitOfWork::begin_immediate(&pool)
+        .await
+        .expect("begin owner chat promotion");
+    promote_owner_chat(&mut owner, 42, 4200, OwnerChatSource::BusinessConnection)
+        .await
+        .expect("promote owner chat");
+    owner.commit().await.expect("commit owner chat promotion");
     let mut engine = ProcessingEngine::new(
         pool.clone(),
         common::MutableDetector::new(common::DetectorMode::Allow),
         common::FixedVerifier,
-        common::TestClock::new(common::at("2026-07-14T00:00:00Z")),
+        common::TestClock::new(now),
         false,
     );
     let update = br#"{
@@ -145,13 +158,13 @@ async fn processing_persists_body_only_in_sample_table_and_replies_via_outbox() 
       "message": {
         "message_id": 3,
         "from": {"id": 42},
-        "chat": {"id": 42, "type": "private"},
+        "chat": {"id": 4200, "type": "private"},
         "date": 1783987270,
         "text": "/mark_spam",
         "reply_to_message": {
           "message_id": 2,
           "from": {"id": 77},
-          "chat": {"id": 42, "type": "private"},
+          "chat": {"id": 4200, "type": "private"},
           "date": 1783987200,
           "text": "secret promotional body"
         }
@@ -174,14 +187,29 @@ async fn processing_persists_body_only_in_sample_table_and_replies_via_outbox() 
             .await
             .unwrap();
     assert!(!event_json.contains("secret promotional body"));
-    let reply: String = sqlx::query_scalar(
+    let replies: Vec<String> = sqlx::query_scalar(
         "SELECT payload_json FROM outbox_action
-         WHERE source_update_id = 300 AND action_type = 'SEND_OWNER_MESSAGE'",
+         WHERE source_update_id = 300 AND action_type = 'SEND_OWNER_MESSAGE'
+         ORDER BY id",
     )
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
     .unwrap();
-    assert!(reply.contains("sample=spam stored"));
+    assert!(
+        replies
+            .iter()
+            .any(|reply| reply.contains("sample=spam stored"))
+    );
+    let replies = replies
+        .iter()
+        .map(|reply| serde_json::from_str::<serde_json::Value>(reply).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        replies
+            .iter()
+            .all(|reply| reply.get("owner_user_id").is_none())
+    );
+    assert!(replies.iter().any(|reply| reply["owner_chat_id"] == 4200));
 
     let unauthorized = br#"{
       "update_id": 301,

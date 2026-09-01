@@ -28,6 +28,7 @@ pub struct BusinessRights {
 pub struct BusinessConnectionSnapshot {
     pub connection_id: String,
     pub owner_user_id: i64,
+    pub owner_chat_id: Option<i64>,
     pub enabled: bool,
     pub rights: BusinessRights,
 }

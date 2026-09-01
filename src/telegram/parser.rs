@@ -16,6 +16,8 @@ pub enum ParseError {
     InvalidJson(#[from] serde_json::Error),
     #[error("Telegram update contains an invalid timestamp: {0}")]
     InvalidTimestamp(i64),
+    #[error("Telegram Business connection contains an invalid owner chat ID")]
+    InvalidOwnerChatId,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +70,7 @@ struct BotMessage {
 struct BusinessConnection {
     id: String,
     user: User,
+    user_chat_id: i64,
     date: i64,
     can_reply: bool,
     is_enabled: bool,
@@ -170,10 +173,14 @@ fn connection_event(
     if connection.user.id != owner_user_id {
         return Ok(ignored_event(occurred_at));
     }
+    if connection.user_chat_id <= 0 {
+        return Err(ParseError::InvalidOwnerChatId);
+    }
     let connection_id = connection.id.clone();
     let snapshot = BusinessConnectionSnapshot {
         connection_id: connection.id,
         owner_user_id: connection.user.id,
+        owner_chat_id: Some(connection.user_chat_id),
         enabled: connection.is_enabled,
         rights: BusinessRights {
             can_reply: connection.can_reply || connection.rights.can_reply,

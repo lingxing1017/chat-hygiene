@@ -3,9 +3,11 @@ mod common;
 use chathygiene::domain::ConversationState;
 use chathygiene::storage::{
     BusinessConnectionRecord, ChallengeRecord, ConversationKey, LedgerMessage, MessageDirection,
-    SenderKind, StorageError, UnitOfWork, active_challenge, active_owner_reply_ids,
-    close_challenge, connect, create_challenge, eligible_deletion_ids, get_or_create_conversation,
-    mark_message_deleted, migrate, record_message, save_conversation, upsert_business_connection,
+    OwnerChatSource, OwnerIdentity, SenderKind, StorageError, UnitOfWork, active_challenge,
+    active_owner_reply_ids, close_challenge, connect, create_challenge, eligible_deletion_ids,
+    find_business_connection, get_or_create_conversation, initialize_or_load_owner_identity,
+    load_owner_identity, mark_message_deleted, migrate, promote_owner_chat, record_message,
+    save_conversation, upsert_business_connection,
 };
 use chrono::{DateTime, Duration, Utc};
 use sqlx::SqlitePool;
@@ -27,6 +29,35 @@ async fn database() -> (tempfile::TempDir, SqlitePool) {
     .await
     .expect("seed connection");
     (directory, pool)
+}
+
+#[tokio::test]
+async fn connection_owner_user_remains_distinct_from_owner_chat() {
+    let (_directory, pool) = database().await;
+    let now = at("2026-07-14T00:00:00Z");
+    initialize_or_load_owner_identity(&pool, now)
+        .await
+        .expect("import legacy owner");
+    let mut uow = UnitOfWork::begin_immediate(&pool).await.unwrap();
+    promote_owner_chat(&mut uow, 42, 4200, OwnerChatSource::BusinessConnection)
+        .await
+        .expect("promote owner chat");
+    let connection = find_business_connection(&mut uow, "business-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let owner = load_owner_identity(&mut uow).await.unwrap();
+    uow.rollback().await.unwrap();
+
+    assert_eq!(connection.owner_user_id, 42);
+    assert!(matches!(
+        owner,
+        OwnerIdentity::Claimed {
+            owner_user_id: 42,
+            owner_chat_id: 4200,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

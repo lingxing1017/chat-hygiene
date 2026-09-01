@@ -5,6 +5,9 @@ use std::sync::{Arc, Mutex};
 use chathygiene::processing::{
     NewContactNotice, NewContactNotifier, NewContactNotifyError, ProcessingEngine,
 };
+use chathygiene::storage::{
+    OwnerChatSource, UnitOfWork, initialize_or_load_owner_identity, promote_owner_chat,
+};
 
 #[derive(Clone, Default)]
 struct CapturingNotifier {
@@ -35,6 +38,16 @@ impl NewContactNotifier for CapturingNotifier {
 async fn first_inbound_notifies_once_without_live_identity_persistence() {
     let (_directory, pool) = common::processing_database().await;
     let now = common::at("2026-07-14T00:00:00Z");
+    initialize_or_load_owner_identity(&pool, now)
+        .await
+        .expect("import legacy owner");
+    let mut owner = UnitOfWork::begin_immediate(&pool)
+        .await
+        .expect("begin owner chat promotion");
+    promote_owner_chat(&mut owner, 42, 4200, OwnerChatSource::BusinessConnection)
+        .await
+        .expect("promote owner chat");
+    owner.commit().await.expect("commit owner chat promotion");
     let notifier = CapturingNotifier::default();
     let mut engine = ProcessingEngine::new(
         pool.clone(),
@@ -58,6 +71,7 @@ async fn first_inbound_notifies_once_without_live_identity_persistence() {
         notifier.notices.lock().unwrap().as_slice(),
         &[NewContactNotice {
             owner_user_id: 42,
+            owner_chat_id: 4200,
             contact_chat_id: 1001,
             username: Some("live_contact_marker".to_owned()),
         }]

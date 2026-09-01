@@ -329,7 +329,7 @@ pub fn connection_update(update_id: i64, enabled: bool, all_rights: bool) -> Val
         "business_connection": {
             "id": "business-1",
             "user": {"id": 42, "is_bot": false, "first_name": "Owner"},
-            "user_chat_id": 42,
+            "user_chat_id": 4200,
             "date": 1_783_987_200_i64 + update_id,
             "can_reply": all_rights,
             "is_enabled": enabled,

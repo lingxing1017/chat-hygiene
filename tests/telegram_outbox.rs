@@ -6,6 +6,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use chathygiene::processing::ProcessingEngine;
+use chathygiene::storage::{
+    OwnerChatSource, UnitOfWork, initialize_or_load_owner_identity, promote_owner_chat,
+};
 use chathygiene::telegram::{
     BusinessApi, DeleteAction, DispatchOutcome, EditAction, OutboxDispatcher, ReadAction,
     SendAction, SentMessage, TelegramError,
@@ -117,8 +120,21 @@ async fn start_challenge(pool: &sqlx::SqlitePool, now: DateTime<Utc>) {
         .unwrap();
 }
 
+async fn promote_test_owner_chat(pool: &sqlx::SqlitePool, now: DateTime<Utc>) {
+    initialize_or_load_owner_identity(pool, now)
+        .await
+        .expect("import legacy owner");
+    let mut uow = UnitOfWork::begin_immediate(pool)
+        .await
+        .expect("begin owner chat promotion");
+    promote_owner_chat(&mut uow, 42, 4200, OwnerChatSource::BusinessConnection)
+        .await
+        .expect("promote owner chat");
+    uow.commit().await.expect("commit owner chat promotion");
+}
+
 #[tokio::test]
-async fn explicit_owner_message_dispatches_without_business_key() {
+async fn legacy_explicit_owner_message_dispatches_without_business_key() {
     let (_directory, pool) = common::processing_database().await;
     let now = common::at("2026-07-14T00:00:00Z");
     sqlx::query(
@@ -157,6 +173,95 @@ async fn explicit_owner_message_dispatches_without_business_key() {
             business_connection_id: None,
             chat_id: 4242,
             text: "keyless trace".to_owned(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn explicit_owner_chat_message_uses_new_destination_field() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES (701, 'ignored', '{}', 'APPLIED', ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox_action
+         (source_update_id, connection_id, chat_id, action_type, payload_json,
+          idempotency_key, status, attempts, created_at, updated_at)
+         VALUES (701, NULL, NULL, 'SEND_OWNER_MESSAGE',
+          '{\"message\":\"new trace\",\"owner_chat_id\":4200}',
+          '701:DRY_RUN_TRACE', 'PENDING', 0, ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let api = FakeApi::with(vec![Planned::Send(Ok(SentMessage { message_id: 902 }))]);
+    let dispatcher = OutboxDispatcher::new(api.clone());
+
+    assert!(matches!(
+        dispatcher.dispatch_next(now, &pool).await.unwrap(),
+        DispatchOutcome::Succeeded { .. }
+    ));
+    assert_eq!(
+        api.sends.lock().unwrap().as_slice(),
+        &[SendAction {
+            business_connection_id: None,
+            chat_id: 4200,
+            text: "new trace".to_owned(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn keyed_owner_message_resolves_persisted_owner_chat() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    promote_test_owner_chat(&pool, now).await;
+    sqlx::query(
+        "INSERT INTO processed_update
+         (update_id, event_type, event_json, status, received_at, applied_at)
+         VALUES (702, 'ignored', '{}', 'APPLIED', ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox_action
+         (source_update_id, connection_id, chat_id, action_type, payload_json,
+          idempotency_key, status, attempts, created_at, updated_at)
+         VALUES (702, 'business-1', 1001, 'SEND_OWNER_MESSAGE',
+          '{\"message\":\"keyed alert\"}',
+          '702:OWNER_ALERT', 'PENDING', 0, ?, ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let api = FakeApi::with(vec![Planned::Send(Ok(SentMessage { message_id: 903 }))]);
+    let dispatcher = OutboxDispatcher::new(api.clone());
+
+    assert!(matches!(
+        dispatcher.dispatch_next(now, &pool).await.unwrap(),
+        DispatchOutcome::Succeeded { .. }
+    ));
+    assert_eq!(
+        api.sends.lock().unwrap().as_slice(),
+        &[SendAction {
+            business_connection_id: None,
+            chat_id: 4200,
+            text: "keyed alert".to_owned(),
         }]
     );
 }

@@ -14,6 +14,8 @@ pub(crate) struct LifecycleFacts {
     pub contact_username: Option<String>,
     #[serde(default)]
     pub owner_user_id: Option<i64>,
+    #[serde(default)]
+    pub owner_chat_id: Option<i64>,
     #[serde(default = "legacy_event_kind")]
     pub event_kind: String,
     #[serde(default)]
@@ -33,6 +35,8 @@ fn legacy_event_kind() -> String {
 pub(crate) enum PreparedAction {
     ConnectionChanged {
         owner_user_id: i64,
+        #[serde(default)]
+        owner_chat_id: Option<i64>,
         enabled: bool,
         rights_json: String,
     },

@@ -3,6 +3,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewContactNotice {
     pub owner_user_id: i64,
+    pub owner_chat_id: i64,
     pub contact_chat_id: i64,
     pub username: Option<String>,
 }

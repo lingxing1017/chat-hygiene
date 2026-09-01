@@ -17,7 +17,7 @@ use crate::owner::{
 };
 use crate::retention::RetentionService;
 use crate::storage::{
-    ConversationKey, NewOutboxAction, OutboxActionKind, StorageError, UnitOfWork,
+    ConversationKey, NewOutboxAction, OutboxActionKind, OwnerIdentity, StorageError, UnitOfWork,
     enqueue_outbox_action, find_business_connection, find_conversation,
     list_outbox_actions_for_update,
 };
@@ -28,7 +28,7 @@ use crate::verification::ChallengeVerifier;
 
 use super::handler::LifecycleHandler;
 use super::notifications::{NewContactNotice, NewContactNotifier, NoopNewContactNotifier};
-use super::preparer::EventPreparer;
+use super::preparer::{EventPreparer, OwnerLifecycleState, load_owner_lifecycle_state};
 use super::trace::ProcessingTrace;
 
 #[derive(Debug, Error)]
@@ -219,7 +219,6 @@ where
                 &mut uow,
                 update_id,
                 owner_key,
-                connection.owner_user_id,
                 owner_chat_id,
                 owner_message_id,
                 raw.occurred_at,
@@ -291,7 +290,6 @@ async fn enqueue_owner_command_trace(
     uow: &mut UnitOfWork<'_>,
     update_id: i64,
     owner_key: ConversationKey,
-    owner_user_id: i64,
     owner_chat_id: i64,
     owner_message_id: Option<i64>,
     occurred_at: chrono::DateTime<chrono::Utc>,
@@ -307,7 +305,7 @@ async fn enqueue_owner_command_trace(
             kind: OutboxActionKind::SendOwnerMessage,
             payload_json: serde_json::json!({
                 "message": trace.render(),
-                "owner_user_id": owner_user_id,
+                "owner_chat_id": owner_chat_id,
             })
             .to_string(),
             idempotency_key: format!("{update_id}:DRY_RUN_TRACE"),
@@ -346,12 +344,22 @@ async fn first_contact_notice(
     let Some(connection) = find_business_connection(uow, connection_id).await? else {
         return Ok(None);
     };
+    let owner_chat_id = match load_owner_lifecycle_state(uow).await? {
+        OwnerLifecycleState::Pending => connection.owner_user_id,
+        OwnerLifecycleState::Ready(OwnerIdentity::Claimed {
+            owner_user_id,
+            owner_chat_id,
+            ..
+        }) if owner_user_id == connection.owner_user_id => owner_chat_id,
+        OwnerLifecycleState::Ready(_) => return Ok(None),
+    };
     let key = ConversationKey::new(connection_id, contact_chat_id);
     if find_conversation(uow, &key).await?.is_some() {
         return Ok(None);
     }
     Ok(Some(NewContactNotice {
         owner_user_id: connection.owner_user_id,
+        owner_chat_id,
         contact_chat_id,
         username: raw.contact_username.clone(),
     }))

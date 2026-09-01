@@ -5,17 +5,19 @@ use crate::domain::{ConversationState, TransitionEvent, transition};
 use crate::events::{EventApplier, EventError, PreparedEvent};
 use crate::storage::{
     BusinessConnectionRecord, ChallengeRecord, Conversation, ConversationKey, LedgerMessage,
-    MessageDirection, NewAuditEvent, NewOutboxAction, OutboxActionKind, SenderKind, UnitOfWork,
-    active_owner_reply_ids, close_active_challenge, close_challenge, create_challenge,
-    eligible_deletion_ids, enqueue_outbox_action, find_conversation, get_or_create_conversation,
-    increment_challenge_attempts, insert_audit_event, list_outbox_actions_for_update,
-    mark_message_deleted, record_message, save_conversation, upsert_business_connection,
+    MessageDirection, NewAuditEvent, NewOutboxAction, OutboxActionKind, OwnerChatSource,
+    OwnerIdentity, SenderKind, UnitOfWork, active_owner_reply_ids, close_active_challenge,
+    close_challenge, create_challenge, eligible_deletion_ids, enqueue_outbox_action,
+    find_conversation, get_or_create_conversation, increment_challenge_attempts,
+    insert_audit_event, list_outbox_actions_for_update, mark_message_deleted, promote_owner_chat,
+    record_message, save_conversation, upsert_business_connection,
 };
 use crate::telegram::delete_message_batches;
 
 use super::models::{
     DetectionFacts, InboundOutcome, LifecycleFacts, PreparedAction, PreparedSender,
 };
+use super::preparer::{OwnerLifecycleState, load_owner_lifecycle_state};
 use super::trace::ProcessingTrace;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -39,21 +41,22 @@ impl EventApplier for LifecycleHandler {
             match &facts.action {
                 PreparedAction::ConnectionChanged {
                     owner_user_id,
+                    owner_chat_id,
                     enabled,
                     rights_json,
                 } => {
                     let connection_id = facts.connection_id.as_ref().ok_or_else(|| {
                         EventError::Application("connection ID is missing".to_owned())
                     })?;
-                    upsert_business_connection(
+                    self.apply_connection_change(
+                        event.update_id,
+                        connection_id,
+                        *owner_user_id,
+                        *owner_chat_id,
+                        *enabled,
+                        rights_json,
+                        facts.occurred_at,
                         uow,
-                        &BusinessConnectionRecord {
-                            connection_id: connection_id.clone(),
-                            owner_user_id: *owner_user_id,
-                            rights_json: rights_json.clone(),
-                            enabled: *enabled,
-                            updated_at: facts.occurred_at,
-                        },
                     )
                     .await?;
                 }
@@ -115,6 +118,82 @@ impl EventApplier for LifecycleHandler {
 }
 
 impl LifecycleHandler {
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_connection_change(
+        self,
+        update_id: i64,
+        connection_id: &str,
+        owner_user_id: i64,
+        owner_chat_id: Option<i64>,
+        enabled: bool,
+        rights_json: &str,
+        occurred_at: chrono::DateTime<Utc>,
+        uow: &mut UnitOfWork<'_>,
+    ) -> Result<(), EventError> {
+        match load_owner_lifecycle_state(uow).await? {
+            OwnerLifecycleState::Pending => {}
+            OwnerLifecycleState::Ready(OwnerIdentity::Unclaimed) => {
+                insert_owner_identity_audit(
+                    uow,
+                    update_id,
+                    "connection_received_before_owner_claim",
+                    occurred_at,
+                )
+                .await?;
+                return Ok(());
+            }
+            OwnerLifecycleState::Ready(OwnerIdentity::Claimed {
+                owner_user_id: stored_user_id,
+                owner_chat_id: stored_chat_id,
+                owner_chat_source,
+                ..
+            }) => {
+                if stored_user_id != owner_user_id {
+                    insert_owner_identity_audit(
+                        uow,
+                        update_id,
+                        "connection_owner_mismatch",
+                        occurred_at,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                if let Some(owner_chat_id) = owner_chat_id {
+                    if owner_chat_source != OwnerChatSource::LegacyFallback
+                        && owner_chat_id != stored_chat_id
+                    {
+                        insert_owner_identity_audit(
+                            uow,
+                            update_id,
+                            "connection_owner_chat_mismatch",
+                            occurred_at,
+                        )
+                        .await?;
+                    }
+                    promote_owner_chat(
+                        uow,
+                        owner_user_id,
+                        owner_chat_id,
+                        OwnerChatSource::BusinessConnection,
+                    )
+                    .await?;
+                }
+            }
+        }
+        upsert_business_connection(
+            uow,
+            &BusinessConnectionRecord {
+                connection_id: connection_id.to_owned(),
+                owner_user_id,
+                rights_json: rights_json.to_owned(),
+                enabled,
+                updated_at: occurred_at,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn enqueue_dry_run_trace(
         self,
         event: &PreparedEvent,
@@ -131,6 +210,7 @@ impl LifecycleHandler {
             );
             return Ok(());
         };
+        let owner_chat_id = facts.owner_chat_id.unwrap_or(owner_user_id);
         let key = facts.optional_key();
         let state_after = if let Some(key) = key.as_ref() {
             find_conversation(uow, key)
@@ -150,7 +230,7 @@ impl LifecycleHandler {
                 kind: OutboxActionKind::SendOwnerMessage,
                 payload_json: json!({
                     "message": trace.render(),
-                    "owner_user_id": owner_user_id,
+                    "owner_chat_id": owner_chat_id,
                 })
                 .to_string(),
                 idempotency_key: format!("{}:DRY_RUN_TRACE", event.update_id),
@@ -724,6 +804,34 @@ async fn insert_detection_audit(
                 .as_ref()
                 .map(|_| "detector_failed".to_owned()),
             error_message: detection.error.clone(),
+            occurred_at,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn insert_owner_identity_audit(
+    uow: &mut UnitOfWork<'_>,
+    update_id: i64,
+    error_code: &str,
+    occurred_at: chrono::DateTime<Utc>,
+) -> Result<(), EventError> {
+    insert_audit_event(
+        uow,
+        &NewAuditEvent {
+            source_update_id: update_id,
+            key: None,
+            event_kind: "owner_identity_security".to_owned(),
+            state_before: None,
+            state_after: None,
+            score: None,
+            reasons_json: None,
+            rule_ids_json: None,
+            normalized_hash: None,
+            rule_version: None,
+            error_code: Some(error_code.to_owned()),
+            error_message: None,
             occurred_at,
         },
     )

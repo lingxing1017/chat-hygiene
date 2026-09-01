@@ -6,9 +6,9 @@ use thiserror::Error;
 
 use crate::storage::{
     BusinessConnectionRecord, ChallengeRecord, ConversationKey, NewOutboxAction, OutboxActionKind,
-    OutboxActionRecord, StorageError, UnitOfWork, claim_due_outbox_action,
+    OutboxActionRecord, OwnerIdentity, StorageError, UnitOfWork, claim_due_outbox_action,
     disable_business_connection, enqueue_outbox_action, find_business_connection,
-    find_challenge_by_id, mark_challenge_sent, mark_challenge_uncertain,
+    find_challenge_by_id, load_owner_identity, mark_challenge_sent, mark_challenge_uncertain,
     mark_outbox_permanent_failure, mark_outbox_retry, mark_outbox_succeeded, mark_outbox_uncertain,
 };
 
@@ -178,19 +178,18 @@ impl<C: BusinessApi> OutboxDispatcher<C> {
             }
             OutboxActionKind::SendOwnerMessage => {
                 let payload: OwnerAlertPayload = parse_payload(action)?;
-                let owner_user_id = if let Some(owner_user_id) = payload.owner_user_id {
+                let owner_chat_id = if let Some(owner_chat_id) = payload.owner_chat_id {
+                    owner_chat_id
+                } else if let Some(owner_user_id) = payload.owner_user_id {
                     owner_user_id
                 } else {
                     let key = required_key(action)?;
-                    load_connection(pool, &key.connection_id)
-                        .await?
-                        .ok_or(ActionFailure::RightsUnavailable)?
-                        .owner_user_id
+                    load_owner_chat(pool, &key.connection_id).await?
                 };
                 self.client
                     .send_business_message(&SendAction {
                         business_connection_id: None,
-                        chat_id: owner_user_id,
+                        chat_id: owner_chat_id,
                         text: owner_alert_text(&payload),
                     })
                     .await?;
@@ -309,6 +308,7 @@ struct OwnerAlertPayload {
     alert: Option<String>,
     message: Option<String>,
     challenge_id: Option<i64>,
+    owner_chat_id: Option<i64>,
     owner_user_id: Option<i64>,
 }
 
@@ -488,6 +488,25 @@ async fn load_connection(
     let connection = find_business_connection(&mut uow, connection_id).await?;
     uow.rollback().await?;
     Ok(connection)
+}
+
+async fn load_owner_chat(pool: &SqlitePool, connection_id: &str) -> Result<i64, ActionFailure> {
+    let mut uow = UnitOfWork::begin(pool).await?;
+    let owner_chat_id = match load_owner_identity(&mut uow).await {
+        Err(StorageError::InvalidOwnerIdentity("owner identity is pending initialization")) => {
+            find_business_connection(&mut uow, connection_id)
+                .await?
+                .ok_or(ActionFailure::RightsUnavailable)?
+                .owner_user_id
+        }
+        Ok(OwnerIdentity::Claimed { owner_chat_id, .. }) => owner_chat_id,
+        Ok(OwnerIdentity::Unclaimed) => {
+            return Err(ActionFailure::RightsUnavailable);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    uow.rollback().await?;
+    Ok(owner_chat_id)
 }
 
 async fn load_challenge(

@@ -2,7 +2,9 @@ mod common;
 
 use chathygiene::events::{record_prepared_event, recover_recorded_events};
 use chathygiene::processing::{EventPreparer, LifecycleHandler, ProcessingEngine};
-use chathygiene::storage::UnitOfWork;
+use chathygiene::storage::{
+    OwnerChatSource, UnitOfWork, initialize_or_load_owner_identity, promote_owner_chat,
+};
 use chathygiene::telegram::{RawEventKind, parse_update};
 
 const CHALLENGE_TRACE: &str = concat!(
@@ -254,6 +256,16 @@ async fn dry_run_traces_every_supported_lifecycle_event() {
 async fn dry_run_owner_command_emits_one_trace_without_command_text() {
     let (_directory, pool) = common::processing_database().await;
     let now = common::at("2026-07-14T00:00:00Z");
+    initialize_or_load_owner_identity(&pool, now)
+        .await
+        .expect("import legacy owner");
+    let mut owner = UnitOfWork::begin_immediate(&pool)
+        .await
+        .expect("begin owner chat promotion");
+    promote_owner_chat(&mut owner, 42, 4200, OwnerChatSource::BusinessConnection)
+        .await
+        .expect("promote owner chat");
+    owner.commit().await.expect("commit owner chat promotion");
     let mut engine = ProcessingEngine::new(
         pool.clone(),
         common::MutableDetector::new(common::DetectorMode::Allow),
@@ -267,7 +279,7 @@ async fn dry_run_owner_command_emits_one_trace_without_command_text() {
           "message": {
             "message_id": 30,
             "from": {"id": 42},
-            "chat": {"id": 42, "type": "private"},
+            "chat": {"id": 4200, "type": "private"},
             "date": 1783987300,
             "text": "/health"
           }
@@ -287,6 +299,18 @@ async fn dry_run_owner_command_emits_one_trace_without_command_text() {
     assert!(traces[0].contains("- EXECUTE_OWNER_COMMAND：APPLIED"));
     assert!(traces[0].contains("- SEND_OWNER_MESSAGE：QUEUED"));
     assert!(!traces[0].contains("/health"));
+    let payload: serde_json::Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>(
+            "SELECT payload_json FROM outbox_action
+             WHERE source_update_id = 200 AND idempotency_key = '200:DRY_RUN_TRACE'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["owner_chat_id"], 4200);
+    assert!(payload.get("owner_user_id").is_none());
 }
 
 #[tokio::test]

@@ -28,11 +28,7 @@ where
         while let Some(notice) = receiver.recv().await {
             let owner_user_id = notice.owner_user_id;
             let contact_chat_id = notice.contact_chat_id;
-            let action = SendAction {
-                business_connection_id: None,
-                chat_id: owner_user_id,
-                text: new_contact_text(&notice),
-            };
+            let action = new_contact_action(&notice);
             if client.send_business_message(&action).await.is_err() {
                 tracing::warn!(
                     owner_user_id,
@@ -43,6 +39,14 @@ where
         }
     });
     NewContactNotifierHandle { sender }
+}
+
+fn new_contact_action(notice: &NewContactNotice) -> SendAction {
+    SendAction {
+        business_connection_id: None,
+        chat_id: notice.owner_chat_id,
+        text: new_contact_text(notice),
+    }
 }
 
 fn new_contact_text(notice: &NewContactNotice) -> String {
@@ -63,13 +67,27 @@ fn new_contact_text(notice: &NewContactNotice) -> String {
 mod tests {
     use crate::processing::NewContactNotice;
 
-    use super::new_contact_text;
+    use super::{new_contact_action, new_contact_text};
+
+    #[test]
+    fn routes_notification_to_owner_chat_without_business_connection() {
+        let action = new_contact_action(&NewContactNotice {
+            owner_user_id: 42,
+            owner_chat_id: 4200,
+            contact_chat_id: 1001,
+            username: Some("sample_user".to_owned()),
+        });
+
+        assert_eq!(action.business_connection_id, None);
+        assert_eq!(action.chat_id, 4200);
+    }
 
     #[test]
     fn renders_username_and_numeric_owner_commands() {
         assert_eq!(
             new_contact_text(&NewContactNotice {
                 owner_user_id: 42,
+                owner_chat_id: 4200,
                 contact_chat_id: 1001,
                 username: Some("sample_user".to_owned()),
             }),
@@ -82,6 +100,7 @@ mod tests {
         assert_eq!(
             new_contact_text(&NewContactNotice {
                 owner_user_id: 42,
+                owner_chat_id: 4200,
                 contact_chat_id: 1001,
                 username: None,
             }),

@@ -13,11 +13,36 @@ fn parses_connection_rights_and_ignores_unknown_fields() {
     let connection = parsed.event.connection.expect("connection snapshot");
     assert_eq!(connection.connection_id, "business-1");
     assert_eq!(connection.owner_user_id, 42);
+    assert_eq!(connection.owner_chat_id, Some(4200));
     assert!(connection.enabled);
     assert!(connection.rights.can_reply);
     assert!(connection.rights.can_read_messages);
     assert!(connection.rights.can_delete_sent_messages);
     assert!(connection.rights.can_delete_all_messages);
+}
+
+#[test]
+fn rejects_missing_or_invalid_business_owner_chat_ids() {
+    for invalid in [
+        None,
+        Some(serde_json::Value::from(0)),
+        Some(serde_json::Value::from(-1)),
+        Some(serde_json::Value::from("chat")),
+    ] {
+        let mut update: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/telegram/business_connection.json"))
+                .unwrap();
+        match invalid {
+            Some(value) => update["business_connection"]["user_chat_id"] = value,
+            None => {
+                update["business_connection"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("user_chat_id");
+            }
+        }
+        assert!(parse_update(&serde_json::to_vec(&update).unwrap(), 42).is_err());
+    }
 }
 
 #[test]
