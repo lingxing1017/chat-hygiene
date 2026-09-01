@@ -117,6 +117,50 @@ fn versioned_verifier_marks_generated_challenges() {
 }
 
 #[test]
+fn persisted_expression_signing_matches_frozen_hmac() {
+    let verifier = ArithmeticVerifier::new_with_key_version(
+        StdRng::seed_from_u64(17),
+        SecretSlice::from(
+            hex::decode("bd442488308239145955b5d27edefe6f3b3c12e7996f099def53e114477253cb")
+                .unwrap(),
+        ),
+        1,
+    );
+    let hmac = verifier.answer_hmac_for_expression("7 + 5 - 3").unwrap();
+    assert!(
+        hmac == "bd1ceaa24bdf20a8f2311171aa2bce5155ce12f48928a838b90fe837c28061ba",
+        "persisted expression HMAC no longer matches the frozen vector"
+    );
+}
+
+#[test]
+fn persisted_expression_signing_rejects_noncanonical_or_out_of_range_input() {
+    let verifier = ArithmeticVerifier::new_with_key_version(
+        StdRng::seed_from_u64(19),
+        SecretSlice::from(b"version-one-key".to_vec()),
+        1,
+    );
+    for invalid in [
+        "7+5-3",
+        "7  + 5 - 3",
+        "7\t+\t5 - 3",
+        "7\n+ 5 - 3",
+        "7 / 1 + 2",
+        "-1 + 2 + 3",
+        "100 + 0 + 0",
+        "7 + 5",
+        "7 + 5 - 3 extra",
+        "99 × 99 - 0",
+    ] {
+        let error = verifier.answer_hmac_for_expression(invalid).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "persisted challenge expression is invalid"
+        );
+    }
+}
+
+#[test]
 fn generates_one_thousand_bounded_challenges() {
     let mut verifier = verifier(42);
     let now = at("2026-07-14T00:00:00Z");

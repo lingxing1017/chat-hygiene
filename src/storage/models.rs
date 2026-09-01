@@ -116,6 +116,13 @@ pub struct ChallengeRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChallengeHmacUpgradeRecord {
+    pub id: i64,
+    pub expression: String,
+    pub hmac_key_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BusinessConnectionRecord {
     pub connection_id: String,
     pub owner_user_id: i64,

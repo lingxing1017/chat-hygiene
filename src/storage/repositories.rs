@@ -6,8 +6,9 @@ use sqlx::FromRow;
 use crate::domain::ConversationState;
 
 use super::models::{
-    BusinessConnectionRecord, ChallengeRecord, Conversation, ConversationKey, LedgerMessage,
-    NewAuditEvent, NewOutboxAction, OutboxActionKind, OutboxActionRecord,
+    BusinessConnectionRecord, ChallengeHmacUpgradeRecord, ChallengeRecord, Conversation,
+    ConversationKey, LedgerMessage, NewAuditEvent, NewOutboxAction, OutboxActionKind,
+    OutboxActionRecord,
 };
 use super::{StorageError, UnitOfWork};
 
@@ -378,6 +379,65 @@ pub async fn active_challenge(
     .fetch_optional(uow.connection())
     .await?;
     row.map(TryInto::try_into).transpose()
+}
+
+/// Lists open challenges whose HMAC was produced by another protocol version.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when `SQLite` cannot read the ordered challenge set.
+pub async fn active_challenges_not_on_version(
+    uow: &mut UnitOfWork<'_>,
+    target_version: i64,
+) -> Result<Vec<ChallengeHmacUpgradeRecord>, StorageError> {
+    Ok(sqlx::query_as::<_, (i64, String, i64)>(
+        "SELECT id, expression, hmac_key_version
+         FROM challenge
+         WHERE closed_at IS NULL AND hmac_key_version != ?
+         ORDER BY id ASC",
+    )
+    .bind(target_version)
+    .fetch_all(uow.connection())
+    .await?
+    .into_iter()
+    .map(
+        |(id, expression, hmac_key_version)| ChallengeHmacUpgradeRecord {
+            id,
+            expression,
+            hmac_key_version,
+        },
+    )
+    .collect())
+}
+
+/// Replaces one open challenge HMAC using a version-checked compare-and-swap.
+///
+/// # Errors
+///
+/// Returns [`StorageError::ConcurrentModification`] when the row is absent,
+/// closed, or no longer on `from_version`; database failures are propagated.
+pub async fn replace_challenge_hmac(
+    uow: &mut UnitOfWork<'_>,
+    challenge_id: i64,
+    from_version: i64,
+    to_version: i64,
+    answer_hmac: &str,
+) -> Result<(), StorageError> {
+    let result = sqlx::query(
+        "UPDATE challenge
+         SET answer_hmac = ?, hmac_key_version = ?
+         WHERE id = ? AND closed_at IS NULL AND hmac_key_version = ?",
+    )
+    .bind(answer_hmac)
+    .bind(to_version)
+    .bind(challenge_id)
+    .bind(from_version)
+    .execute(uow.connection())
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(StorageError::ConcurrentModification);
+    }
+    Ok(())
 }
 
 /// Closes an active challenge exactly once.
