@@ -105,9 +105,6 @@ impl BusinessApi for StartupFake {
 fn settings(database_url: String) -> Arc<Settings> {
     Arc::new(Settings {
         bot_token: SecretString::from("token-sentinel".to_owned()),
-        webhook_secret: SecretString::from("old-webhook-sentinel".to_owned()),
-        challenge_hmac_key: SecretString::from("old-challenge-sentinel".to_owned()),
-        owner_user_id: 999_999,
         public_webhook_url: "https://runtime.example/telegram/webhook".parse().unwrap(),
         database_url,
         destructive_mode: false,

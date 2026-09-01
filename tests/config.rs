@@ -5,12 +5,6 @@ use chathygiene::config::{ConfigError, Settings};
 fn valid_values() -> HashMap<String, String> {
     HashMap::from([
         ("CHATHYGIENE_BOT_TOKEN".into(), "bot-token".into()),
-        ("CHATHYGIENE_WEBHOOK_SECRET".into(), "webhook-secret".into()),
-        (
-            "CHATHYGIENE_CHALLENGE_HMAC_KEY".into(),
-            "challenge-key".into(),
-        ),
-        ("CHATHYGIENE_OWNER_USER_ID".into(), "42".into()),
         (
             "CHATHYGIENE_PUBLIC_WEBHOOK_URL".into(),
             "https://chat.example.net/telegram/webhook".into(),
@@ -27,23 +21,41 @@ fn defaults_to_dry_run() {
 }
 
 #[test]
-fn rejects_empty_secret() {
+fn rejects_empty_bot_token() {
     let mut values = valid_values();
-    values.insert("CHATHYGIENE_WEBHOOK_SECRET".into(), "   ".into());
+    values.insert("CHATHYGIENE_BOT_TOKEN".into(), "   ".into());
 
-    let error = Settings::from_map(&values).expect_err("empty secret must fail");
+    let error = Settings::from_map(&values).expect_err("empty bot token must fail");
 
-    assert_eq!(error, ConfigError::Empty("CHATHYGIENE_WEBHOOK_SECRET"));
+    assert_eq!(error, ConfigError::Empty("CHATHYGIENE_BOT_TOKEN"));
 }
 
 #[test]
-fn rejects_non_positive_owner() {
+fn old_installation_variables_are_ignored() {
     let mut values = valid_values();
-    values.insert("CHATHYGIENE_OWNER_USER_ID".into(), "0".into());
+    values.insert(
+        "CHATHYGIENE_WEBHOOK_SECRET".into(),
+        "legacy-webhook-sentinel".into(),
+    );
+    values.insert(
+        "CHATHYGIENE_CHALLENGE_HMAC_KEY".into(),
+        "legacy-challenge-sentinel".into(),
+    );
+    values.insert(
+        "CHATHYGIENE_OWNER_USER_ID".into(),
+        "legacy-owner-sentinel".into(),
+    );
 
-    let error = Settings::from_map(&values).expect_err("zero owner id must fail");
+    let settings = Settings::from_map(&values).expect("legacy variables are ignored");
+    let rendered = format!("{settings:?}");
 
-    assert_eq!(error, ConfigError::InvalidOwnerUserId);
+    for sentinel in [
+        "legacy-webhook-sentinel",
+        "legacy-challenge-sentinel",
+        "legacy-owner-sentinel",
+    ] {
+        assert!(!rendered.contains(sentinel));
+    }
 }
 
 #[test]
@@ -142,8 +154,6 @@ fn redacts_the_complete_public_webhook_url() {
         "sentinel-password",
         "sentinel-query",
         "bot-token",
-        "webhook-secret",
-        "challenge-key",
     ] {
         assert!(!rendered.contains(sentinel));
     }
