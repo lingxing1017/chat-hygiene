@@ -67,6 +67,8 @@ pub(crate) enum InboundOutcome {
     StartChallenge {
         expression: String,
         answer_hmac: String,
+        #[serde(default)]
+        hmac_key_version: i64,
         created_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,
         max_attempts: u8,

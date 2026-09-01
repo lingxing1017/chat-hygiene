@@ -223,6 +223,11 @@ where
                 if raw_kind == RawEventKind::EditedInboundMessage {
                     return Ok(InboundOutcome::Retain);
                 }
+                if challenge.hmac_key_version != self.verifier.key_version() {
+                    return Err(ProcessingError::InvalidEvent(
+                        "challenge HMAC key version does not match verifier".to_owned(),
+                    ));
+                }
                 let raw_answer = content.text.as_deref().unwrap_or_default();
                 Ok(
                     match self.verifier.evaluate(raw_answer, &challenge.answer_hmac) {
@@ -261,6 +266,7 @@ where
         InboundOutcome::StartChallenge {
             expression: challenge.expression,
             answer_hmac: challenge.answer_hmac,
+            hmac_key_version: challenge.hmac_key_version,
             created_at: challenge.created_at,
             expires_at: challenge.expires_at,
             max_attempts: challenge.max_attempts,

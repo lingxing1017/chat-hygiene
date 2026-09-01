@@ -4,7 +4,7 @@ use chathygiene::verification::{
 use chrono::{DateTime, Duration, Utc};
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
-use secrecy::SecretString;
+use secrecy::{SecretSlice, SecretString};
 
 fn at(value: &str) -> DateTime<Utc> {
     value.parse().expect("valid timestamp")
@@ -97,9 +97,23 @@ fn challenge_has_two_minute_deadline_and_three_attempts() {
     assert_eq!(challenge.created_at, now);
     assert_eq!(challenge.expires_at, now + Duration::minutes(2));
     assert_eq!(challenge.max_attempts, 3);
+    assert_eq!(challenge.hmac_key_version, 0);
     assert!(!challenge.is_expired(challenge.expires_at - Duration::nanoseconds(1)));
     assert!(challenge.is_expired(challenge.expires_at));
     assert_ne!(challenge.answer_hmac, solve(&challenge).to_string());
+}
+
+#[test]
+fn versioned_verifier_marks_generated_challenges() {
+    let mut verifier = ArithmeticVerifier::new_with_key_version(
+        StdRng::seed_from_u64(13),
+        SecretSlice::from(b"version-one-key".to_vec()),
+        1,
+    );
+    let challenge = verifier.generate(at("2026-07-14T00:00:00Z"));
+
+    assert_eq!(verifier.key_version(), 1);
+    assert_eq!(challenge.hmac_key_version, 1);
 }
 
 #[test]

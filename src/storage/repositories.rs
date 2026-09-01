@@ -32,6 +32,7 @@ struct ChallengeRow {
     chat_id: i64,
     expression: String,
     answer_hmac: String,
+    hmac_key_version: i64,
     created_at: String,
     expires_at: String,
     attempts_used: i64,
@@ -337,14 +338,15 @@ pub async fn create_challenge(
 ) -> Result<i64, StorageError> {
     let result = sqlx::query(
         "INSERT INTO challenge
-         (connection_id, chat_id, expression, answer_hmac, created_at, expires_at,
+         (connection_id, chat_id, expression, answer_hmac, hmac_key_version, created_at, expires_at,
           attempts_used, max_attempts, prompt_message_id, delivery_status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&challenge.key.connection_id)
     .bind(challenge.key.chat_id)
     .bind(&challenge.expression)
     .bind(&challenge.answer_hmac)
+    .bind(challenge.hmac_key_version)
     .bind(challenge.created_at.to_rfc3339())
     .bind(challenge.expires_at.to_rfc3339())
     .bind(challenge.attempts_used)
@@ -366,7 +368,7 @@ pub async fn active_challenge(
     key: &ConversationKey,
 ) -> Result<Option<ChallengeRecord>, StorageError> {
     let row = sqlx::query_as::<_, ChallengeRow>(
-        "SELECT id, connection_id, chat_id, expression, answer_hmac, created_at,
+        "SELECT id, connection_id, chat_id, expression, answer_hmac, hmac_key_version, created_at,
                 expires_at, attempts_used, max_attempts, prompt_message_id,
                 delivery_status
          FROM challenge WHERE connection_id = ? AND chat_id = ? AND closed_at IS NULL",
@@ -663,7 +665,7 @@ pub async fn find_challenge_by_id(
     challenge_id: i64,
 ) -> Result<Option<ChallengeRecord>, StorageError> {
     let row = sqlx::query_as::<_, ChallengeRow>(
-        "SELECT id, connection_id, chat_id, expression, answer_hmac, created_at,
+        "SELECT id, connection_id, chat_id, expression, answer_hmac, hmac_key_version, created_at,
                 expires_at, attempts_used, max_attempts, prompt_message_id,
                 delivery_status
          FROM challenge WHERE id = ?",
@@ -863,6 +865,7 @@ impl TryFrom<ChallengeRow> for ChallengeRecord {
             key: ConversationKey::new(row.connection_id, row.chat_id),
             expression: row.expression,
             answer_hmac: row.answer_hmac,
+            hmac_key_version: row.hmac_key_version,
             created_at: parse_timestamp(&row.created_at)?,
             expires_at: parse_timestamp(&row.expires_at)?,
             attempts_used: row.attempts_used,

@@ -2,7 +2,11 @@ mod common;
 
 use chathygiene::processing::ProcessingEngine;
 use chathygiene::telegram::RawEventKind;
+use chathygiene::verification::ArithmeticVerifier;
 use chrono::Duration;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use secrecy::SecretSlice;
 
 #[tokio::test]
 async fn verification_handles_success_exhaustion_and_expiry() {
@@ -115,6 +119,127 @@ async fn new_non_spam_replies_consume_attempts_but_edits_do_not() {
     edited.kind = RawEventKind::EditedInboundMessage;
     engine.process(23, edited).await.unwrap();
     assert_eq!(challenge_attempts(&pool, 2001).await, 2);
+}
+
+#[tokio::test]
+async fn verifier_version_mismatch_leaves_verification_state_unchanged() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    let detector = common::MutableDetector::new(common::DetectorMode::Allow);
+    let mut legacy = ProcessingEngine::new(
+        pool.clone(),
+        detector.clone(),
+        common::FixedVerifier,
+        common::TestClock::new(now),
+        true,
+    );
+    legacy
+        .process(100, common::inbound(3001, 1, Some("hello"), now))
+        .await
+        .unwrap();
+    let before_conversation: (String, i64) =
+        sqlx::query_as("SELECT state, state_version FROM conversation WHERE chat_id = 3001")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let before_challenge: (i64, i64, String, Option<String>) = sqlx::query_as(
+        "SELECT hmac_key_version, attempts_used, delivery_status, closed_at
+         FROM challenge WHERE chat_id = 3001",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let before_outbox: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outbox_action WHERE chat_id = 3001")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let verifier = ArithmeticVerifier::new_with_key_version(
+        StdRng::seed_from_u64(1),
+        SecretSlice::from(b"version-one".to_vec()),
+        1,
+    );
+    let mut current = ProcessingEngine::new(
+        pool.clone(),
+        detector,
+        verifier,
+        common::TestClock::new(now),
+        true,
+    );
+    let error = current
+        .process(101, common::inbound(3001, 2, Some("9"), now))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        chathygiene::processing::ProcessingError::InvalidEvent(_)
+    ));
+    assert_eq!(
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT state, state_version FROM conversation WHERE chat_id = 3001",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        before_conversation
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (i64, i64, String, Option<String>)>(
+            "SELECT hmac_key_version, attempts_used, delivery_status, closed_at
+             FROM challenge WHERE chat_id = 3001",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        before_challenge
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbox_action WHERE chat_id = 3001")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        before_outbox
+    );
+
+    legacy
+        .process(101, common::inbound(3001, 2, Some("9"), now))
+        .await
+        .unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM conversation WHERE chat_id = 3001")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "VERIFIED_WAITING_OWNER");
+}
+
+#[tokio::test]
+async fn current_start_challenge_event_serializes_key_version() {
+    let (_directory, pool) = common::processing_database().await;
+    let now = common::at("2026-07-14T00:00:00Z");
+    let verifier = ArithmeticVerifier::new_with_key_version(
+        StdRng::seed_from_u64(2),
+        SecretSlice::from(b"version-one".to_vec()),
+        1,
+    );
+    let mut engine = ProcessingEngine::new(
+        pool.clone(),
+        common::MutableDetector::new(common::DetectorMode::Allow),
+        verifier,
+        common::TestClock::new(now),
+        true,
+    );
+    engine
+        .process(110, common::inbound(3101, 1, Some("hello"), now))
+        .await
+        .unwrap();
+    let event_json: String =
+        sqlx::query_scalar("SELECT event_json FROM processed_update WHERE update_id = 110")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+    assert_eq!(event["facts"]["action"]["outcome"]["hmac_key_version"], 1);
 }
 
 async fn challenge_attempts(pool: &sqlx::SqlitePool, chat_id: i64) -> i64 {

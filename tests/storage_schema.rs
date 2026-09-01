@@ -45,7 +45,7 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         .fetch_one(&pool)
         .await
         .expect("count migrations");
-    assert_eq!(applied, 4);
+    assert_eq!(applied, 5);
     let key_material = sqlx::query(
         "SELECT singleton, key_version, state, master_seed, seed_checksum,
                 initialized_at, telegram_bot_id
@@ -85,6 +85,14 @@ async fn migration_is_idempotent_and_creates_expected_tables() {
         .map(|row| row.get::<String, _>("name"))
         .collect::<BTreeSet<_>>();
     assert!(outbox_columns.contains("claimed_at"));
+    let challenge_columns = sqlx::query("PRAGMA table_info(challenge)")
+        .fetch_all(&pool)
+        .await
+        .expect("list challenge columns")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<BTreeSet<_>>();
+    assert!(challenge_columns.contains("hmac_key_version"));
     let runtime_override: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM runtime_setting WHERE key = 'destructive_mode'")
             .fetch_one(&pool)
@@ -157,6 +165,14 @@ async fn schema_enforces_identity_and_active_challenge_constraints() {
     .execute(&pool)
     .await
     .expect("insert first active challenge");
+    let default_version: i64 = sqlx::query_scalar(
+        "SELECT hmac_key_version FROM challenge
+         WHERE connection_id = 'business-1' AND chat_id = 100",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read legacy challenge key version");
+    assert_eq!(default_version, 0);
 
     let second_active_challenge = sqlx::query(
         "INSERT INTO challenge

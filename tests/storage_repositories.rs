@@ -164,6 +164,7 @@ async fn challenge_repository_closes_the_single_active_challenge() {
         key.clone(),
         "7 + 5 - 3",
         "answer-hmac",
+        1,
         now,
         now + Duration::minutes(2),
     );
@@ -176,6 +177,7 @@ async fn challenge_repository_closes_the_single_active_challenge() {
         .expect("active challenge");
     assert_eq!(active.id, id);
     assert_eq!(active.attempts_used, 0);
+    assert_eq!(active.hmac_key_version, 1);
 
     assert!(
         close_challenge(&mut uow, id, now + Duration::seconds(30))
@@ -219,6 +221,7 @@ async fn seed_replacement_fixture(pool: &SqlitePool, created_at: DateTime<Utc>) 
             old_key,
             "7 + 5 - 3",
             "answer-hmac",
+            0,
             created_at,
             created_at + Duration::minutes(2),
         ),

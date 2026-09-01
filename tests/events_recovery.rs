@@ -215,3 +215,63 @@ async fn legacy_incorrect_event_recovers_with_remaining_attempts() {
         2
     );
 }
+
+#[tokio::test]
+async fn legacy_start_challenge_event_defaults_to_version_zero() {
+    let (_directory, pool) = database().await;
+    let now = at("2026-07-14T00:00:00Z");
+    record_prepared_event(
+        &pool,
+        &PreparedEvent::new(
+            50,
+            "lifecycle",
+            now,
+            json!({
+                "connection_id": "business-1",
+                "chat_id": 200,
+                "user_id": 200,
+                "message_id": 1,
+                "media_group_id": null,
+                "occurred_at": now,
+                "action": {
+                    "kind": "INBOUND",
+                    "detection": {
+                        "decision": "ALLOW",
+                        "score": 0,
+                        "reasons": [],
+                        "matched_rules": [],
+                        "detector_name": "legacy",
+                        "detector_version": "1",
+                        "normalized_hash": "legacy-start",
+                        "error": null
+                    },
+                    "outcome": {
+                        "kind": "START_CHALLENGE",
+                        "expression": "7 + 5 - 3",
+                        "answer_hmac": "legacy-hmac",
+                        "created_at": now,
+                        "expires_at": now + chrono::Duration::minutes(2),
+                        "max_attempts": 3
+                    },
+                    "dry_run_spam": false
+                }
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        recover_recorded_events(&pool, &LifecycleHandler)
+            .await
+            .unwrap(),
+        1
+    );
+    let version: i64 = sqlx::query_scalar(
+        "SELECT hmac_key_version FROM challenge WHERE connection_id = 'business-1' AND chat_id = 200",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(version, 0);
+}

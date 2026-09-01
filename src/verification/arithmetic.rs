@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::{ExposeSecret, SecretSlice, SecretString};
 use sha2::Sha256;
 use unicode_normalization::UnicodeNormalization;
 
@@ -23,6 +23,7 @@ pub enum AnswerKind {
 pub struct GeneratedChallenge {
     pub expression: String,
     pub answer_hmac: String,
+    pub hmac_key_version: i64,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub max_attempts: u8,
@@ -36,18 +37,30 @@ impl GeneratedChallenge {
 }
 
 pub trait ChallengeVerifier: Send {
+    fn key_version(&self) -> i64;
     fn generate(&mut self, now: DateTime<Utc>) -> GeneratedChallenge;
     fn evaluate(&self, raw: &str, expected_hmac: &str) -> AnswerKind;
 }
 
 pub struct ArithmeticVerifier<R> {
     rng: R,
-    key: SecretString,
+    key: SecretSlice<u8>,
+    key_version: i64,
 }
 
 impl<R> ArithmeticVerifier<R> {
     pub fn new(rng: R, key: SecretString) -> Self {
-        Self { rng, key }
+        let key_bytes = key.expose_secret().as_bytes().to_vec();
+        drop(key);
+        Self::new_with_key_version(rng, SecretSlice::from(key_bytes), 0)
+    }
+
+    pub fn new_with_key_version(rng: R, key: SecretSlice<u8>, key_version: i64) -> Self {
+        Self {
+            rng,
+            key,
+            key_version,
+        }
     }
 }
 
@@ -56,9 +69,18 @@ impl ArithmeticVerifier<StdRng> {
     pub fn from_os_rng(key: SecretString) -> Self {
         Self::new(StdRng::from_os_rng(), key)
     }
+
+    #[must_use]
+    pub fn from_os_rng_with_key_version(key: SecretSlice<u8>, key_version: i64) -> Self {
+        Self::new_with_key_version(StdRng::from_os_rng(), key, key_version)
+    }
 }
 
 impl<R: RngCore + Send> ChallengeVerifier for ArithmeticVerifier<R> {
+    fn key_version(&self) -> i64 {
+        self.key_version
+    }
+
     fn generate(&mut self, now: DateTime<Utc>) -> GeneratedChallenge {
         let (expression, answer) = (0..MAX_RANDOM_CANDIDATES)
             .find_map(|_| random_candidate(&mut self.rng))
@@ -67,6 +89,7 @@ impl<R: RngCore + Send> ChallengeVerifier for ArithmeticVerifier<R> {
         GeneratedChallenge {
             expression,
             answer_hmac: self.answer_hmac(&answer.to_string()),
+            hmac_key_version: self.key_version,
             created_at: now,
             expires_at: now + Duration::minutes(2),
             max_attempts: 3,
@@ -98,8 +121,7 @@ impl<R> ArithmeticVerifier<R> {
     }
 
     fn mac(&self) -> HmacSha256 {
-        HmacSha256::new_from_slice(self.key.expose_secret().as_bytes())
-            .expect("HMAC accepts keys of any size")
+        HmacSha256::new_from_slice(self.key.expose_secret()).expect("HMAC accepts keys of any size")
     }
 }
 

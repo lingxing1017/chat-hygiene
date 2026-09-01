@@ -296,6 +296,7 @@ impl LifecycleHandler {
         let InboundOutcome::StartChallenge {
             expression,
             answer_hmac,
+            hmac_key_version,
             created_at,
             expires_at,
             max_attempts,
@@ -314,6 +315,7 @@ impl LifecycleHandler {
             context.key.clone(),
             expression,
             answer_hmac,
+            *hmac_key_version,
             *created_at,
             *expires_at,
         );

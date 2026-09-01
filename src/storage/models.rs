@@ -106,6 +106,7 @@ pub struct ChallengeRecord {
     pub key: ConversationKey,
     pub expression: String,
     pub answer_hmac: String,
+    pub hmac_key_version: i64,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub attempts_used: i64,
@@ -210,6 +211,7 @@ impl ChallengeRecord {
         key: ConversationKey,
         expression: impl Into<String>,
         answer_hmac: impl Into<String>,
+        hmac_key_version: i64,
         created_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,
     ) -> Self {
@@ -218,6 +220,7 @@ impl ChallengeRecord {
             key,
             expression: expression.into(),
             answer_hmac: answer_hmac.into(),
+            hmac_key_version,
             created_at,
             expires_at,
             attempts_used: 0,

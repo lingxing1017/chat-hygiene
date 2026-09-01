@@ -508,10 +508,15 @@ fn result(decision: Decision, score: u8) -> DetectionResult {
 pub struct FixedVerifier;
 
 impl ChallengeVerifier for FixedVerifier {
+    fn key_version(&self) -> i64 {
+        0
+    }
+
     fn generate(&mut self, now: DateTime<Utc>) -> GeneratedChallenge {
         GeneratedChallenge {
             expression: "7 + 5 - 3".to_owned(),
             answer_hmac: "fixed-hmac".to_owned(),
+            hmac_key_version: 0,
             created_at: now,
             expires_at: now + Duration::minutes(2),
             max_attempts: 3,
