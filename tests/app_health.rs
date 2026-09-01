@@ -1,6 +1,5 @@
 mod common;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
@@ -16,18 +15,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn liveness_exposes_no_config() {
-    let settings = Settings::from_map(&HashMap::from([
-        ("CHATHYGIENE_BOT_TOKEN".into(), "secret-bot-token".into()),
-        ("CHATHYGIENE_WEBHOOK_SECRET".into(), "secret-webhook".into()),
-        (
-            "CHATHYGIENE_CHALLENGE_HMAC_KEY".into(),
-            "secret-challenge".into(),
-        ),
-        ("CHATHYGIENE_OWNER_USER_ID".into(), "42".into()),
-    ]))
-    .expect("valid settings");
-
-    let response = build_router(Arc::new(settings))
+    let response = build_router()
         .oneshot(
             Request::builder()
                 .uri("/health/live")
@@ -80,7 +68,7 @@ async fn runtime_recovers_recorded_events_before_readiness() {
         bot_token: SecretString::from("test-token".to_owned()),
         webhook_secret: SecretString::from("test-webhook".to_owned()),
         challenge_hmac_key: SecretString::from("test-hmac".to_owned()),
-        owner_user_id: 42,
+        owner_user_id: 999_999,
         database_url: database_url.clone(),
         destructive_mode: false,
     });
@@ -110,6 +98,12 @@ async fn runtime_recovers_recorded_events_before_readiness() {
         recovered,
         ("APPLIED".to_owned(), "recovered-business".to_owned())
     );
+    let owner: (String, Option<i64>) =
+        sqlx::query_as("SELECT state, owner_user_id FROM owner_identity WHERE singleton = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(owner, ("CLAIMED".to_owned(), Some(42)));
     let trace_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM outbox_action WHERE idempotency_key = '90:DRY_RUN_TRACE'",
     )
@@ -117,4 +111,29 @@ async fn runtime_recovers_recorded_events_before_readiness() {
     .await
     .unwrap();
     assert_eq!(trace_count, 0, "legacy events must not gain dry-run traces");
+}
+
+#[tokio::test]
+async fn runtime_leaves_a_fresh_database_unclaimed_despite_legacy_setting() {
+    let (_directory, database_url) = common::temporary_database();
+    let settings = Arc::new(Settings {
+        bot_token: SecretString::from("test-token".to_owned()),
+        webhook_secret: SecretString::from("test-webhook".to_owned()),
+        challenge_hmac_key: SecretString::from("test-hmac".to_owned()),
+        owner_user_id: 999_999,
+        database_url: database_url.clone(),
+        destructive_mode: false,
+    });
+
+    let _router = build_runtime_router(settings).await.unwrap();
+
+    let pool = connect(&database_url).await.unwrap();
+    let owner: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT state, owner_user_id, owner_chat_id
+         FROM owner_identity WHERE singleton = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owner, ("UNCLAIMED".to_owned(), None, None));
 }

@@ -12,6 +12,7 @@ use crate::clock::SystemClock;
 use crate::config::Settings;
 use crate::detection::{DetectorError, RuleDetector};
 use crate::events::{EventError, recover_recorded_events, spawn_outbox_worker};
+use crate::owner::OwnerIdentityHandle;
 use crate::processing::{
     LifecycleHandler, ProcessingEngine, ProcessingError, spawn_processing_worker,
 };
@@ -38,21 +39,18 @@ pub enum AppError {
     Processing(#[from] ProcessingError),
 }
 
-pub fn build_router(_settings: Arc<Settings>) -> Router {
+pub fn build_router() -> Router {
     Router::new().route("/health/live", get(liveness))
 }
 
 pub fn build_router_with_inbox<I: WebhookInbox + 'static>(
-    settings: &Settings,
+    webhook_secret: secrecy::SecretString,
+    owner_identity: OwnerIdentityHandle,
     inbox: Arc<I>,
 ) -> Router {
     Router::new()
         .route("/health/live", get(liveness))
-        .merge(webhook_router(
-            settings.webhook_secret.clone(),
-            settings.owner_user_id,
-            inbox,
-        ))
+        .merge(webhook_router(webhook_secret, owner_identity, inbox))
 }
 
 /// Builds the production router and starts its two single-worker pipelines.
@@ -64,7 +62,8 @@ pub async fn build_runtime_router(settings: Arc<Settings>) -> Result<Router, App
     let pool = connect(&settings.database_url).await?;
     migrate(&pool).await?;
     recover_recorded_events(&pool, &LifecycleHandler).await?;
-    initialize_or_load_owner_identity(&pool, Utc::now()).await?;
+    let owner = initialize_or_load_owner_identity(&pool, Utc::now()).await?;
+    let owner_identity = OwnerIdentityHandle::new(owner);
     let detector = RuleDetector::from_defaults()?;
     let verifier = ArithmeticVerifier::from_os_rng_with_key_version(
         SecretSlice::from(
@@ -86,6 +85,7 @@ pub async fn build_runtime_router(settings: Arc<Settings>) -> Result<Router, App
         settings.destructive_mode,
     )
     .with_business_connection_api(telegram.clone())
+    .with_owner_claim(None, owner_identity.clone())
     .with_new_contact_notifier(notifier);
     engine.recover_recorded_connection_triggers().await?;
     let inbox = Arc::new(spawn_processing_worker(engine, 128));
@@ -94,7 +94,10 @@ pub async fn build_runtime_router(settings: Arc<Settings>) -> Result<Router, App
         pool,
         std::time::Duration::from_millis(250),
     ));
-    Ok(build_router_with_inbox(&settings, inbox).route("/health/ready", get(readiness)))
+    Ok(
+        build_router_with_inbox(settings.webhook_secret.clone(), owner_identity, inbox)
+            .route("/health/ready", get(readiness)),
+    )
 }
 
 async fn liveness() -> Json<HealthResponse> {

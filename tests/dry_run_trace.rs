@@ -3,7 +3,8 @@ mod common;
 use chathygiene::events::{record_prepared_event, recover_recorded_events};
 use chathygiene::processing::{EventPreparer, LifecycleHandler, ProcessingEngine};
 use chathygiene::storage::{
-    OwnerChatSource, UnitOfWork, initialize_or_load_owner_identity, promote_owner_chat,
+    OwnerChatSource, OwnerIdentity, UnitOfWork, initialize_or_load_owner_identity,
+    promote_owner_chat,
 };
 use chathygiene::telegram::{RawEventKind, parse_update};
 
@@ -30,6 +31,16 @@ const CHALLENGE_TRACE: &str = concat!(
     "- UPDATE_CONVERSATION_STATE：APPLIED\n",
     "- SEND_CHALLENGE：QUEUED\n",
 );
+
+fn parser_owner(owner_chat_id: i64) -> OwnerIdentity {
+    OwnerIdentity::Claimed {
+        owner_user_id: 42,
+        owner_chat_id,
+        owner_chat_source: OwnerChatSource::LegacyFallback,
+        connection_floor_established_at: None,
+        bound_at: common::at("2026-07-14T00:00:00Z"),
+    }
+}
 
 async fn trace_messages(pool: &sqlx::SqlitePool, update_id: i64) -> Vec<String> {
     let payloads: Vec<String> = sqlx::query_scalar(
@@ -207,7 +218,7 @@ async fn dry_run_traces_supported_events_but_not_reconciliation_triggers() {
 
     let mut connection = parse_update(
         include_bytes!("fixtures/telegram/business_connection.json"),
-        42,
+        &parser_owner(42),
     )
     .unwrap()
     .event;
@@ -287,7 +298,7 @@ async fn dry_run_owner_command_emits_one_trace_without_command_text() {
             "text": "/health"
           }
         }"#,
-        42,
+        &parser_owner(4200),
     )
     .unwrap();
 
@@ -610,5 +621,5 @@ fn owner_command(update_id: i64, text: &str) -> chathygiene::telegram::ParsedUpd
             "text": text,
         }
     });
-    parse_update(&serde_json::to_vec(&body).unwrap(), 42).unwrap()
+    parse_update(&serde_json::to_vec(&body).unwrap(), &parser_owner(42)).unwrap()
 }

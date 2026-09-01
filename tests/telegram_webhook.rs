@@ -6,12 +6,11 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chathygiene::app::build_router_with_inbox;
-use chathygiene::config::Settings;
 use chathygiene::events::RecordReceipt;
 use chathygiene::owner::OwnerIdentityHandle;
 use chathygiene::storage::{OwnerChatSource, OwnerIdentity};
 use chathygiene::telegram::{
-    IngressError, RawBusinessEvent, RawEventKind, WebhookInbox, webhook_router_with_owner_identity,
+    IngressError, RawBusinessEvent, RawEventKind, WebhookInbox, webhook_router,
 };
 use chrono::Utc;
 use secrecy::SecretString;
@@ -52,19 +51,18 @@ impl WebhookInbox for FakeInbox {
     }
 }
 
-fn settings() -> Arc<Settings> {
-    Arc::new(Settings {
-        bot_token: SecretString::from("bot-token"),
-        webhook_secret: SecretString::from("correct-secret"),
-        challenge_hmac_key: SecretString::from("challenge-key"),
-        owner_user_id: 42,
-        database_url: "sqlite::memory:".to_owned(),
-        destructive_mode: false,
-    })
-}
-
 fn router(inbox: FakeInbox) -> Router {
-    build_router_with_inbox(settings().as_ref(), Arc::new(inbox))
+    build_router_with_inbox(
+        SecretString::from("correct-secret"),
+        OwnerIdentityHandle::new(OwnerIdentity::Claimed {
+            owner_user_id: 42,
+            owner_chat_id: 42,
+            owner_chat_source: OwnerChatSource::LegacyFallback,
+            connection_floor_established_at: None,
+            bound_at: Utc::now(),
+        }),
+        Arc::new(inbox),
+    )
 }
 
 fn request(secret: Option<&str>, body: impl Into<Body>) -> Request<Body> {
@@ -149,7 +147,7 @@ async fn oversized_body_is_rejected() {
 }
 
 #[tokio::test]
-async fn identity_router_accepts_redacted_claims_and_reclassifies_after_publication() {
+async fn identity_router_accepts_redacted_unclaimed_owner_claims() {
     let owner = OwnerIdentityHandle::new(OwnerIdentity::Unclaimed);
     let inbox = FakeInbox::returning(RecordReceipt::Recorded);
     let submitted = Arc::clone(&inbox.submitted);
@@ -163,7 +161,7 @@ async fn identity_router_accepts_redacted_claims_and_reclassifies_after_publicat
             "text": "/claim 1111111111111111111111111111111111111111111111111111111111111111"
         }
     });
-    let response = webhook_router_with_owner_identity(
+    let response = webhook_router(
         SecretString::from("correct-secret"),
         owner.clone(),
         Arc::new(inbox),
@@ -181,7 +179,10 @@ async fn identity_router_accepts_redacted_claims_and_reclassifies_after_publicat
         assert!(submitted[0].1.owner_command.is_none());
         assert!(!format!("{:?}", submitted[0].1).contains("1111111111111111"));
     }
+}
 
+#[tokio::test]
+async fn identity_router_requires_claimed_user_and_chat() {
     let claimed = OwnerIdentityHandle::new(OwnerIdentity::Claimed {
         owner_user_id: 100,
         owner_chat_id: 500,
@@ -201,9 +202,9 @@ async fn identity_router_accepts_redacted_claims_and_reclassifies_after_publicat
             "text": "/health"
         }
     });
-    let response = webhook_router_with_owner_identity(
+    let response = webhook_router(
         SecretString::from("correct-secret"),
-        claimed,
+        claimed.clone(),
         Arc::new(inbox),
     )
     .oneshot(request(
@@ -217,4 +218,92 @@ async fn identity_router_accepts_redacted_claims_and_reclassifies_after_publicat
         submitted.lock().unwrap()[0].1.kind,
         RawEventKind::OwnerCommand
     );
+
+    let inbox = FakeInbox::returning(RecordReceipt::Recorded);
+    let submitted = Arc::clone(&inbox.submitted);
+    let mismatch_router = webhook_router(
+        SecretString::from("correct-secret"),
+        claimed,
+        Arc::new(inbox),
+    );
+    for (update_id, from_user_id, chat_id) in [(502, 100, 501), (503, 101, 500)] {
+        let mismatch = serde_json::json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": update_id,
+                "from": {"id": from_user_id},
+                "chat": {"id": chat_id, "type": "private"},
+                "date": 1_783_987_270_i64 + update_id,
+                "text": "/health"
+            }
+        });
+        let response = mismatch_router
+            .clone()
+            .oneshot(request(
+                Some("correct-secret"),
+                serde_json::to_vec(&mismatch).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert!(
+        submitted
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, event)| event.kind == RawEventKind::Ignored)
+    );
+}
+
+#[tokio::test]
+async fn identity_router_accepts_legacy_fallback_chat() {
+    let fallback = OwnerIdentityHandle::new(OwnerIdentity::Claimed {
+        owner_user_id: 100,
+        owner_chat_id: 500,
+        owner_chat_source: OwnerChatSource::LegacyFallback,
+        connection_floor_established_at: None,
+        bound_at: Utc::now(),
+    });
+    let inbox = FakeInbox::returning(RecordReceipt::Recorded);
+    let submitted = Arc::clone(&inbox.submitted);
+    let fallback_command = serde_json::json!({
+        "update_id": 504,
+        "message": {
+            "message_id": 504,
+            "from": {"id": 100},
+            "chat": {"id": 700, "type": "private"},
+            "date": 1_783_987_774_i64,
+            "text": "/health"
+        }
+    });
+    webhook_router(
+        SecretString::from("correct-secret"),
+        fallback,
+        Arc::new(inbox),
+    )
+    .oneshot(request(
+        Some("correct-secret"),
+        serde_json::to_vec(&fallback_command).unwrap(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        submitted.lock().unwrap()[0].1.kind,
+        RawEventKind::OwnerCommand
+    );
+}
+
+#[test]
+fn legacy_routing_symbols_are_absent_from_the_module_surface() {
+    let parser = include_str!("../src/telegram/parser.rs");
+    let webhook = include_str!("../src/telegram/webhook.rs");
+    let module = include_str!("../src/telegram/mod.rs");
+
+    assert!(!parser.contains("pub fn parse_update_with_owner_identity"));
+    assert!(!parser.contains("pub fn parse_update(body: &[u8], owner_user_id: i64)"));
+    assert!(!webhook.contains("pub fn webhook_router_with_owner_identity"));
+    assert!(!webhook.contains("owner_user_id: i64"));
+    assert!(!module.contains("parse_update_with_owner_identity"));
+    assert!(!module.contains("webhook_router_with_owner_identity"));
 }

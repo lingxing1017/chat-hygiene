@@ -14,7 +14,7 @@ use chathygiene::storage::{
 };
 use chathygiene::telegram::{
     AuthoritativeBusinessConnection, BoxFuture, BusinessConnectionApi, BusinessRights,
-    RawBusinessEvent, RawEventKind, TelegramError, WebhookInbox, parse_update_with_owner_identity,
+    RawBusinessEvent, RawEventKind, TelegramError, WebhookInbox, parse_update,
 };
 use secrecy::{ExposeSecret, SecretSlice};
 use sqlx::SqlitePool;
@@ -121,7 +121,7 @@ async fn parsed_claim_for(
             "text": format!("/claim {token}")
         }
     });
-    parse_update_with_owner_identity(&serde_json::to_vec(&body).unwrap(), &owner.snapshot().await)
+    parse_update(&serde_json::to_vec(&body).unwrap(), &owner.snapshot().await)
         .unwrap()
         .event
 }
@@ -365,11 +365,8 @@ async fn claimed_owner_commands_work_without_business_connection() {
             "text": "/health"
         }
     });
-    let parsed = parse_update_with_owner_identity(
-        &serde_json::to_vec(&body).unwrap(),
-        &owner.snapshot().await,
-    )
-    .unwrap();
+    let parsed =
+        parse_update(&serde_json::to_vec(&body).unwrap(), &owner.snapshot().await).unwrap();
     assert_eq!(parsed.event.kind, RawEventKind::OwnerCommand);
     engine.process(41, parsed.event).await.unwrap();
     let payload: String = sqlx::query_scalar(

@@ -5,7 +5,7 @@ use chathygiene::owner::{
     OwnerTelegramAction, parse_owner_command,
 };
 use chathygiene::processing::ProcessingEngine;
-use chathygiene::storage::{ConversationKey, UnitOfWork};
+use chathygiene::storage::{ConversationKey, OwnerChatSource, OwnerIdentity, UnitOfWork};
 use chathygiene::telegram::parse_update;
 
 fn owner(sample: Option<LabeledMessageBody>) -> OwnerCommandSource {
@@ -576,7 +576,13 @@ async fn health_reports_the_engine_destructive_default() {
             "text": "/health"
           }
         }"#,
-        42,
+        &OwnerIdentity::Claimed {
+            owner_user_id: 42,
+            owner_chat_id: 42,
+            owner_chat_source: OwnerChatSource::LegacyFallback,
+            connection_floor_established_at: None,
+            bound_at: now,
+        },
     )
     .unwrap();
 

@@ -5,9 +5,21 @@ use chathygiene::owner::{
 };
 use chathygiene::processing::ProcessingEngine;
 use chathygiene::storage::{
-    OwnerChatSource, UnitOfWork, initialize_or_load_owner_identity, promote_owner_chat,
+    OwnerChatSource, OwnerIdentity, UnitOfWork, initialize_or_load_owner_identity,
+    promote_owner_chat,
 };
 use chathygiene::telegram::{RawEventKind, parse_update};
+use chrono::Utc;
+
+fn claimed_owner() -> OwnerIdentity {
+    OwnerIdentity::Claimed {
+        owner_user_id: 42,
+        owner_chat_id: 42,
+        owner_chat_source: OwnerChatSource::LegacyFallback,
+        connection_floor_established_at: None,
+        bound_at: Utc::now(),
+    }
+}
 
 fn source(from_user_id: i64, private_chat: bool) -> OwnerCommandSource {
     OwnerCommandSource {
@@ -65,7 +77,7 @@ fn parser_accepts_normal_private_bot_commands_but_not_business_messages() {
         "text": "/health@ChatHygieneBot"
       }
     }"#;
-    let parsed = parse_update(normal, 42).unwrap();
+    let parsed = parse_update(normal, &claimed_owner()).unwrap();
     assert_eq!(parsed.event.kind, RawEventKind::OwnerCommand);
     let command = parsed.event.owner_command.unwrap();
     assert_eq!(command.from_user_id, Some(42));
@@ -84,7 +96,7 @@ fn parser_accepts_normal_private_bot_commands_but_not_business_messages() {
       }
     }"#;
     assert_eq!(
-        parse_update(business, 42).unwrap().event.kind,
+        parse_update(business, &claimed_owner()).unwrap().event.kind,
         RawEventKind::ManualOwnerMessage
     );
 
@@ -97,7 +109,7 @@ fn parser_accepts_normal_private_bot_commands_but_not_business_messages() {
         "text": "/health"
       }
     }"#;
-    let parsed = parse_update(channel, 42).unwrap();
+    let parsed = parse_update(channel, &claimed_owner()).unwrap();
     assert_eq!(parsed.event.kind, RawEventKind::Ignored);
     assert!(parsed.event.owner_command.is_none());
 }
@@ -126,7 +138,7 @@ fn parser_preserves_explicit_replied_sample_only_for_transient_command_handling(
         }
       }
     }"#;
-    let parsed = parse_update(update, 42).unwrap();
+    let parsed = parse_update(update, &claimed_owner()).unwrap();
     let sample = parsed.event.owner_command.unwrap().replied_sample.unwrap();
     assert_eq!(sample.body, "promo caption");
     assert_eq!(sample.content_type, "caption");
@@ -172,7 +184,7 @@ async fn processing_persists_body_only_in_sample_table_and_replies_via_outbox() 
         }
       }
     }"#;
-    let parsed = parse_update(update, 42).unwrap();
+    let parsed = parse_update(update, &claimed_owner()).unwrap();
     engine
         .process(parsed.update_id, parsed.event)
         .await
@@ -223,7 +235,7 @@ async fn processing_persists_body_only_in_sample_table_and_replies_via_outbox() 
         "text": "/health"
       }
     }"#;
-    let parsed = parse_update(unauthorized, 42).unwrap();
+    let parsed = parse_update(unauthorized, &claimed_owner()).unwrap();
     engine
         .process(parsed.update_id, parsed.event)
         .await

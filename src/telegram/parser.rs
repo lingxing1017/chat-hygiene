@@ -126,32 +126,7 @@ struct DeletedBusinessMessages {
 ///
 /// Returns [`ParseError`] when JSON, required fields, or Telegram timestamps
 /// are invalid. Unusable entity ranges are ignored with the entity itself.
-pub fn parse_update(body: &[u8], owner_user_id: i64) -> Result<ParsedUpdate, ParseError> {
-    let owner = if owner_user_id > 0 {
-        OwnerIdentity::Claimed {
-            owner_user_id,
-            owner_chat_id: owner_user_id,
-            owner_chat_source: OwnerChatSource::LegacyFallback,
-            connection_floor_established_at: None,
-            bound_at: Utc::now(),
-        }
-    } else {
-        OwnerIdentity::Unclaimed
-    };
-    parse_update_with_owner_identity(body, &owner)
-}
-
-/// Parses a Telegram update against the complete persisted Owner identity.
-///
-/// # Errors
-///
-/// Returns [`ParseError`] when JSON, required fields, or Telegram timestamps
-/// are invalid. Claim-like messages with unusable source metadata are instead
-/// normalized to a redacted ignored claim event.
-pub fn parse_update_with_owner_identity(
-    body: &[u8],
-    owner: &OwnerIdentity,
-) -> Result<ParsedUpdate, ParseError> {
+pub fn parse_update(body: &[u8], owner: &OwnerIdentity) -> Result<ParsedUpdate, ParseError> {
     let update: Envelope = serde_json::from_slice(body)?;
     let event = if let Some(connection) = update.business_connection {
         connection_event(connection)?

@@ -15,11 +15,11 @@ use axum::routing::any;
 use axum::{Json, Router};
 use chathygiene::app::build_router_with_inbox;
 use chathygiene::clock::Clock;
-use chathygiene::config::Settings;
 use chathygiene::detection::{
     Decision, DetectionContext, DetectionResult, DetectorError, MessageContent, RuleDetector,
     SpamDetector,
 };
+use chathygiene::owner::OwnerIdentityHandle;
 use chathygiene::processing::{ProcessingEngine, spawn_processing_worker};
 use chathygiene::storage::{
     UnitOfWork, claim_owner, connect, initialize_or_load_owner_identity, migrate,
@@ -265,7 +265,7 @@ impl E2eHarness {
         let mut owner = UnitOfWork::begin_immediate(&pool)
             .await
             .expect("begin E2E owner claim");
-        claim_owner(&mut owner, 42, 4200, 1, clock.now())
+        let claimed_owner = claim_owner(&mut owner, 42, 4200, 1, clock.now())
             .await
             .expect("claim E2E owner");
         owner.commit().await.expect("commit E2E owner claim");
@@ -285,15 +285,11 @@ impl E2eHarness {
         )
         .with_business_connection_api(authoritative_api.clone());
         let inbox = Arc::new(spawn_processing_worker(engine, 128));
-        let settings = Settings {
-            bot_token: SecretString::from("123456:test-token".to_owned()),
-            webhook_secret: SecretString::from("e2e-webhook-secret".to_owned()),
-            challenge_hmac_key: SecretString::from("e2e-challenge-key".to_owned()),
-            owner_user_id: 42,
-            database_url,
-            destructive_mode,
-        };
-        let router = build_router_with_inbox(&settings, inbox);
+        let router = build_router_with_inbox(
+            SecretString::from("e2e-webhook-secret".to_owned()),
+            OwnerIdentityHandle::new(claimed_owner),
+            inbox,
+        );
         let dispatcher = OutboxDispatcher::new(telegram.client());
         Self {
             _directory: directory,

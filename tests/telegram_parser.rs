@@ -1,9 +1,21 @@
 use chathygiene::detection::{MediaKind, MessageEntityKind};
 use chathygiene::owner::ParsedOwnerClaim;
+use chathygiene::storage::{OwnerChatSource, OwnerIdentity};
 use chathygiene::telegram::{RawEventKind, parse_update};
+use chrono::Utc;
+
+fn owner(user_id: i64) -> OwnerIdentity {
+    OwnerIdentity::Claimed {
+        owner_user_id: user_id,
+        owner_chat_id: user_id,
+        owner_chat_source: OwnerChatSource::LegacyFallback,
+        connection_floor_established_at: None,
+        bound_at: Utc::now(),
+    }
+}
 
 fn parse(fixture: &str) -> chathygiene::telegram::ParsedUpdate {
-    parse_update(fixture.as_bytes(), 42).expect("parse fixture")
+    parse_update(fixture.as_bytes(), &owner(42)).expect("parse fixture")
 }
 
 #[test]
@@ -18,7 +30,7 @@ fn parses_owner_claim_without_retaining_command_text() {
         "text": "/claim 1111111111111111111111111111111111111111111111111111111111111111"
       }
     }"#;
-    let parsed = parse_update(update, 42).unwrap();
+    let parsed = parse_update(update, &owner(42)).unwrap();
     assert_eq!(parsed.event.kind, RawEventKind::OwnerClaim);
     assert!(matches!(
         parsed.event.owner_claim,
@@ -55,7 +67,7 @@ fn ignores_mutable_connection_payload_but_rejects_invalid_ids() {
             serde_json::from_str(include_str!("fixtures/telegram/business_connection.json"))
                 .unwrap();
         update["business_connection"][field] = value;
-        let parsed = parse_update(&serde_json::to_vec(&update).unwrap(), 42).unwrap();
+        let parsed = parse_update(&serde_json::to_vec(&update).unwrap(), &owner(42)).unwrap();
         assert_eq!(parsed.event.kind, RawEventKind::BusinessConnectionChanged);
         assert_eq!(parsed.event.connection_id.as_deref(), Some("business-1"));
         assert!(parsed.event.connection.is_none());
@@ -70,7 +82,7 @@ fn ignores_mutable_connection_payload_but_rejects_invalid_ids() {
             serde_json::from_str(include_str!("fixtures/telegram/business_connection.json"))
                 .unwrap();
         update["business_connection"]["id"] = invalid_id;
-        assert!(parse_update(&serde_json::to_vec(&update).unwrap(), 42).is_err());
+        assert!(parse_update(&serde_json::to_vec(&update).unwrap(), &owner(42)).is_err());
     }
 }
 
@@ -80,7 +92,7 @@ fn foreign_owner_payload_still_becomes_an_untrusted_trigger() {
         serde_json::from_str(include_str!("fixtures/telegram/business_connection.json")).unwrap();
     update["business_connection"]["user"]["id"] = serde_json::Value::from(99);
 
-    let parsed = parse_update(&serde_json::to_vec(&update).unwrap(), 42).unwrap();
+    let parsed = parse_update(&serde_json::to_vec(&update).unwrap(), &owner(42)).unwrap();
 
     assert_eq!(parsed.event.kind, RawEventKind::BusinessConnectionChanged);
     assert!(parsed.event.connection.is_none());
@@ -141,7 +153,7 @@ fn preserves_album_identity_and_deletion_batches() {
         serde_json::from_str(include_str!("fixtures/telegram/album_messages.json")).unwrap();
     let parsed = album
         .iter()
-        .map(|update| parse_update(&serde_json::to_vec(update).unwrap(), 42).unwrap())
+        .map(|update| parse_update(&serde_json::to_vec(update).unwrap(), &owner(42)).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(parsed[0].event.media_group_id.as_deref(), Some("album-1"));
     assert_eq!(parsed[1].event.media_group_id.as_deref(), Some("album-1"));
@@ -174,11 +186,11 @@ fn recognizes_owner_commands_and_rejects_invalid_required_fields() {
       }
     }"#;
     assert_eq!(
-        parse_update(command, 42).unwrap().event.kind,
+        parse_update(command, &owner(42)).unwrap().event.kind,
         RawEventKind::OwnerCommand
     );
-    assert!(parse_update(br#"{"update_id":110,"business_message":{}}"#, 42).is_err());
-    assert!(parse_update(b"not json", 42).is_err());
+    assert!(parse_update(br#"{"update_id":110,"business_message":{}}"#, &owner(42)).is_err());
+    assert!(parse_update(b"not json", &owner(42)).is_err());
 }
 
 #[test]
@@ -197,7 +209,7 @@ fn parses_only_exact_private_start_commands() {
     }
 
     for text in ["/start", "/start@ChatHygieneBot"] {
-        let parsed = parse_update(&serde_json::to_vec(&update(text)).unwrap(), 42).unwrap();
+        let parsed = parse_update(&serde_json::to_vec(&update(text)).unwrap(), &owner(42)).unwrap();
         assert_eq!(parsed.event.kind, RawEventKind::OwnerStart);
         assert_eq!(parsed.event.chat_id, Some(4200));
         let source = parsed.event.owner_command.unwrap();
@@ -215,7 +227,7 @@ fn parses_only_exact_private_start_commands() {
         " /start",
         "/START",
     ] {
-        let parsed = parse_update(&serde_json::to_vec(&update(text)).unwrap(), 42).unwrap();
+        let parsed = parse_update(&serde_json::to_vec(&update(text)).unwrap(), &owner(42)).unwrap();
         assert_eq!(parsed.event.kind, RawEventKind::Ignored, "accepted {text}");
     }
 }
@@ -274,7 +286,7 @@ fn ignores_start_outside_a_positive_ordinary_private_source() {
     ];
 
     for update in cases {
-        let parsed = parse_update(&serde_json::to_vec(&update).unwrap(), 42).unwrap();
+        let parsed = parse_update(&serde_json::to_vec(&update).unwrap(), &owner(42)).unwrap();
         assert_eq!(parsed.event.kind, RawEventKind::Ignored);
     }
 }

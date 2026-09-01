@@ -7,7 +7,7 @@ use chathygiene::storage::{
     OwnerIdentity, UnitOfWork, claim_owner, connect, initialize_or_load_owner_identity,
     load_owner_identity, migrate,
 };
-use chathygiene::telegram::{RawBusinessEvent, parse_update_with_owner_identity};
+use chathygiene::telegram::{RawBusinessEvent, parse_update};
 use secrecy::SecretSlice;
 use sqlx::SqlitePool;
 
@@ -69,7 +69,7 @@ async fn private_command(
             "text": text,
         }
     });
-    parse_update_with_owner_identity(&serde_json::to_vec(&body).unwrap(), &owner.snapshot().await)
+    parse_update(&serde_json::to_vec(&body).unwrap(), &owner.snapshot().await)
         .unwrap()
         .event
 }
