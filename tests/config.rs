@@ -11,6 +11,10 @@ fn valid_values() -> HashMap<String, String> {
             "challenge-key".into(),
         ),
         ("CHATHYGIENE_OWNER_USER_ID".into(), "42".into()),
+        (
+            "CHATHYGIENE_PUBLIC_WEBHOOK_URL".into(),
+            "https://chat.example.net/telegram/webhook".into(),
+        ),
     ])
 }
 
@@ -40,4 +44,108 @@ fn rejects_non_positive_owner() {
     let error = Settings::from_map(&values).expect_err("zero owner id must fail");
 
     assert_eq!(error, ConfigError::InvalidOwnerUserId);
+}
+
+#[test]
+fn requires_a_structurally_safe_public_webhook_url() {
+    let mut missing = valid_values();
+    missing.remove("CHATHYGIENE_PUBLIC_WEBHOOK_URL");
+    assert_eq!(
+        Settings::from_map(&missing).unwrap_err(),
+        ConfigError::Missing("CHATHYGIENE_PUBLIC_WEBHOOK_URL")
+    );
+
+    for invalid in [
+        "",
+        "   ",
+        "/telegram/webhook",
+        "http://chat.example.net/telegram/webhook",
+        "https://",
+        "https://user@chat.example.net/telegram/webhook",
+        "https://user:password@chat.example.net/telegram/webhook",
+        "https://chat.example.net/telegram/webhook#fragment",
+        "https://chat.example.net:65536/telegram/webhook",
+    ] {
+        let mut values = valid_values();
+        values.insert("CHATHYGIENE_PUBLIC_WEBHOOK_URL".into(), invalid.into());
+        assert_eq!(
+            Settings::from_map(&values).unwrap_err(),
+            ConfigError::InvalidPublicWebhookUrl,
+            "accepted invalid public webhook URL shape {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn accepts_only_telegram_webhook_ports() {
+    for (value, effective_port) in [
+        ("https://chat.example.net/telegram/webhook", 443),
+        ("https://chat.example.net:443/telegram/webhook", 443),
+        ("https://chat.example.net:80/telegram/webhook", 80),
+        ("https://chat.example.net:88/telegram/webhook", 88),
+        (
+            "https://chat.example.net:8443/telegram/webhook?tenant=one",
+            8443,
+        ),
+        ("https://[2001:db8::1]:8443/telegram/webhook", 8443),
+    ] {
+        let mut values = valid_values();
+        values.insert("CHATHYGIENE_PUBLIC_WEBHOOK_URL".into(), value.into());
+        let settings = Settings::from_map(&values).unwrap();
+        assert_eq!(
+            settings.public_webhook_url.port_or_known_default(),
+            Some(effective_port)
+        );
+        if effective_port == 8443 && value.contains("tenant=one") {
+            assert_eq!(settings.public_webhook_url.path(), "/telegram/webhook");
+            assert_eq!(settings.public_webhook_url.query(), Some("tenant=one"));
+        }
+    }
+
+    for unsupported in [8080, 0] {
+        let mut values = valid_values();
+        values.insert(
+            "CHATHYGIENE_PUBLIC_WEBHOOK_URL".into(),
+            format!("https://chat.example.net:{unsupported}/telegram/webhook"),
+        );
+        assert_eq!(
+            Settings::from_map(&values).unwrap_err(),
+            ConfigError::UnsupportedPublicWebhookPort(unsupported)
+        );
+    }
+
+    let mut values = valid_values();
+    values.insert(
+        "CHATHYGIENE_PUBLIC_WEBHOOK_URL".into(),
+        "http://chat.example.net:8080/telegram/webhook".into(),
+    );
+    assert_eq!(
+        Settings::from_map(&values).unwrap_err(),
+        ConfigError::InvalidPublicWebhookUrl
+    );
+}
+
+#[test]
+fn redacts_the_complete_public_webhook_url() {
+    let sentinel_url =
+        "https://chat.example.net:8443/sentinel-user/sentinel-password?token=sentinel-query";
+    let mut values = valid_values();
+    values.insert("CHATHYGIENE_PUBLIC_WEBHOOK_URL".into(), sentinel_url.into());
+
+    let settings = Settings::from_map(&values).unwrap();
+    let rendered = format!("{settings:?}");
+
+    assert_eq!(settings.public_webhook_url.as_str(), sentinel_url);
+    for sentinel in [
+        sentinel_url,
+        "sentinel-user",
+        "sentinel-password",
+        "sentinel-query",
+        "bot-token",
+        "webhook-secret",
+        "challenge-key",
+    ] {
+        assert!(!rendered.contains(sentinel));
+    }
+    assert!(rendered.contains("public_webhook_url: \"[REDACTED]\""));
 }

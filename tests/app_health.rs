@@ -69,6 +69,7 @@ async fn runtime_recovers_recorded_events_before_readiness() {
         webhook_secret: SecretString::from("test-webhook".to_owned()),
         challenge_hmac_key: SecretString::from("test-hmac".to_owned()),
         owner_user_id: 999_999,
+        public_webhook_url: "https://chat.example.net/telegram/webhook".parse().unwrap(),
         database_url: database_url.clone(),
         destructive_mode: false,
     });
@@ -121,6 +122,7 @@ async fn runtime_leaves_a_fresh_database_unclaimed_despite_legacy_setting() {
         webhook_secret: SecretString::from("test-webhook".to_owned()),
         challenge_hmac_key: SecretString::from("test-hmac".to_owned()),
         owner_user_id: 999_999,
+        public_webhook_url: "https://chat.example.net/telegram/webhook".parse().unwrap(),
         database_url: database_url.clone(),
         destructive_mode: false,
     });

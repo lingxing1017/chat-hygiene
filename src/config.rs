@@ -4,11 +4,13 @@ use std::fmt;
 
 use secrecy::SecretString;
 use thiserror::Error;
+use url::Url;
 
 const BOT_TOKEN: &str = "CHATHYGIENE_BOT_TOKEN";
 const WEBHOOK_SECRET: &str = "CHATHYGIENE_WEBHOOK_SECRET";
 const CHALLENGE_HMAC_KEY: &str = "CHATHYGIENE_CHALLENGE_HMAC_KEY";
 const OWNER_USER_ID: &str = "CHATHYGIENE_OWNER_USER_ID";
+const PUBLIC_WEBHOOK_URL: &str = "CHATHYGIENE_PUBLIC_WEBHOOK_URL";
 const DATABASE_URL: &str = "CHATHYGIENE_DATABASE_URL";
 const DESTRUCTIVE_MODE: &str = "CHATHYGIENE_DESTRUCTIVE_MODE";
 
@@ -18,6 +20,7 @@ pub struct Settings {
     pub webhook_secret: SecretString,
     pub challenge_hmac_key: SecretString,
     pub owner_user_id: i64,
+    pub public_webhook_url: Url,
     pub database_url: String,
     pub destructive_mode: bool,
 }
@@ -30,6 +33,7 @@ impl fmt::Debug for Settings {
             .field("webhook_secret", &"[REDACTED]")
             .field("challenge_hmac_key", &"[REDACTED]")
             .field("owner_user_id", &self.owner_user_id)
+            .field("public_webhook_url", &"[REDACTED]")
             .field("database_url", &self.database_url)
             .field("destructive_mode", &self.destructive_mode)
             .finish()
@@ -44,6 +48,10 @@ pub enum ConfigError {
     Empty(&'static str),
     #[error("owner user ID must be a positive integer")]
     InvalidOwnerUserId,
+    #[error("public webhook URL must be an HTTPS URL with a host and no credentials or fragment")]
+    InvalidPublicWebhookUrl,
+    #[error("public webhook URL port {0} is unsupported by Telegram; use 443, 80, 88, or 8443")]
+    UnsupportedPublicWebhookPort(u16),
     #[error("destructive mode must be true or false")]
     InvalidDestructiveMode,
 }
@@ -75,6 +83,11 @@ impl Settings {
             .ok()
             .filter(|id| *id > 0)
             .ok_or(ConfigError::InvalidOwnerUserId)?;
+        let public_webhook_url = parse_public_webhook_url(
+            values
+                .get(PUBLIC_WEBHOOK_URL)
+                .ok_or(ConfigError::Missing(PUBLIC_WEBHOOK_URL))?,
+        )?;
         let database_url = values
             .get(DATABASE_URL)
             .cloned()
@@ -90,10 +103,30 @@ impl Settings {
             webhook_secret,
             challenge_hmac_key,
             owner_user_id,
+            public_webhook_url,
             database_url,
             destructive_mode,
         })
     }
+}
+
+fn parse_public_webhook_url(value: &str) -> Result<Url, ConfigError> {
+    let url = Url::parse(value).map_err(|_| ConfigError::InvalidPublicWebhookUrl)?;
+    if url.scheme() != "https"
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidPublicWebhookUrl);
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or(ConfigError::InvalidPublicWebhookUrl)?;
+    if !matches!(port, 443 | 80 | 88 | 8443) {
+        return Err(ConfigError::UnsupportedPublicWebhookPort(port));
+    }
+    Ok(url)
 }
 
 fn required_secret(
